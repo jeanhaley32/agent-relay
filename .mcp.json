@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "channel-spike": {
+      "command": "./bin/channel-spike",
+      "args": []
+    }
+  }
+}
