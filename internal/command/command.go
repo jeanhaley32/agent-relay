@@ -26,24 +26,34 @@ type Handler func(ctx Context, args []string) string
 
 // Command is one registered slash command.
 type Command struct {
-	Name string // without the leading slash, e.g. "rate"
-	Help string // one-line description for /help
-	Run  Handler
+	Name  string // without the leading slash, e.g. "rate"
+	Help  string // one-line description for /help
+	Admin bool   // requires the caller to be an admin (and to be in a DM)
+	Run   Handler
 }
 
 // Registry holds the command set. Not safe for concurrent registration, but
 // Dispatch is read-only after setup and safe to call concurrently.
 type Registry struct {
 	cmds map[string]Command
+	// IsAdmin reports whether a sender id (as a string) is an admin. When nil,
+	// no admin system is configured and admin gating is skipped (e.g. the CLI
+	// demo). Set it to enforce admin-only commands.
+	IsAdmin func(senderID string) bool
 }
 
 // NewRegistry returns an empty registry with a built-in /help.
 func NewRegistry() *Registry {
 	r := &Registry{cmds: map[string]Command{}}
-	r.Register(Command{Name: "help", Help: "list commands", Run: func(_ Context, _ []string) string {
-		return r.help()
+	r.Register(Command{Name: "help", Help: "list commands", Run: func(ctx Context, _ []string) string {
+		return r.help(ctx)
 	}})
 	return r
+}
+
+// admin reports whether the caller is an admin (nil predicate ⇒ yes).
+func (r *Registry) admin(senderID string) bool {
+	return r.IsAdmin == nil || r.IsAdmin(senderID)
 }
 
 // Register adds or replaces a command.
@@ -63,20 +73,35 @@ func (r *Registry) Dispatch(ctx Context, text string) (reply string, handled boo
 	}
 	fields := strings.Fields(text[1:]) // drop the slash
 	if len(fields) == 0 {
-		return r.help(), true
+		return r.help(ctx), true
 	}
 	name, args := fields[0], fields[1:]
 	c, ok := r.cmds[name]
 	if !ok {
 		return "unknown command: /" + name + "  (try /help)", true
 	}
+	// Admin commands require the caller to be an admin AND to be in a direct
+	// message (chat id == sender id), so admin output never leaks into a group.
+	if c.Admin {
+		if ctx.ChatID != ctx.SenderID {
+			return "admin commands are only available in a direct message to the bot", true
+		}
+		if !r.admin(ctx.SenderID) {
+			return "⛔ not authorized (admins only)", true
+		}
+	}
 	return c.Run(ctx, args), true
 }
 
-// help renders the command list, sorted for stable output.
-func (r *Registry) help() string {
+// help renders the command list, sorted for stable output. Admin commands are
+// hidden from non-admins.
+func (r *Registry) help(ctx Context) string {
+	isAdmin := r.admin(ctx.SenderID)
 	names := make([]string, 0, len(r.cmds))
-	for n := range r.cmds {
+	for n, c := range r.cmds {
+		if c.Admin && !isAdmin {
+			continue
+		}
 		names = append(names, n)
 	}
 	sort.Strings(names)
