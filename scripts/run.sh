@@ -19,6 +19,7 @@ MODEL="${MODEL:-sonnet}"       # relay session model; strong work → ask for an
 SESSION="${SESSION:-relay}"
 CONFIG="${CONFIG:-config.json}"
 SOCK="${SOCK:-/tmp/agent-relay.sock}"
+SECURITY="${SECURITY:-security.yaml}"  # security profile; falls back to the example
 
 # Bot token from .env (never committed).
 [ -f .env ] && { set -a; . ./.env; set +a; }
@@ -31,6 +32,12 @@ CLAUDE="$(command -v claude || echo "$HOME/.local/bin/claude")"
 echo "building binaries…"
 go build -o bin/relayd ./cmd/relayd
 go build -o bin/relay-shim ./cmd/relay-shim
+go build -o bin/apply-security ./cmd/apply-security
+
+# Apply the security profile: writes .claude/settings.json and returns any extra
+# launch flags (e.g. --dangerously-skip-permissions for full mode).
+[ -f "$SECURITY" ] || SECURITY="security.example.yaml"
+SEC_FLAGS="$(./bin/apply-security --config "$SECURITY")"
 
 # Start relayd if not already running (the shim auto-reconnects, so an existing
 # daemon is fine to leave up).
@@ -46,10 +53,10 @@ fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -c "$REPO"
 tmux send-keys -t "$SESSION" \
-  "$CLAUDE --model $MODEL --dangerously-load-development-channels server:relay" C-m
+  "$CLAUDE --model $MODEL $SEC_FLAGS --dangerously-load-development-channels server:relay" C-m
 
 cat <<EOF
-Claude launching in tmux session '$SESSION' on model=$MODEL.
+Claude launching in tmux session '$SESSION' on model=$MODEL, security=$SECURITY.
 Next:
   tmux attach -t $SESSION      # approve the one-time "development channels" prompt
 Then DM your bot. Strong work: ask it to "spawn a subagent on Opus to …".
