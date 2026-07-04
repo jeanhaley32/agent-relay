@@ -19,3 +19,6 @@ config.json
 
 # relay-managed dynamic allowlist (may contain user ids)
 allowlist.json
+
+# runtime logs
+*.log
