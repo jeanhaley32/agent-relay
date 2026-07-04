@@ -112,6 +112,16 @@ func main() {
 	}()
 
 	b := &relay.Broker{Frontend: front, Backend: back, Commands: cmds, Meter: meter}
+	// Outbound gate: the model can only reply to allowlisted chats. The inbound
+	// allowlist gates who reaches Claude; this stops Claude messaging strangers.
+	b.OutboundAllowed = func(chatID string) bool {
+		id, err := strconv.ParseInt(chatID, 10, 64)
+		if err != nil || !acc.Allowed(id) {
+			logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
+			return false
+		}
+		return true
+	}
 
 	logger.Printf("relayd up — tier=%s, socket=%s, allowed=%d sender(s), admins=%d",
 		cfg.Budget.Tier, cfg.Claude.Socket, len(acc.Allowlist()), len(cfg.Telegram.Admins))
