@@ -52,15 +52,21 @@ func main() {
 	}
 
 	// Access manager: allowlist + admins + pending-request queue (persisted).
-	acc := access.New(cfg.Telegram.Admins, cfg.Telegram.Allowlist, cfg.Telegram.AllowlistFile)
+	acc := access.New(cfg.Telegram.Admins, cfg.Telegram.Allowlist, cfg.Telegram.AllowlistFile, logger)
 
 	// Budget + shared control-plane commands + the admin /handshake command.
 	meter := budget.New(cfg.Budget.Tier, nil)
 	cmds := relay.StandardCommands(meter)
+	// Central admin gating for all Admin-flagged commands.
+	cmds.IsAdmin = func(senderID string) bool {
+		id, err := strconv.ParseInt(senderID, 10, 64)
+		return err == nil && acc.IsAdmin(id)
+	}
 	cmds.Register(command.Command{
-		Name: "handshake",
-		Help: "admin: list/approve/deny access requests",
-		Run:  handshake(acc),
+		Name:  "handshake",
+		Help:  "admin: list/approve/deny access requests",
+		Admin: true,
+		Run:   handshake(acc),
 	})
 
 	// Claude backend: listen on the socket for the shim.
@@ -88,8 +94,8 @@ func main() {
 	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
 
 	// Permission relay: admins approve tool-use prompts via /allow and /deny.
-	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Run: verdict(acc, back, true)})
-	cmds.Register(command.Command{Name: "deny", Help: "admin: reject a tool request: /deny <id>", Run: verdict(acc, back, false)})
+	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Admin: true, Run: verdict(back, true)})
+	cmds.Register(command.Command{Name: "deny", Help: "admin: reject a tool request: /deny <id>", Admin: true, Run: verdict(back, false)})
 
 	// Forward Claude's tool-approval prompts to every admin's chat.
 	go func() {
@@ -130,14 +136,10 @@ func main() {
 	logger.Printf("stopped")
 }
 
-// verdict returns an admin-only /allow or /deny handler that answers a pending
-// tool-approval request by its id.
-func verdict(acc *access.Manager, back *claudebk.Endpoint, allow bool) command.Handler {
-	return func(ctx command.Context, args []string) string {
-		sender, _ := strconv.ParseInt(ctx.SenderID, 10, 64)
-		if !acc.IsAdmin(sender) {
-			return "⛔ not authorized (admins only)"
-		}
+// verdict returns an /allow or /deny handler that answers a pending tool-approval
+// request by its id. Admin gating is enforced centrally by the registry.
+func verdict(back *claudebk.Endpoint, allow bool) command.Handler {
+	return func(_ command.Context, args []string) string {
 		if len(args) < 1 {
 			return "usage: /" + map[bool]string{true: "allow", false: "deny"}[allow] + " <request_id>"
 		}
@@ -157,11 +159,8 @@ func verdict(acc *access.Manager, back *claudebk.Endpoint, allow bool) command.H
 //	/handshake approve <id> grant access to a pending id
 //	/handshake deny <id>    drop a pending request
 func handshake(acc *access.Manager) command.Handler {
-	return func(ctx command.Context, args []string) string {
-		sender, _ := strconv.ParseInt(ctx.SenderID, 10, 64)
-		if !acc.IsAdmin(sender) {
-			return "⛔ not authorized (admins only)"
-		}
+	const maxList = 20 // cap the listing so it stays under Telegram's message limit
+	return func(_ command.Context, args []string) string {
 		if len(args) == 0 {
 			pend := acc.Pending()
 			if len(pend) == 0 {
@@ -169,7 +168,11 @@ func handshake(acc *access.Manager) command.Handler {
 			}
 			var b strings.Builder
 			b.WriteString("pending requests:\n")
-			for _, r := range pend {
+			for i, r := range pend {
+				if i >= maxList {
+					fmt.Fprintf(&b, "  …and %d more\n", len(pend)-maxList)
+					break
+				}
 				fmt.Fprintf(&b, "  %d — %s\n", r.ID, r.Name)
 			}
 			b.WriteString("approve with: /handshake approve <id>")
@@ -179,7 +182,7 @@ func handshake(acc *access.Manager) command.Handler {
 			return "usage: /handshake [approve|deny] <id>"
 		}
 		id, err := strconv.ParseInt(args[1], 10, 64)
-		if err != nil {
+		if err != nil || id <= 0 {
 			return "invalid id: " + args[1]
 		}
 		switch args[0] {
@@ -187,7 +190,7 @@ func handshake(acc *access.Manager) command.Handler {
 			if acc.Approve(id) {
 				return fmt.Sprintf("✅ approved %d", id)
 			}
-			return fmt.Sprintf("approved %d (was not pending)", id)
+			return fmt.Sprintf("%d is not pending or denied — not approved (use an id from /handshake)", id)
 		case "deny":
 			if acc.Deny(id) {
 				return fmt.Sprintf("denied %d", id)

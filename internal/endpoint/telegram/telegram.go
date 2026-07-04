@@ -169,6 +169,9 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 			if m == nil || m.Text == "" {
 				continue
 			}
+			if m.From.ID <= 0 { // no/invalid sender (e.g. anonymous channel post) — ignore
+				continue
+			}
 			if !f.auth.Allowed(m.From.ID) {
 				name := m.From.Username
 				if name == "" {
