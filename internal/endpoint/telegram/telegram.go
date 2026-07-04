@@ -107,7 +107,7 @@ func New(token string, opts ...Option) *Frontend {
 }
 
 func (f *Frontend) Name() string               { return "telegram" }
-func (f *Frontend) Recv() <-chan relay.Message  { return f.recv }
+func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 
 // Close stops polling. The Recv channel is closed by the poll loop on exit.
 func (f *Frontend) Close() error { f.cancel(); return nil }
@@ -125,10 +125,10 @@ type tgChat struct {
 }
 
 type tgMessage struct {
-	MessageID int64   `json:"message_id"`
-	From      tgUser  `json:"from"`
-	Chat      tgChat  `json:"chat"`
-	Text      string  `json:"text"`
+	MessageID int64  `json:"message_id"`
+	From      tgUser `json:"from"`
+	Chat      tgChat `json:"chat"`
+	Text      string `json:"text"`
 }
 
 type tgUpdate struct {

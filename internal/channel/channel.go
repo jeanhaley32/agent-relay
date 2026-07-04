@@ -19,12 +19,12 @@ import (
 
 // Channel-specific protocol constants (Claude Code extensions to MCP).
 const (
-	capabilityKey    = "claude/channel"
+	capabilityKey     = "claude/channel"
 	permCapabilityKey = "claude/channel/permission"
-	notifyMethod     = "notifications/claude/channel"
+	notifyMethod      = "notifications/claude/channel"
 	permRequestMethod = "notifications/claude/channel/permission_request"
 	permVerdictMethod = "notifications/claude/channel/permission"
-	replyToolName    = "reply"
+	replyToolName     = "reply"
 )
 
 // PermissionRequest is a tool-approval prompt forwarded from Claude Code.
