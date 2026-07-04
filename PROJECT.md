@@ -18,9 +18,11 @@ Keep this file current: when you finish work, update **Status**, the **Work log*
 A Go broker that connects **message frontends** (Telegram, CLI, webhooks) to **agent
 backends** (Claude Code, Ollama, OpenAI) through **one symmetric `Endpoint` interface**, so
 either side is swappable by config. It runs on an always-on, Tailscale-only ThinkPad
-(see the machine's `~/CLAUDE.md`). The near-term goal: text a Telegram bot and have it
-driven by Claude Code (on a subscription, not metered API), with local Ollama offload for
-cheap traffic to conserve subscription quota.
+(see the machine's `~/CLAUDE.md`).
+
+**MVP scope (current):** text a Telegram bot → driven by Claude Code (on a subscription, not
+metered API), gated by the budget/command control plane. Ollama offload is **deferred** —
+designed for, not built. The MVP is `cmd/relayd` wiring Telegram ⇄ broker ⇄ Claude backend.
 
 Repo: `github.com/jeanhaley32/agent-relay` (private). Local: `~/agent-relay`. Go 1.24.
 
@@ -37,7 +39,8 @@ Repo: `github.com/jeanhaley32/agent-relay` (private). Local: `~/agent-relay`. Go
 | Telegram frontend endpoint | 🟡 built + unit-tested | `internal/endpoint/telegram`; live bot round-trip pending a token (§8 T1) |
 | Claude Code backend endpoint (daemon+shim) | 🟡 built + tested | `internal/ipc`, `internal/endpoint/claude`, `cmd/relay-shim`; live wiring pending (§8 C1) |
 | Ollama backend endpoint (+breaker fallback) | ⬜ todo | §8 item O1 |
-| Config loader + daemon wiring | ⬜ todo | §8 item D1 |
+| **Config loader + `relayd` daemon (MVP)** | 🟡 built + tested | `internal/config`, `cmd/relayd`; Telegram⇄broker⇄Claude wired. Live run pending token (§8 D1) |
+| Ollama backend (+breaker fallback) | ⏸ deferred | out of MVP scope by decision |
 | CI (build+test on push) | ⬜ todo | §8 item X1 |
 
 Branch state: PoC-1 on `poc-1-channel` → **PR #1** (open). `main` has the core + control plane.
@@ -77,6 +80,8 @@ Two backend control-flow shapes hidden behind the one interface:
 | `internal/endpoint/claude` | Daemon-side Claude backend `Endpoint`: unix-socket listener; Send→inject frame, reply frame→Recv. | `New(socket)`, `Endpoint`, `ErrNoSession` | Claude-specific |
 | `internal/endpoint/telegram` | Telegram frontend `Endpoint`: long-poll, allowlist, sendMessage. | `New(token, opts…)` | platform |
 | `cmd/relay-shim` | Thin bridge Claude spawns over stdio; connects to daemon socket; translates inject↔reply. | `main`, `--socket` | — |
+| `internal/config` | JSON config loader (dependency-free); token via env var name, not stored. | `Load`, `Config`, `Token` | platform |
+| `cmd/relayd` | **MVP daemon**: wires Telegram ⇄ broker (budget+commands) ⇄ Claude from config. | `main`, `--config` | — |
 
 ## 5. Validated results
 
@@ -164,10 +169,12 @@ Ordered by the critical path. Each item names files to add and a "done when" bar
   fallback**: when the Claude budget trips, route to Ollama instead of rejecting. *Done when:*
   `/backend ollama` (or an open breaker) routes a turn to a local model and replies.
 
-- **D1 — Config + daemon wiring**
-  `internal/config` (YAML per DESIGN.md) + a `cmd/relayd` that reads config, builds endpoints,
-  and runs brokers. *Done when:* a single config file starts Telegram↔(Claude|Ollama) with the
-  budget tier and allowlist applied.
+- **D1 — Config + `relayd` daemon (MVP)** 🟡 *built + tested; live run pending token*
+  `internal/config` (JSON, dependency-free) + `cmd/relayd` wiring Telegram ⇄ broker
+  (budget+commands) ⇄ Claude backend, with graceful SIGINT/SIGTERM shutdown. Config test +
+  `config.example.json` + `.mcp.json` registering `relay-shim`. **Remaining (the MVP finish
+  line):** `export TELEGRAM_BOT_TOKEN`, run `relayd`, launch `claude … server:relay`, and
+  confirm a Telegram DM round-trips through Claude. Decide reply-tool pre-approval.
 
 - **X1 — CI**: GitHub Actions running `go vet` + `go build` + `go test` on push/PR.
 
@@ -199,6 +206,11 @@ description.
 
 ## 11. Work log (newest first)
 
+- **2026-07-03** — Built **D1 MVP daemon**: `internal/config` (JSON loader + test) and
+  `cmd/relayd` wiring Telegram ⇄ broker ⇄ Claude with graceful shutdown. Added
+  `config.example.json`, registered `relay-shim` in `.mcp.json`, factored shared control-plane
+  commands into `relay.StandardCommands` (used by both `relayd` and `broker-demo`). Scoped MVP
+  to Telegram↔Claude; Ollama deferred. Builds + full suite pass; startup/shutdown smoke-tested.
 - **2026-07-03** — Built **C1 Claude backend** (daemon+shim): `internal/ipc` (framed
   inject/reply over unix socket), `internal/endpoint/claude` (daemon-side `Endpoint`),
   `cmd/relay-shim` (stdio bridge on `internal/channel`). IPC round-trip + socket bridge
