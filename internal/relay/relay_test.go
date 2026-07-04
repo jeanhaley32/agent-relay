@@ -15,18 +15,18 @@ type capFrontend struct {
 	sent chan Message
 }
 
-func (f *capFrontend) Name() string                          { return "front" }
-func (f *capFrontend) Recv() <-chan Message                  { return f.recv }
+func (f *capFrontend) Name() string                            { return "front" }
+func (f *capFrontend) Recv() <-chan Message                    { return f.recv }
 func (f *capFrontend) Send(_ context.Context, m Message) error { f.sent <- m; return nil }
-func (f *capFrontend) Close() error                          { return nil }
+func (f *capFrontend) Close() error                            { return nil }
 
 // emitBackend emits replies the test pushes onto recv.
 type emitBackend struct{ recv chan Message }
 
-func (b *emitBackend) Name() string                          { return "back" }
-func (b *emitBackend) Recv() <-chan Message                  { return b.recv }
-func (b *emitBackend) Send(context.Context, Message) error   { return nil }
-func (b *emitBackend) Close() error                          { close(b.recv); return nil }
+func (b *emitBackend) Name() string                        { return "back" }
+func (b *emitBackend) Recv() <-chan Message                { return b.recv }
+func (b *emitBackend) Send(context.Context, Message) error { return nil }
+func (b *emitBackend) Close() error                        { close(b.recv); return nil }
 
 // TestOutboundGate: the model's replies to non-allowlisted chats are dropped;
 // replies to allowed chats are delivered.

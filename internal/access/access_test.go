@@ -96,8 +96,8 @@ func TestDenyOnlyPending(t *testing.T) {
 func TestApproveUnDenies(t *testing.T) {
 	m := New(nil, nil, "", nil)
 	m.Record(8, "x")
-	m.Deny(8)              // now denied, not pending
-	if !m.Approve(8) {     // approve must reverse the denial
+	m.Deny(8)          // now denied, not pending
+	if !m.Approve(8) { // approve must reverse the denial
 		t.Fatal("approve should un-deny a previously denied id")
 	}
 	if !m.Allowed(8) {

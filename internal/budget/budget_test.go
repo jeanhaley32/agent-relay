@@ -8,7 +8,7 @@ import (
 // fakeClock is a controllable time source for deterministic tests.
 type fakeClock struct{ t time.Time }
 
-func (c *fakeClock) now() time.Time  { return c.t }
+func (c *fakeClock) now() time.Time      { return c.t }
 func (c *fakeClock) add(d time.Duration) { c.t = c.t.Add(d) }
 
 func TestCircuitTripsAndRecovers(t *testing.T) {
