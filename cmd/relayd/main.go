@@ -76,6 +76,24 @@ func main() {
 		telegram.WithLogger(logger),
 	)
 
+	// Permission relay: admins approve tool-use prompts via /allow and /deny.
+	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Run: verdict(acc, back, true)})
+	cmds.Register(command.Command{Name: "deny", Help: "admin: reject a tool request: /deny <id>", Run: verdict(acc, back, false)})
+
+	// Forward Claude's tool-approval prompts to every admin's chat.
+	go func() {
+		for req := range back.Permissions() {
+			msg := fmt.Sprintf("🔐 Claude wants to use %s\n%s\n\napprove: /allow %s   deny: /deny %s",
+				req.Tool, req.Detail, req.ID, req.ID)
+			for _, admin := range cfg.Telegram.Admins {
+				id := strconv.FormatInt(admin, 10)
+				_ = front.Send(context.Background(), relay.Message{
+					ConversationID: id, Text: msg, Meta: map[string]string{"chat_id": id},
+				})
+			}
+		}
+	}()
+
 	b := &relay.Broker{Frontend: front, Backend: back, Commands: cmds, Meter: meter}
 
 	logger.Printf("relayd up — tier=%s, socket=%s, allowed=%d sender(s), admins=%d",
@@ -99,6 +117,27 @@ func main() {
 		logger.Fatalf("broker: %v", err)
 	}
 	logger.Printf("stopped")
+}
+
+// verdict returns an admin-only /allow or /deny handler that answers a pending
+// tool-approval request by its id.
+func verdict(acc *access.Manager, back *claudebk.Endpoint, allow bool) command.Handler {
+	return func(ctx command.Context, args []string) string {
+		sender, _ := strconv.ParseInt(ctx.SenderID, 10, 64)
+		if !acc.IsAdmin(sender) {
+			return "⛔ not authorized (admins only)"
+		}
+		if len(args) < 1 {
+			return "usage: /" + map[bool]string{true: "allow", false: "deny"}[allow] + " <request_id>"
+		}
+		if err := back.Decide(args[0], allow); err != nil {
+			return "error: " + err.Error()
+		}
+		if allow {
+			return "✅ allowed " + args[0]
+		}
+		return "⛔ denied " + args[0]
+	}
 }
 
 // handshake returns the admin-only /handshake command handler:

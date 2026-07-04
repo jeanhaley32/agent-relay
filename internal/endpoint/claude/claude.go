@@ -19,11 +19,19 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
+// PermRequest is a tool-approval request surfaced from the Claude session.
+type PermRequest struct {
+	ID     string // request id to echo in the verdict
+	Tool   string // tool name (e.g. "Bash")
+	Detail string // human-readable description
+}
+
 // Endpoint is the Claude Code backend.
 type Endpoint struct {
 	socketPath string
 	ln         net.Listener
 	recv       chan relay.Message
+	perms      chan PermRequest
 
 	mu   sync.Mutex
 	conn *ipc.Conn // current shim connection (nil until one connects)
@@ -43,18 +51,36 @@ func New(socketPath string) (*Endpoint, error) {
 		socketPath: socketPath,
 		ln:         ln,
 		recv:       make(chan relay.Message, 32),
+		perms:      make(chan PermRequest, 32),
 	}
 	go e.acceptLoop()
 	return e, nil
 }
 
-func (e *Endpoint) Name() string              { return "claude" }
-func (e *Endpoint) Recv() <-chan relay.Message { return e.recv }
+func (e *Endpoint) Name() string               { return "claude" }
+func (e *Endpoint) Recv() <-chan relay.Message  { return e.recv }
+
+// Permissions delivers tool-approval requests from the Claude session. Consume
+// these and call Decide to answer. If no one consumes them, tool calls that need
+// approval will simply wait (Claude's local dialog stays open).
+func (e *Endpoint) Permissions() <-chan PermRequest { return e.perms }
+
+// Decide answers a pending permission request: allow=true proceeds, false rejects.
+func (e *Endpoint) Decide(requestID string, allow bool) error {
+	e.mu.Lock()
+	c := e.conn
+	e.mu.Unlock()
+	if c == nil {
+		return ErrNoSession
+	}
+	return c.Send(ipc.Frame{Kind: ipc.KindPermVerdict, RequestID: requestID, Allow: allow})
+}
 
 // acceptLoop accepts shim connections. Only the most recent is used for Send;
 // each connection's reply stream is pumped onto recv.
 func (e *Endpoint) acceptLoop() {
 	defer close(e.recv)
+	defer close(e.perms)
 	for {
 		nc, err := e.ln.Accept()
 		if err != nil {
@@ -81,18 +107,25 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 			e.mu.Unlock()
 			return
 		}
-		if f.Kind != ipc.KindReply {
-			continue // ignore unexpected frames
-		}
-		msg := relay.Message{
-			ConversationID: f.ChatID,
-			Role:           relay.Assistant,
-			Text:           f.Text,
-			Meta:           map[string]string{"chat_id": f.ChatID},
-		}
-		select {
-		case e.recv <- msg:
-		default: // drop if the consumer is gone/slow rather than block accept loop
+		switch f.Kind {
+		case ipc.KindReply:
+			msg := relay.Message{
+				ConversationID: f.ChatID,
+				Role:           relay.Assistant,
+				Text:           f.Text,
+				Meta:           map[string]string{"chat_id": f.ChatID},
+			}
+			select {
+			case e.recv <- msg:
+			default: // drop if the consumer is gone/slow rather than block accept loop
+			}
+		case ipc.KindPermRequest:
+			select {
+			case e.perms <- PermRequest{ID: f.RequestID, Tool: f.Tool, Detail: f.Detail}:
+			default:
+			}
+		default:
+			// ignore unexpected frames
 		}
 	}
 }

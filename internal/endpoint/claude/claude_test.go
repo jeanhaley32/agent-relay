@@ -74,4 +74,29 @@ func TestEndpointBridge(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for reply on Recv")
 	}
+
+	// Permission relay: shim forwards a tool request -> surfaces on Permissions;
+	// Decide -> shim receives a verdict frame.
+	if err := shim.Send(ipc.Frame{Kind: ipc.KindPermRequest, RequestID: "abcde", Tool: "Bash", Detail: "run ls"}); err != nil {
+		t.Fatalf("shim send perm request: %v", err)
+	}
+	select {
+	case p := <-e.Permissions():
+		if p.ID != "abcde" || p.Tool != "Bash" {
+			t.Fatalf("wrong perm request: %+v", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for permission request")
+	}
+
+	if err := e.Decide("abcde", true); err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	v, err := shim.Recv()
+	if err != nil {
+		t.Fatalf("shim recv verdict: %v", err)
+	}
+	if v.Kind != ipc.KindPermVerdict || v.RequestID != "abcde" || !v.Allow {
+		t.Fatalf("wrong verdict frame: %+v", v)
+	}
 }
