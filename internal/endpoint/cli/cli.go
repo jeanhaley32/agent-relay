@@ -41,9 +41,9 @@ func (f *Frontend) readLoop(in io.Reader) {
 	}
 }
 
-func (f *Frontend) Name() string              { return "cli" }
+func (f *Frontend) Name() string               { return "cli" }
 func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
-func (f *Frontend) Close() error              { return nil }
+func (f *Frontend) Close() error               { return nil }
 
 // Send prints an assistant/reply message to the output writer.
 func (f *Frontend) Send(_ context.Context, m relay.Message) error {
