@@ -11,6 +11,12 @@ supported: no other chat platforms, no other model backends. (Internally the pie
 factored so more could be added later — see [`DESIGN.md`](./DESIGN.md) — but none are built,
 so don't pick this up expecting a general-purpose, provider-agnostic relay.)
 
+> ⚠️ **Experimental (`v0.x`).** This relies on Claude Code **channels**, a *research-preview*
+> feature that can change or break with Claude Code updates. It also hands chat users a
+> Claude Code session with **tool access to your machine** — read [`SECURITY.md`](./SECURITY.md)
+> before exposing it to anyone but yourself. Running an automated bot on your Claude
+> subscription is your responsibility under Anthropic's usage policies.
+
 ```
   Telegram DM ──▶ relayd ──▶ [ commands? · budget/rate gate ] ──▶ Claude Code (Sonnet)
        ▲                                                                │
