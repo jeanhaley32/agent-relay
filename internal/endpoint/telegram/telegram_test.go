@@ -14,6 +14,40 @@ import (
 
 const testToken = "TESTTOKEN"
 
+// TestMeHandshake covers the getMe connection handshake: success identifies the
+// bot; a non-ok response is a clear error.
+func TestMeHandshake(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bot"+testToken+"/getMe", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":{"id":8656983200,"username":"thinkpt480bot","first_name":"thinkbot"}}`)
+	})
+	mux.HandleFunc("/botBADTOKEN/getMe", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":false,"description":"Unauthorized"}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Valid token → bot identity.
+	good := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithPollTimeout(0))
+	defer good.Close()
+	info, err := good.Me(context.Background())
+	if err != nil {
+		t.Fatalf("Me: %v", err)
+	}
+	if info.Username != "thinkpt480bot" || info.ID != 8656983200 {
+		t.Fatalf("wrong bot info: %+v", info)
+	}
+
+	// Bad token → clear error.
+	bad := New("BADTOKEN", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithPollTimeout(0))
+	defer bad.Close()
+	if _, err := bad.Me(context.Background()); err == nil {
+		t.Fatal("expected error for bad token")
+	}
+}
+
 // TestPollGateAndSend verifies inbound allowlist gating, message normalization,
 // and outbound sendMessage — all against an httptest server, no real bot.
 func TestPollGateAndSend(t *testing.T) {

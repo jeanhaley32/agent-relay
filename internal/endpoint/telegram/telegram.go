@@ -223,6 +223,42 @@ func (f *Frontend) getUpdates(ctx context.Context, offset int64) ([]tgUpdate, er
 	return out.Result, nil
 }
 
+// BotInfo identifies the connected bot, returned by the getMe handshake.
+type BotInfo struct {
+	ID        int64
+	Username  string
+	FirstName string
+}
+
+// Me performs the connection handshake: it calls Telegram's getMe to verify the
+// token and identify the bot. A clear error here means a bad token or that
+// Telegram is unreachable — call it at startup to fail fast instead of silently
+// long-polling a misconfigured bot.
+func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
+	endpoint := fmt.Sprintf("%s/bot%s/getMe", f.base, f.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return BotInfo{}, err
+	}
+	resp, err := f.http.Do(req)
+	if err != nil {
+		return BotInfo{}, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+		Result      tgUser `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return BotInfo{}, err
+	}
+	if !out.OK {
+		return BotInfo{}, fmt.Errorf("telegram getMe: %s", out.Description)
+	}
+	return BotInfo{ID: out.Result.ID, Username: out.Result.Username, FirstName: out.Result.FirstName}, nil
+}
+
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
 // to m.ConversationID) via sendMessage.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
