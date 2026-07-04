@@ -81,6 +81,34 @@ func TestDenyBlocksRequeue(t *testing.T) {
 	}
 }
 
+func TestDenyOnlyPending(t *testing.T) {
+	m := New(nil, nil, "", nil)
+	if m.Deny(123) { // never pending — must be a no-op
+		t.Fatal("deny of a non-pending id should return false")
+	}
+	// A stray deny must NOT permanently block a later genuine request.
+	m.Record(123, "later")
+	if len(m.Pending()) != 1 {
+		t.Fatal("a non-pending deny must not denylist the id")
+	}
+}
+
+func TestApproveUnDenies(t *testing.T) {
+	m := New(nil, nil, "", nil)
+	m.Record(8, "x")
+	m.Deny(8)              // now denied, not pending
+	if !m.Approve(8) {     // approve must reverse the denial
+		t.Fatal("approve should un-deny a previously denied id")
+	}
+	if !m.Allowed(8) {
+		t.Fatal("un-denied id should be allowed")
+	}
+	m.Record(8, "x") // already allowed → no new pending
+	if len(m.Pending()) != 0 {
+		t.Fatal("allowed id should not re-queue")
+	}
+}
+
 func TestPendingBounded(t *testing.T) {
 	m := New(nil, nil, "", nil)
 	for i := int64(1); i <= maxPending+50; i++ {

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -144,8 +145,9 @@ func sanitizeName(s string) string {
 		return r
 	}, s)
 	s = strings.TrimSpace(s)
-	if len(s) > maxNameLen {
-		s = strings.TrimSpace(s[:maxNameLen])
+	if utf8.RuneCountInString(s) > maxNameLen {
+		r := []rune(s)
+		s = strings.TrimSpace(string(r[:maxNameLen])) // truncate on a rune boundary
 	}
 	return s
 }
@@ -162,10 +164,34 @@ func (m *Manager) Pending() []Request {
 	return out
 }
 
-// Approve grants access to a currently-pending id and persists. Returns false
-// (and grants nothing) if the id was not pending — so a typo can't silently
-// authorize a stranger.
+// Approve grants access to an id that is currently pending OR previously denied
+// (clearing the denial — this is the un-deny path). Returns false (and grants
+// nothing) if the id is neither pending nor denied — so a typo can't silently
+// authorize a never-seen stranger.
 func (m *Manager) Approve(id int64) bool {
+	if id <= 0 {
+		return false
+	}
+	m.mu.Lock()
+	_, pending := m.pending[id]
+	denied := m.denied[id]
+	if !pending && !denied {
+		m.mu.Unlock()
+		return false
+	}
+	m.removePending(id)
+	delete(m.denied, id) // reverse a prior Deny
+	m.allowed[id] = true
+	m.mu.Unlock()
+	m.save()
+	return true
+}
+
+// Deny drops a pending request and remembers the denial (persisted) so the
+// sender can't immediately re-queue. It only denylists ids that were actually
+// pending — a stray Deny of an unknown id is a no-op (returns false), so it
+// can't permanently block someone who never asked. Reverse a denial with Approve.
+func (m *Manager) Deny(id int64) bool {
 	if id <= 0 {
 		return false
 	}
@@ -175,25 +201,10 @@ func (m *Manager) Approve(id int64) bool {
 		return false
 	}
 	m.removePending(id)
-	m.allowed[id] = true
-	m.mu.Unlock()
-	m.save()
-	return true
-}
-
-// Deny drops a pending request and remembers the denial (persisted) so the
-// sender can't immediately re-queue. Returns false if the id was not pending.
-func (m *Manager) Deny(id int64) bool {
-	if id <= 0 {
-		return false
-	}
-	m.mu.Lock()
-	_, ok := m.pending[id]
-	m.removePending(id)
 	m.denied[id] = true
 	m.mu.Unlock()
 	m.save()
-	return ok
+	return true
 }
 
 // removePending deletes from the pending map and order slice. Caller holds mu.

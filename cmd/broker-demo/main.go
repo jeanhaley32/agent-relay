@@ -26,6 +26,7 @@ func main() {
 
 	meter := budget.New(*tier, nil)
 	cmds := relay.StandardCommands(meter) // shared control-plane commands
+	cmds.IsAdmin = func(string) bool { return true } // demo: the single local operator is admin
 
 	front := cli.New("demo", os.Stdin, os.Stdout)
 	back := echo.New()

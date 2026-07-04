@@ -36,9 +36,10 @@ type Command struct {
 // Dispatch is read-only after setup and safe to call concurrently.
 type Registry struct {
 	cmds map[string]Command
-	// IsAdmin reports whether a sender id (as a string) is an admin. When nil,
-	// no admin system is configured and admin gating is skipped (e.g. the CLI
-	// demo). Set it to enforce admin-only commands.
+	// IsAdmin reports whether a sender id (as a string) is an admin. It MUST be
+	// set to use Admin-flagged commands: when nil, admin gating fails closed and
+	// every Admin command is denied. (The CLI demo opts in with a func returning
+	// true.)
 	IsAdmin func(senderID string) bool
 }
 
@@ -51,9 +52,10 @@ func NewRegistry() *Registry {
 	return r
 }
 
-// admin reports whether the caller is an admin (nil predicate ⇒ yes).
+// admin reports whether the caller is an admin. Fails closed: a nil predicate
+// (no admin system wired) denies all admin commands.
 func (r *Registry) admin(senderID string) bool {
-	return r.IsAdmin == nil || r.IsAdmin(senderID)
+	return r.IsAdmin != nil && r.IsAdmin(senderID)
 }
 
 // Register adds or replaces a command.

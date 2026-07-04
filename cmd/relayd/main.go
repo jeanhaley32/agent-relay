@@ -179,7 +179,7 @@ func handshake(acc *access.Manager) command.Handler {
 			if acc.Approve(id) {
 				return fmt.Sprintf("✅ approved %d", id)
 			}
-			return fmt.Sprintf("%d is not a pending request — not approved (use the id from /handshake)", id)
+			return fmt.Sprintf("%d is not pending or denied — not approved (use an id from /handshake)", id)
 		case "deny":
 			if acc.Deny(id) {
 				return fmt.Sprintf("denied %d", id)
