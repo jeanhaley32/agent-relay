@@ -122,6 +122,9 @@ forwarded to admins' chat; reply `/allow <id>` or `/deny <id>`. The session neve
 **Heavier tasks:** the session runs on Sonnet to be light on your quota. Ask it to *"spawn a
 subagent on Opus to …"* when you want stronger reasoning.
 
+**Sending a literal command to the model:** prefix with a backslash — `\/help` reaches Claude
+as the text `/help` instead of being intercepted by the relay.
+
 ---
 
 ## Try the control plane without a bot
