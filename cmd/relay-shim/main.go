@@ -50,6 +50,22 @@ func main() {
 			return conn.Send(ipc.Frame{Kind: ipc.KindReply, ChatID: chatID, Text: text})
 		})
 
+	// Claude → daemon: forward tool-approval prompts down the relay pipeline.
+	srv.EnablePermissionRelay(func(req channel.PermissionRequest) {
+		detail := req.Description
+		if req.InputPreview != "" {
+			detail += " — " + req.InputPreview
+		}
+		if err := conn.Send(ipc.Frame{
+			Kind:      ipc.KindPermRequest,
+			RequestID: req.RequestID,
+			Tool:      req.ToolName,
+			Detail:    detail,
+		}); err != nil {
+			logger.Printf("forward permission request: %v", err)
+		}
+	})
+
 	// daemon → Claude: read inject frames and push them into the session.
 	go func() {
 		for {
@@ -58,18 +74,22 @@ func main() {
 				logger.Printf("daemon connection closed: %v", err)
 				return
 			}
-			if f.Kind != ipc.KindInject {
-				continue
-			}
-			meta := f.Meta
-			if meta == nil {
-				meta = map[string]string{}
-			}
-			if _, ok := meta["chat_id"]; !ok {
-				meta["chat_id"] = f.ChatID
-			}
-			if err := srv.Inject(f.Text, meta); err != nil {
-				logger.Printf("inject error: %v", err)
+			switch f.Kind {
+			case ipc.KindInject:
+				meta := f.Meta
+				if meta == nil {
+					meta = map[string]string{}
+				}
+				if _, ok := meta["chat_id"]; !ok {
+					meta["chat_id"] = f.ChatID
+				}
+				if err := srv.Inject(f.Text, meta); err != nil {
+					logger.Printf("inject error: %v", err)
+				}
+			case ipc.KindPermVerdict:
+				if err := srv.SendVerdict(f.RequestID, f.Allow); err != nil {
+					logger.Printf("send verdict error: %v", err)
+				}
 			}
 		}
 	}()
