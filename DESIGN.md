@@ -1,15 +1,13 @@
 # agent-relay — design
 
-## Scope (read first)
+## What this is
 
-**What's built and supported:** a one-way-in, one-way-out router — **Telegram messages →
-a Claude Code session → replies back to Telegram** — with a control plane (allowlist +
-admin approval, rate limit / circuit breaker, tool-approval relay) in between.
+`agent-relay` routes Telegram messages to a Claude Code session and sends the replies back,
+with a control plane in between: allowlist + admin approval, rate limit / circuit breaker,
+and tool-approval relay. This document describes how that's built.
 
-**What's *not* built:** any other chat frontend, and any other model backend. The internals
-are factored around a generic `Endpoint` abstraction so more could be added later, and this
-document describes that factoring — but treat everything under
-[Design intent (not built)](#design-intent-not-built) as aspiration, not capability.
+The internals are factored around a generic `Endpoint` abstraction, which leaves room for
+other frontends or backends; those are sketched under [Design intent](#design-intent-not-built).
 
 ```
   Telegram DM ──▶ relayd ──▶ [ command? · access gate · budget/circuit ] ──▶ Claude Code
@@ -189,8 +187,7 @@ agent-relay/
 
 ## Design intent (not built)
 
-These are **aspirational** — the `Endpoint` factoring leaves room for them, but none exist.
-Do not read them as features.
+Directions the `Endpoint` factoring leaves room for. None are built yet.
 
 - **Other frontends** (Discord, iMessage, webhooks) — each would be another `Endpoint`
   implementation with its own sender-gating.

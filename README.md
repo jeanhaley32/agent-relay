@@ -3,13 +3,8 @@
 **Text a Telegram bot, get answered by Claude Code running on your own machine.**
 
 `agent-relay` is a small Go daemon that routes Telegram messages to a Claude Code session,
-with a control plane in between: an allowlist, per-account rate limiting, a circuit breaker,
-and tool-approval prompts you answer from chat.
-
-That's the scope today — **a Telegram router for a Claude Code backend.** Nothing else is
-supported: no other chat platforms, no other model backends. (Internally the pieces are
-factored so more could be added later — see [`DESIGN.md`](./DESIGN.md) — but none are built,
-so don't pick this up expecting a general-purpose, provider-agnostic relay.)
+with a control plane in between: an allowlist and admin approval, per-account rate limiting,
+a circuit breaker, and tool-approval prompts you answer from chat.
 
 ```
   Telegram DM ──▶ relayd ──▶ [ commands? · budget/rate gate ] ──▶ Claude Code (Sonnet)
@@ -149,9 +144,8 @@ the rate budget?), and forwards the rest to a Claude Code session. Because Claud
 *spawns* its channel over stdio, a thin `relay-shim` bridges the always-on daemon to the
 Claude session over a unix socket; replies flow back the same way.
 
-Full architecture (including the internal factoring that could support other frontends or
-backends in future — currently unused), the token/turn economics, and the security model are
-in [`DESIGN.md`](./DESIGN.md); current status and roadmap in [`PROJECT.md`](./PROJECT.md).
+Full architecture, the token/turn economics, and the security model are in
+[`DESIGN.md`](./DESIGN.md); current status and roadmap in [`PROJECT.md`](./PROJECT.md).
 
 ## License
 
