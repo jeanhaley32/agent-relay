@@ -2,11 +2,14 @@
 
 **Text a Telegram bot, get answered by Claude Code running on your own machine.**
 
-`agent-relay` is a small Go daemon that bridges a chat frontend (Telegram) to an agent
-backend (Claude Code), with a control plane in between: an allowlist, per-account rate
-limiting, a circuit breaker, and tool-approval prompts you answer from chat. It's built so
-either side is swappable — the same core could drive a different chat app or a different
-model — but the working, batteries-included path today is **Telegram ⇄ Claude Code**.
+`agent-relay` is a small Go daemon that routes Telegram messages to a Claude Code session,
+with a control plane in between: an allowlist, per-account rate limiting, a circuit breaker,
+and tool-approval prompts you answer from chat.
+
+That's the scope today — **a Telegram router for a Claude Code backend.** Nothing else is
+supported: no other chat platforms, no other model backends. (Internally the pieces are
+factored so more could be added later — see [`DESIGN.md`](./DESIGN.md) — but none are built,
+so don't pick this up expecting a general-purpose, provider-agnostic relay.)
 
 ```
   Telegram DM ──▶ relayd ──▶ [ commands? · budget/rate gate ] ──▶ Claude Code (Sonnet)
@@ -18,9 +21,6 @@ model — but the working, batteries-included path today is **Telegram ⇄ Claud
 - **Gated.** Only people you allow can use it; strangers queue for approval.
 - **Cheap by default.** Runs on Sonnet; ask it to spawn an Opus subagent for hard tasks.
 - **Resilient.** Restart/upgrade the daemon without losing messages or context.
-
-> Ollama and OpenAI backends are designed for (the backend is a swappable `Endpoint`) but
-> not yet built. See [`DESIGN.md`](./DESIGN.md).
 
 ---
 
@@ -144,13 +144,14 @@ printf '/tier pro\n/rate\nhello\n/status\n' | go run ./cmd/broker-demo
 
 ## How it works
 
-Everything is an `Endpoint` (emits + accepts messages); a `Broker` binds two of them and
-pumps between them, screening slash commands and gating model turns through a budget meter.
-The Claude backend is special — Claude Code *spawns* the channel over stdio — so a thin
-`relay-shim` bridges the always-on daemon to each Claude session over a unix socket.
+`relayd` long-polls Telegram, screens each message (slash command? allowed sender? within
+the rate budget?), and forwards the rest to a Claude Code session. Because Claude Code
+*spawns* its channel over stdio, a thin `relay-shim` bridges the always-on daemon to the
+Claude session over a unix socket; replies flow back the same way.
 
-Full architecture, the token/turn economics, and the security model are in
-[`DESIGN.md`](./DESIGN.md); current status and roadmap in [`PROJECT.md`](./PROJECT.md).
+Full architecture (including the internal factoring that could support other frontends or
+backends in future — currently unused), the token/turn economics, and the security model are
+in [`DESIGN.md`](./DESIGN.md); current status and roadmap in [`PROJECT.md`](./PROJECT.md).
 
 ## License
 
