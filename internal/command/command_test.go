@@ -56,6 +56,25 @@ func TestNilAdminFailsClosed(t *testing.T) {
 	}
 }
 
+func TestEscaped(t *testing.T) {
+	cases := []struct {
+		in, out string
+		ok      bool
+	}{
+		{`\/help`, `/help`, true}, // escaped command → unescape + forward to model
+		{`\/tier max5`, `/tier max5`, true},
+		{`/help`, `/help`, false},   // real command → unchanged, not escaped
+		{`hello`, `hello`, false},   // plain text
+		{`\hello`, `\hello`, false}, // backslash not before a slash → not escaped
+	}
+	for _, c := range cases {
+		out, ok := Escaped(c.in)
+		if out != c.out || ok != c.ok {
+			t.Fatalf("Escaped(%q) = (%q, %v), want (%q, %v)", c.in, out, ok, c.out, c.ok)
+		}
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
