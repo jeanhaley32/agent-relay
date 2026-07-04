@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/jeanhaley32/agent-relay/internal/budget"
 )
 
 // Config is the top-level daemon configuration.
@@ -64,7 +66,38 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	c.applyDefaults()
+	if err := c.validate(); err != nil {
+		return nil, fmt.Errorf("invalid config %s: %w", path, err)
+	}
 	return &c, nil
+}
+
+// validate checks the config after defaults are applied and returns a clear
+// error rather than letting a mistake surface as confusing downstream behavior.
+func (c *Config) validate() error {
+	if len(c.Telegram.Admins) == 0 && len(c.Telegram.Allowlist) == 0 {
+		return fmt.Errorf("telegram: no admins or allowlist — the bot would serve nobody; add your Telegram user id to \"admins\"")
+	}
+	for _, id := range c.Telegram.Admins {
+		if id <= 0 {
+			return fmt.Errorf("telegram.admins: invalid id %d (must be > 0)", id)
+		}
+	}
+	for _, id := range c.Telegram.Allowlist {
+		if id <= 0 {
+			return fmt.Errorf("telegram.allowlist: invalid id %d (must be > 0)", id)
+		}
+	}
+	if _, ok := budget.DefaultTiers[c.Budget.Tier]; !ok {
+		return fmt.Errorf("budget.tier %q is unknown (want one of: free, pro, max5, max20)", c.Budget.Tier)
+	}
+	if c.Telegram.PollTimeout < 0 {
+		return fmt.Errorf("telegram.poll_timeout must be >= 0")
+	}
+	if c.Claude.Socket == "" {
+		return fmt.Errorf("claude.socket must not be empty")
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
