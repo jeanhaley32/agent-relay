@@ -40,15 +40,15 @@ jobs:
   vulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
-    # Informational: surfaces known vulns (incl. stdlib advisories tied to the
-    # runner's Go version) without blocking merges.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: govulncheck
+      - name: govulncheck (informational)
+        # Reports known vulns (incl. stdlib advisories tied to the runner's Go
+        # version) but never blocks — `|| true` keeps the check green; read the
+        # log for findings.
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
+          "$(go env GOPATH)/bin/govulncheck" ./... || true
