@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jeanhaley32/agent-relay/internal/access"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
@@ -75,6 +76,16 @@ func main() {
 		telegram.WithPollTimeout(cfg.Telegram.PollTimeout),
 		telegram.WithLogger(logger),
 	)
+
+	// Handshake: verify the token and identify the bot before serving. Fails
+	// fast with a clear message instead of silently long-polling a bad token.
+	hctx, hcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	info, err := front.Me(hctx)
+	hcancel()
+	if err != nil {
+		logger.Fatalf("bot connection failed (check the %s env var): %v", cfg.Telegram.TokenEnv, err)
+	}
+	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
 
 	// Permission relay: admins approve tool-use prompts via /allow and /deny.
 	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Run: verdict(acc, back, true)})
