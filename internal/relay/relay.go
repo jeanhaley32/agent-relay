@@ -73,6 +73,11 @@ type Broker struct {
 	Commands *command.Registry
 	Meter    *budget.Meter
 	Estimate Estimator
+	// OutboundAllowed, if set, gates backend (model) replies: a reply whose
+	// target chat is not allowed is dropped, never delivered to the frontend.
+	// This stops the model from messaging non-allowlisted chats even though the
+	// allowlist only gates inbound. nil ⇒ no outbound gating.
+	OutboundAllowed func(chatID string) bool
 }
 
 // Run pumps both directions until the frontend's Recv channel closes. Backend
@@ -92,6 +97,11 @@ func (b *Broker) Run(ctx context.Context) error {
 		defer wg.Done()
 		for m := range b.Backend.Recv() {
 			b.Meter.Record(b.Estimate(m.Text))
+			// Outbound gate: the model may target any chat via its reply tool;
+			// only deliver to allowed chats.
+			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
+				continue // dropped (the gate func is responsible for logging)
+			}
 			_ = b.Frontend.Send(ctx, m)
 		}
 	}()
