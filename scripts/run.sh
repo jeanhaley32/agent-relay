@@ -28,7 +28,7 @@ cd "$REPO"
 MODEL="${MODEL:-sonnet}"
 SESSION="${SESSION:-relay}"
 CONFIG="${CONFIG:-config.json}"
-SOCK="${SOCK:-/tmp/agent-relay.sock}"
+SOCK="${SOCK:-${XDG_RUNTIME_DIR:-/tmp}/agent-relay.sock}"  # private per-user dir if available
 SECURITY="${SECURITY:-security.yaml}"
 ISOLATE="${ISOLATE:-1}"                              # 1 = isolated workspace, 0 = run in repo
 WORKSPACE="${WORKSPACE:-$HOME/.agent-relay/workspace}"
