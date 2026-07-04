@@ -5,8 +5,18 @@
 #   - launches Claude in a tmux session on the chosen model (default: sonnet),
 #     with the relay channel registered
 #
-#   bash scripts/run.sh              # sonnet default
-#   MODEL=opus bash scripts/run.sh   # override the model
+# Safety defaults (all have escape valves — env vars):
+#   ISOLATE=1   run Claude in a clean workspace with NO secrets in reach (default).
+#               Set ISOLATE=0 to run in the repo instead (full repo access; only
+#               for a trusted operator).
+#   WORKSPACE=  override the isolated workspace dir (default ~/.agent-relay/workspace).
+#   SECURITY=   security profile (default security.yaml → falls back to the example).
+#               Set mode: full in that file for unrestricted tools.
+#   MODEL=      session model (default sonnet). e.g. MODEL=opus.
+#
+#   bash scripts/run.sh                    # safe defaults
+#   ISOLATE=0 bash scripts/run.sh          # run in the repo (trusted operator)
+#   MODEL=opus bash scripts/run.sh
 #
 # After it starts, attach to approve the one-time dev-channel prompt:
 #   tmux attach -t relay
@@ -15,11 +25,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-MODEL="${MODEL:-sonnet}"       # relay session model; strong work → ask for an Opus subagent
+MODEL="${MODEL:-sonnet}"
 SESSION="${SESSION:-relay}"
 CONFIG="${CONFIG:-config.json}"
 SOCK="${SOCK:-/tmp/agent-relay.sock}"
-SECURITY="${SECURITY:-security.yaml}"  # security profile; falls back to the example
+SECURITY="${SECURITY:-security.yaml}"
+ISOLATE="${ISOLATE:-1}"                              # 1 = isolated workspace, 0 = run in repo
+WORKSPACE="${WORKSPACE:-$HOME/.agent-relay/workspace}"
 
 # Bot token from .env (never committed).
 [ -f .env ] && { set -a; . ./.env; set +a; }
@@ -34,10 +46,28 @@ go build -o bin/relayd ./cmd/relayd
 go build -o bin/relay-shim ./cmd/relay-shim
 go build -o bin/apply-security ./cmd/apply-security
 
-# Apply the security profile: writes .claude/settings.json and returns any extra
-# launch flags (e.g. --dangerously-skip-permissions for full mode).
 [ -f "$SECURITY" ] || SECURITY="security.example.yaml"
-SEC_FLAGS="$(./bin/apply-security --config "$SECURITY")"
+
+# Choose where Claude runs and generate its config there.
+#   Isolated: a clean workspace containing ONLY .mcp.json + .claude/settings.json.
+#   Your .env / config.json / allowlist.json / source stay in the repo, out of reach.
+if [ "$ISOLATE" = "1" ]; then
+  mkdir -p "$WORKSPACE/.claude"
+  SEC_FLAGS="$(./bin/apply-security --config "$SECURITY" --settings "$WORKSPACE/.claude/settings.json")"
+  cat > "$WORKSPACE/.mcp.json" <<JSON
+{
+  "mcpServers": {
+    "relay": { "command": "$REPO/bin/relay-shim", "args": ["--socket", "$SOCK"] }
+  }
+}
+JSON
+  CLAUDE_DIR="$WORKSPACE"
+  ISO_NOTE="isolated workspace ($WORKSPACE)"
+else
+  SEC_FLAGS="$(./bin/apply-security --config "$SECURITY")"   # writes ./.claude/settings.json
+  CLAUDE_DIR="$REPO"
+  ISO_NOTE="repo (ISOLATE=0 — Claude can see your secrets)"
+fi
 
 # Start relayd if not already running (the shim auto-reconnects, so an existing
 # daemon is fine to leave up).
@@ -49,14 +79,17 @@ else
   echo "relayd started (pid $!) → logs in relayd.log"
 fi
 
-# (Re)launch Claude on the chosen model with the relay channel.
+# (Re)launch Claude in the chosen directory with the relay channel.
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-tmux new-session -d -s "$SESSION" -c "$REPO"
+tmux new-session -d -s "$SESSION" -c "$CLAUDE_DIR"
 tmux send-keys -t "$SESSION" \
   "$CLAUDE --model $MODEL $SEC_FLAGS --dangerously-load-development-channels server:relay" C-m
 
 cat <<EOF
-Claude launching in tmux session '$SESSION' on model=$MODEL, security=$SECURITY.
+Claude launching in tmux session '$SESSION'.
+  model:    $MODEL
+  security: $SECURITY
+  workdir:  $ISO_NOTE
 Next:
   tmux attach -t $SESSION      # approve the one-time "development channels" prompt
 Then DM your bot. Strong work: ask it to "spawn a subagent on Opus to …".
