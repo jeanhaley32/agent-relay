@@ -3,6 +3,7 @@ package claude
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -21,6 +22,13 @@ func TestEndpointBridge(t *testing.T) {
 		t.Fatalf("new endpoint: %v", err)
 	}
 	defer e.Close()
+
+	// The socket must be owner-only (0600) so other local users can't attach.
+	if fi, err := os.Stat(sock); err != nil {
+		t.Fatalf("stat socket: %v", err)
+	} else if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("socket perms = %o, want 600", perm)
+	}
 
 	// Before any shim connects, Send fails cleanly.
 	if err := e.Send(context.Background(), relay.UserMsg("1", "hi")); err != ErrNoSession {

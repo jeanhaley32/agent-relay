@@ -47,6 +47,13 @@ func New(socketPath string) (*Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Restrict the socket to the owner so other local users can't connect and
+	// hijack the channel (inject replies / approve tool use). connect() needs
+	// write permission, so 0600 blocks everyone but us.
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
 	e := &Endpoint{
 		socketPath: socketPath,
 		ln:         ln,

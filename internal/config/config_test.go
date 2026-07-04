@@ -21,8 +21,8 @@ func TestLoadAndDefaults(t *testing.T) {
 	if c.Telegram.PollTimeout != DefaultPollTimeout {
 		t.Fatalf("poll timeout default: got %d", c.Telegram.PollTimeout)
 	}
-	if c.Claude.Socket != DefaultSocket {
-		t.Fatalf("socket default: got %q", c.Claude.Socket)
+	if c.Claude.Socket != defaultSocket() {
+		t.Fatalf("socket default: got %q, want %q", c.Claude.Socket, defaultSocket())
 	}
 	if c.Budget.Tier != DefaultTier {
 		t.Fatalf("tier default: got %q", c.Budget.Tier)
