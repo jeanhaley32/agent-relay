@@ -35,7 +35,7 @@ Repo: `github.com/jeanhaley32/agent-relay` (private). Local: `~/agent-relay`. Go
 | **PoC-1: Go↔Claude Code channel dialect** | ✅ **validated live** | `internal/channel` + `cmd/channel-spike`; see §5 |
 | PoC-2: control-plane demo (CLI+echo) | ✅ done | `cmd/broker-demo` |
 | Telegram frontend endpoint | 🟡 built + unit-tested | `internal/endpoint/telegram`; live bot round-trip pending a token (§8 T1) |
-| Claude Code backend endpoint (daemon+shim) | ⬜ todo | §8 item C1 |
+| Claude Code backend endpoint (daemon+shim) | 🟡 built + tested | `internal/ipc`, `internal/endpoint/claude`, `cmd/relay-shim`; live wiring pending (§8 C1) |
 | Ollama backend endpoint (+breaker fallback) | ⬜ todo | §8 item O1 |
 | Config loader + daemon wiring | ⬜ todo | §8 item D1 |
 | CI (build+test on push) | ⬜ todo | §8 item X1 |
@@ -73,6 +73,10 @@ Two backend control-flow shapes hidden behind the one interface:
 | `internal/endpoint/echo` | Backend endpoint that echoes (stands in for a model). | `New()` | demo |
 | `cmd/broker-demo` | Runnable control-plane demo (CLI + echo + budget + commands). | `main` | — |
 | `cmd/channel-spike` | Real channel server: Claude spawns over stdio; HTTP inject (POST `/`) + SSE (`GET /events`). | `main`, `--addr` | — |
+| `internal/ipc` | Newline-JSON frame protocol (inject/reply) between daemon and shim over a unix socket. | `Frame`, `Conn.Send/Recv` | ✅ daemon↔shim |
+| `internal/endpoint/claude` | Daemon-side Claude backend `Endpoint`: unix-socket listener; Send→inject frame, reply frame→Recv. | `New(socket)`, `Endpoint`, `ErrNoSession` | Claude-specific |
+| `internal/endpoint/telegram` | Telegram frontend `Endpoint`: long-poll, allowlist, sendMessage. | `New(token, opts…)` | platform |
+| `cmd/relay-shim` | Thin bridge Claude spawns over stdio; connects to daemon socket; translates inject↔reply. | `main`, `--socket` | — |
 
 ## 5. Validated results
 
@@ -144,12 +148,15 @@ Ordered by the critical path. Each item names files to add and a "done when" bar
   real DM round-trips with a non-allowlisted sender dropped. Bootstrap the allowlist via a
   pairing flow or config.
 
-- **C1 — Claude Code backend endpoint** (daemon + shim)
-  Wrap PoC-1 into a `relay.Endpoint`. Design the daemon↔shim IPC (unix socket) so the shim
-  (built on `internal/channel`) forwards injected events and relays `reply` calls back to the
-  daemon. Decide: one long-lived Claude session vs. per-conversation. Pre-approve the reply
-  tool (allow-rule) or implement permission-relay. *Done when:* the broker drives a live
-  Claude session as a backend and a message injected via the frontend gets a Claude reply.
+- **C1 — Claude Code backend endpoint** (daemon + shim) 🟡 *built + tested; live wiring pending*
+  `internal/ipc` (inject/reply frames), `internal/endpoint/claude` (daemon-side `Endpoint`:
+  unix-socket listener, Send→inject, reply→Recv), `cmd/relay-shim` (stdio bridge Claude
+  spawns, built on `internal/channel`). Socket-level integration test proves the daemon↔shim
+  bridge without a live Claude. **Remaining:** wire it live — a `.mcp.json` pointing Claude at
+  `relay-shim --socket <path>`, launch `claude --dangerously-load-development-channels
+  server:relay`, and confirm inject→Claude→reply flows through the daemon endpoint. Still open:
+  single long-lived session vs. per-conversation; pre-approve the reply tool (allow-rule) or
+  permission-relay so it doesn't prompt.
 
 - **O1 — Ollama backend endpoint**
   `internal/endpoint/ollama`. Call `POST {base_url}/v1/chat/completions`, manage per-
@@ -192,6 +199,10 @@ description.
 
 ## 11. Work log (newest first)
 
+- **2026-07-03** — Built **C1 Claude backend** (daemon+shim): `internal/ipc` (framed
+  inject/reply over unix socket), `internal/endpoint/claude` (daemon-side `Endpoint`),
+  `cmd/relay-shim` (stdio bridge on `internal/channel`). IPC round-trip + socket bridge
+  integration tests pass. Live wiring against a real Claude session still pending.
 - **2026-07-03** — Built the **Telegram frontend endpoint** (`internal/endpoint/telegram`):
   long-poll getUpdates, sender allowlist (fail-closed), message normalization, sendMessage.
   Injectable HTTP client/base URL; unit-tested via httptest (gating + normalize + send).
