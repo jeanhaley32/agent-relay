@@ -1,82 +1,156 @@
 # agent-relay
 
-A Go broker that connects **message frontends** (Telegram, CLI, webhooks) to **agent
-backends** (Claude Code, Ollama, OpenAI) through one symmetric interface — so either side
-is swappable without touching the other.
+**Text a Telegram bot, get answered by Claude Code running on your own machine.**
+
+`agent-relay` is a small Go daemon that bridges a chat frontend (Telegram) to an agent
+backend (Claude Code), with a control plane in between: an allowlist, per-account rate
+limiting, a circuit breaker, and tool-approval prompts you answer from chat. It's built so
+either side is swappable — the same core could drive a different chat app or a different
+model — but the working, batteries-included path today is **Telegram ⇄ Claude Code**.
 
 ```
-   Telegram ─┐                              ┌── Claude Code  (stdio channel MCP)
-   CLI      ─┼────▶  RELAY DAEMON (broker) ─┼── Ollama       (localhost:11434/v1)  [planned]
-   Webhook  ─┘         commands + budget    └── OpenAI       (api.openai.com/v1)   [planned]
-     frontend Endpoints        gate            backend Endpoints
+  Telegram DM ──▶ relayd ──▶ [ commands? · budget/rate gate ] ──▶ Claude Code (Sonnet)
+       ▲                                                                │
+       └───────────────────────── reply ───────────────────────────────┘
 ```
 
-## Idea
+- **Runs on your box.** Claude uses your Claude Code session and files; nothing is hosted.
+- **Gated.** Only people you allow can use it; strangers queue for approval.
+- **Cheap by default.** Runs on Sonnet; ask it to spawn an Opus subagent for hard tasks.
+- **Resilient.** Restart/upgrade the daemon without losing messages or context.
 
-Everything is an `Endpoint` — a thing that emits and accepts messages. A `Broker` binds two
-endpoints and pumps between them, intercepting slash commands and gating model turns through
-an account-tier rate limiter + circuit breaker. Both sides are the same interface, so a
-frontend (Telegram) and a backend (Claude) are peers, not special cases.
+> Ollama and OpenAI backends are designed for (the backend is a swappable `Endpoint`) but
+> not yet built. See [`DESIGN.md`](./DESIGN.md).
 
-See [`DESIGN.md`](./DESIGN.md) for architecture and [`PROJECT.md`](./PROJECT.md) for status.
-
-## What works today
-
-A complete **Telegram ⇄ Claude Code** relay: DM a bot and it's answered by a Claude Code
-session running on your machine, gated by a rate-limit/circuit-breaker control plane, with
-admin-approved access and tool-permission approval from chat. Ollama/OpenAI backends are
-designed (symmetric `Endpoint`) but not yet built.
+---
 
 ## Requirements
 
-- **Go 1.24+** (to build)
-- **Claude Code ≥ v2.1.80**, authenticated with a **first-party Anthropic account**
-  (claude.ai Pro/Max subscription or a Console API key). Channels are a *research preview*
-  and are **not** available on Bedrock/Vertex/Foundry.
-- A **Telegram bot** (via [@BotFather](https://t.me/BotFather)) and your numeric Telegram
-  **user id** (e.g. from [@userinfobot](https://t.me/userinfobot)).
-- **tmux** (used by the launch script to host the interactive Claude session).
+| | |
+|---|---|
+| **Go** | 1.24 or newer (to build) |
+| **Claude Code** | v2.1.80+, signed in with a **first-party Anthropic account** — a claude.ai **Pro/Max** subscription or an Anthropic **Console API key**. *Not* supported on Bedrock / Vertex / Foundry. Channels are a research-preview feature. |
+| **Telegram** | A bot token from [@BotFather](https://t.me/BotFather) and your numeric user id (get it from [@userinfobot](https://t.me/userinfobot)). |
+| **tmux** | Hosts the interactive Claude session that the launcher starts. |
 
-## Setup
+---
+
+## Quickstart
 
 ```bash
-# 1. Build
+# 1. Clone and build
+git clone https://github.com/jeanhaley32/agent-relay.git
+cd agent-relay
 go build ./...
 
-# 2. Create a Telegram bot with @BotFather, then store the token (never committed)
-echo 'TELEGRAM_BOT_TOKEN=123456:your-bot-token' > .env
+# 2. Create a Telegram bot (talk to @BotFather → /newbot) and save the token.
+#    .env is gitignored — your token never gets committed.
+echo 'TELEGRAM_BOT_TOKEN=123456:paste-your-bot-token-here' > .env
 
-# 3. Configure — copy the example and set YOUR Telegram user id as admin
+# 3. Configure. Copy the example and set YOUR Telegram user id as an admin.
 cp config.example.json config.json
-#    edit config.json: "admins": [ <your-telegram-user-id> ]
+$EDITOR config.json          # set "admins": [ <your-telegram-user-id> ]
 
-# 4. Launch the stack (builds, starts relayd, opens Claude on Sonnet in tmux)
+# 4. Launch everything (builds, starts the daemon, opens Claude in tmux on Sonnet)
 bash scripts/run.sh
 
-# 5. Approve the one-time "development channels" prompt
-tmux attach -t relay      # press Enter at the prompt, then Ctrl-b d to detach
+# 5. Approve the one-time "development channels" prompt, then detach
+tmux attach -t relay         # press Enter at the prompt; then Ctrl-b, d to detach
 ```
 
-Now DM your bot — it should reply. For heavier tasks, ask it to *"spawn a subagent on Opus
-to …"*. Stop everything with `tmux kill-session -t relay && pkill -x relayd`.
+Now open Telegram and message your bot — it should reply within a few seconds. 🎉
 
-### Notes
-- **Access control:** only ids in `admins`/`allowlist` are served; everyone else is queued.
-  Approve new users from chat with `/handshake approve <id>` (admin only). Approvals persist
-  to `allowlist.json`.
-- **Tool approvals:** Claude's tool-use prompts are forwarded to admins' chat — answer with
-  `/allow <id>` / `/deny <id>`, so an unattended session never hangs.
-- **Restarts are lossless:** the shim auto-reconnects and buffers replies, so you can restart
-  `relayd` without losing messages or Claude's context.
-- **Custom channels** require `--dangerously-load-development-channels` (research preview);
-  `scripts/run.sh` passes it for you.
+To stop everything:
 
-## Control-plane demo (no bot needed)
+```bash
+tmux kill-session -t relay && pkill -x relayd
+```
+
+---
+
+## Configuration
+
+`config.json` (copied from `config.example.json`; gitignored so it can hold your ids):
+
+```json
+{
+  "telegram": {
+    "token_env": "TELEGRAM_BOT_TOKEN",   // env var that holds the token (not the token itself)
+    "admins": [123456789],               // your user id(s): allowed + can run admin commands
+    "allowlist": [],                     // extra allowed user ids (admins are auto-allowed)
+    "allowlist_file": "allowlist.json",  // where /handshake approvals are persisted
+    "poll_timeout": 30
+  },
+  "claude": { "socket": "/tmp/agent-relay.sock" },
+  "budget": { "tier": "max5" }           // free | pro | max5 | max20 (local rate-limit estimate)
+}
+```
+
+- The **bot token lives in `.env`**, never in `config.json`.
+- `admins`, `allowlist`, and `allowlist.json` are yours — all gitignored.
+- Use a different default model: `MODEL=opus bash scripts/run.sh`.
+
+---
+
+## Using the bot
+
+Slash commands are handled by the relay itself (they never reach the model, so they cost
+nothing):
+
+| Command | Who | What |
+|---|---|---|
+| `/help` | anyone allowed | list commands |
+| `/rate`, `/status` | anyone allowed | usage vs. your tier's limit + circuit state |
+| `/tier <free\|pro\|max5\|max20>` | anyone allowed | switch the rate-limit tier |
+| `/pause`, `/resume` | anyone allowed | stop / resume forwarding to the model |
+| `/handshake` | admin | list pending access requests |
+| `/handshake approve <id>` / `deny <id>` | admin | grant / drop access (persisted) |
+| `/allow <id>` / `/deny <id>` | admin | answer a forwarded tool-approval prompt |
+
+**Access requests:** anyone can message the bot, but only allowed ids are served. Others are
+queued — run `/handshake` to see and approve them.
+
+**Tool approvals:** when Claude wants to use a tool that needs approval, the prompt is
+forwarded to admins' chat; reply `/allow <id>` or `/deny <id>`. The session never hangs.
+
+**Heavier tasks:** the session runs on Sonnet to be light on your quota. Ask it to *"spawn a
+subagent on Opus to …"* when you want stronger reasoning.
+
+---
+
+## Try the control plane without a bot
+
+No Telegram or Claude needed — a CLI frontend + echo backend exercises the commands, rate
+limiter, and circuit breaker:
 
 ```bash
 go test ./...
 printf '/tier pro\n/rate\nhello\n/status\n' | go run ./cmd/broker-demo
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `claude: command not found` in tmux | The launcher uses an absolute path, but if you run Claude manually, ensure `~/.local/bin` is on `PATH`. |
+| Bot never replies | Make sure your user id is in `admins`/`allowlist`, and that you approved the tmux "development channels" prompt (step 5). |
+| "blocked by org policy" at startup | On a Team/Enterprise plan an admin must enable channels; personal Pro/Max works out of the box. |
+| Claude keeps asking to approve the `reply` tool | Approve with *"don't ask again"* once, or the prompt is forwarded to you via `/allow`. |
+| Restarted `relayd` and the bot went quiet | It auto-reconnects within ~1s and buffers replies; give it a moment. Re-launch Claude only if you also killed its tmux session. |
+
+---
+
+## How it works
+
+Everything is an `Endpoint` (emits + accepts messages); a `Broker` binds two of them and
+pumps between them, screening slash commands and gating model turns through a budget meter.
+The Claude backend is special — Claude Code *spawns* the channel over stdio — so a thin
+`relay-shim` bridges the always-on daemon to each Claude session over a unix socket.
+
+Full architecture, the token/turn economics, and the security model are in
+[`DESIGN.md`](./DESIGN.md); current status and roadmap in [`PROJECT.md`](./PROJECT.md).
 
 ## License
 
