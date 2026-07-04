@@ -3,6 +3,10 @@
     "channel-spike": {
       "command": "./bin/channel-spike",
       "args": []
+    },
+    "relay": {
+      "command": "./bin/relay-shim",
+      "args": ["--socket", "/tmp/agent-relay.sock"]
     }
   }
 }
