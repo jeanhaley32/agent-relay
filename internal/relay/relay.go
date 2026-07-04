@@ -45,7 +45,7 @@ func AssistantMsg(conv, text string) Message {
 // implement the same interface; the Broker does not care which is which.
 type Endpoint interface {
 	Name() string
-	Recv() <-chan Message                    // messages originating at this endpoint
+	Recv() <-chan Message                      // messages originating at this endpoint
 	Send(ctx context.Context, m Message) error // deliver a message to this endpoint
 	Close() error
 }

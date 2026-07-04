@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 )
@@ -42,8 +43,17 @@ const (
 	DefaultTokenEnv    = "TELEGRAM_BOT_TOKEN"
 	DefaultPollTimeout = 30
 	DefaultTier        = "pro"
-	DefaultSocket      = "/tmp/agent-relay.sock"
 )
+
+// defaultSocket prefers the per-user runtime dir ($XDG_RUNTIME_DIR, mode 0700)
+// so the IPC socket isn't in world-accessible /tmp; falls back to /tmp when it's
+// unset (the socket itself is chmod 0600 either way).
+func defaultSocket() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "agent-relay.sock")
+	}
+	return "/tmp/agent-relay.sock"
+}
 
 // Load reads and validates a config file, applying defaults.
 func Load(path string) (*Config, error) {
@@ -98,7 +108,7 @@ func (c *Config) applyDefaults() {
 		c.Telegram.PollTimeout = DefaultPollTimeout
 	}
 	if c.Claude.Socket == "" {
-		c.Claude.Socket = DefaultSocket
+		c.Claude.Socket = defaultSocket()
 	}
 	if c.Budget.Tier == "" {
 		c.Budget.Tier = DefaultTier

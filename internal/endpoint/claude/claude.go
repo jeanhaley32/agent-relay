@@ -47,6 +47,13 @@ func New(socketPath string) (*Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Restrict the socket to the owner so other local users can't connect and
+	// hijack the channel (inject replies / approve tool use). connect() needs
+	// write permission, so 0600 blocks everyone but us.
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
 	e := &Endpoint{
 		socketPath: socketPath,
 		ln:         ln,
@@ -58,7 +65,7 @@ func New(socketPath string) (*Endpoint, error) {
 }
 
 func (e *Endpoint) Name() string               { return "claude" }
-func (e *Endpoint) Recv() <-chan relay.Message  { return e.recv }
+func (e *Endpoint) Recv() <-chan relay.Message { return e.recv }
 
 // Permissions delivers tool-approval requests from the Claude session. Consume
 // these and call Decide to answer. If no one consumes them, tool calls that need
