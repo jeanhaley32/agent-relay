@@ -58,7 +58,7 @@ func New(socketPath string) (*Endpoint, error) {
 }
 
 func (e *Endpoint) Name() string               { return "claude" }
-func (e *Endpoint) Recv() <-chan relay.Message  { return e.recv }
+func (e *Endpoint) Recv() <-chan relay.Message { return e.recv }
 
 // Permissions delivers tool-approval requests from the Claude session. Consume
 // these and call Decide to answer. If no one consumes them, tool calls that need
