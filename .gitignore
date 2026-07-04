@@ -22,3 +22,7 @@ allowlist.json
 
 # runtime logs
 *.log
+
+# operator security profile + generated Claude settings
+security.yaml
+.claude/settings.json
