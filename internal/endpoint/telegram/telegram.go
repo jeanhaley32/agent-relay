@@ -24,12 +24,26 @@ import (
 
 const defaultBaseURL = "https://api.telegram.org"
 
+// Authorizer decides whether a sender may use the relay and records requests
+// from those who may not (so an admin can approve them later). An access.Manager
+// satisfies this; so does the built-in static allowlist.
+type Authorizer interface {
+	Allowed(id int64) bool
+	Record(id int64, name string)
+}
+
+// staticAuthorizer is a fixed allowlist (WithAllowlist). It records nothing.
+type staticAuthorizer map[int64]bool
+
+func (s staticAuthorizer) Allowed(id int64) bool { return s[id] }
+func (s staticAuthorizer) Record(int64, string)  {}
+
 // Frontend is a Telegram Bot API frontend Endpoint.
 type Frontend struct {
 	token       string
 	base        string
 	http        *http.Client
-	allow       map[int64]bool
+	auth        Authorizer
 	pollTimeout int // long-poll seconds
 	logger      *log.Logger
 
@@ -46,15 +60,22 @@ func WithBaseURL(u string) Option { return func(f *Frontend) { f.base = strings.
 // WithHTTPClient injects an HTTP client (for tests / custom transport).
 func WithHTTPClient(c *http.Client) Option { return func(f *Frontend) { f.http = c } }
 
-// WithAllowlist sets the permitted sender user ids. REQUIRED for real use: an
-// empty allowlist denies everyone (fail closed).
+// WithAllowlist sets a fixed set of permitted sender user ids. REQUIRED for real
+// use if no Authorizer is supplied: an empty allowlist denies everyone (fail
+// closed). For dynamic approval, use WithAuthorizer instead.
 func WithAllowlist(ids ...int64) Option {
 	return func(f *Frontend) {
+		s := staticAuthorizer{}
 		for _, id := range ids {
-			f.allow[id] = true
+			s[id] = true
 		}
+		f.auth = s
 	}
 }
+
+// WithAuthorizer supplies a custom authorization backend (e.g. access.Manager)
+// that can grant access dynamically and record pending requests.
+func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a } }
 
 // WithPollTimeout sets the long-poll timeout in seconds (default 30).
 func WithPollTimeout(sec int) Option { return func(f *Frontend) { f.pollTimeout = sec } }
@@ -67,7 +88,7 @@ func New(token string, opts ...Option) *Frontend {
 	f := &Frontend{
 		token:       token,
 		base:        defaultBaseURL,
-		allow:       map[int64]bool{},
+		auth:        staticAuthorizer{}, // fail-closed default (denies everyone)
 		pollTimeout: 30,
 		logger:      log.New(io.Discard, "", 0),
 		recv:        make(chan relay.Message, 32),
@@ -90,8 +111,6 @@ func (f *Frontend) Recv() <-chan relay.Message  { return f.recv }
 
 // Close stops polling. The Recv channel is closed by the poll loop on exit.
 func (f *Frontend) Close() error { f.cancel(); return nil }
-
-func (f *Frontend) allowed(fromID int64) bool { return f.allow[fromID] }
 
 // --- Telegram wire types (subset we use) ------------------------------------
 
@@ -150,8 +169,13 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 			if m == nil || m.Text == "" {
 				continue
 			}
-			if !f.allowed(m.From.ID) {
-				f.logger.Printf("dropped message from unauthorized sender id=%d (%s)", m.From.ID, m.From.Username)
+			if !f.auth.Allowed(m.From.ID) {
+				name := m.From.Username
+				if name == "" {
+					name = m.From.FirstName
+				}
+				f.auth.Record(m.From.ID, name) // queue as a pending request
+				f.logger.Printf("dropped message from unauthorized sender id=%d (%s) — recorded as pending", m.From.ID, name)
 				continue
 			}
 			msg := relay.Message{
