@@ -45,13 +45,14 @@ func TestHelpHidesAdminFromNonAdmins(t *testing.T) {
 	}
 }
 
-// NilIsAdmin (no admin system, e.g. CLI demo) allows admin commands.
-func TestNilAdminAllows(t *testing.T) {
+// nil IsAdmin must FAIL CLOSED — admin commands denied when no admin system is
+// wired (a real frontend must set IsAdmin; the demo opts in explicitly).
+func TestNilAdminFailsClosed(t *testing.T) {
 	r := NewRegistry()
 	r.Register(Command{Name: "danger", Admin: true, Run: func(Context, []string) string { return "ok" }})
 	reply, _ := r.Dispatch(Context{}, "/danger")
-	if reply != "ok" {
-		t.Fatalf("nil IsAdmin should allow (demo mode), got %q", reply)
+	if reply == "ok" {
+		t.Fatalf("nil IsAdmin must fail closed, got %q", reply)
 	}
 }
 
