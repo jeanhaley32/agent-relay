@@ -3,8 +3,47 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// loadErr writes body to a temp config and returns the Load error (nil if valid).
+func loadErr(t *testing.T, body string) error {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(p)
+	return err
+}
+
+func TestValidation(t *testing.T) {
+	cases := []struct {
+		name, body, wantErr string
+	}{
+		{"no admins or allowlist", `{"telegram":{}}`, "serve nobody"},
+		{"unknown tier", `{"telegram":{"admins":[1]},"budget":{"tier":"mega"}}`, "unknown"},
+		{"negative admin id", `{"telegram":{"admins":[-1]}}`, "invalid id"},
+		{"zero allowlist id", `{"telegram":{"allowlist":[0]}}`, "invalid id"},
+		{"negative poll timeout", `{"telegram":{"admins":[1],"poll_timeout":-1}}`, "poll_timeout"},
+		{"valid", `{"telegram":{"admins":[1]},"budget":{"tier":"max5"}}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := loadErr(t, tc.body)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected valid, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
 
 func TestLoadAndDefaults(t *testing.T) {
 	dir := t.TempDir()
