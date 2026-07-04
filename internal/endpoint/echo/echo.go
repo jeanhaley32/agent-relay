@@ -20,9 +20,9 @@ func New() *Backend {
 	return &Backend{out: make(chan relay.Message, 64)}
 }
 
-func (b *Backend) Name() string                  { return "echo" }
-func (b *Backend) Recv() <-chan relay.Message     { return b.out }
-func (b *Backend) Close() error                   { close(b.out); return nil }
+func (b *Backend) Name() string               { return "echo" }
+func (b *Backend) Recv() <-chan relay.Message { return b.out }
+func (b *Backend) Close() error               { close(b.out); return nil }
 
 // Send produces the echoed reply on the endpoint's Recv channel.
 func (b *Backend) Send(ctx context.Context, m relay.Message) error {
