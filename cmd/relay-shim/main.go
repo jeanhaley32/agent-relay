@@ -39,7 +39,7 @@ func main() {
 		logger.Fatal("no --socket (or RELAY_SOCKET) provided")
 	}
 
-	cl := &client{socket: *socket, logger: logger}
+	cl := &client{socket: *socket, logger: logger, out: make(chan ipc.Frame, outboundBuffer)}
 
 	// Claude → daemon: reply tool + tool-approval prompts become frames.
 	srv := channel.New("relay", "0.0.1",
@@ -81,7 +81,8 @@ func main() {
 		}
 	}
 
-	go cl.run() // reconnecting daemon link
+	go cl.run()       // reconnecting daemon link (inbound)
+	go cl.writeLoop() // outbound: buffers + retries frames across reconnects
 
 	logger.Printf("channel shim ready on stdio")
 	if err := srv.Serve(context.Background(), os.Stdin, os.Stdout); err != nil {
@@ -89,12 +90,18 @@ func main() {
 	}
 }
 
-// client is a reconnecting IPC link to the daemon. send is safe for concurrent
-// use; onFrame is invoked for each inbound frame from the daemon.
+// outboundBuffer bounds how many frames the shim holds while disconnected from
+// the daemon. Sized for restart windows; if it fills, the oldest are dropped.
+const outboundBuffer = 256
+
+// client is a reconnecting IPC link to the daemon. Outbound frames are queued
+// and retried across reconnects so a relayd restart is lossless; onFrame is
+// invoked for each inbound frame. send is safe for concurrent use.
 type client struct {
 	socket  string
 	logger  *log.Logger
 	onFrame func(ipc.Frame)
+	out     chan ipc.Frame
 
 	mu   sync.Mutex
 	conn *ipc.Conn
@@ -133,13 +140,35 @@ func (c *client) set(conn *ipc.Conn) {
 	c.mu.Unlock()
 }
 
-// send writes a frame on the current connection, or errors if disconnected.
-func (c *client) send(f ipc.Frame) error {
+func (c *client) get() *ipc.Conn {
 	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-	if conn == nil {
-		return errors.New("daemon not connected")
+	defer c.mu.Unlock()
+	return c.conn
+}
+
+// send enqueues a frame for delivery. It never blocks the caller (Claude's tool
+// handler): frames are buffered and flushed by writeLoop once connected. If the
+// buffer is full it drops the frame rather than stall.
+func (c *client) send(f ipc.Frame) error {
+	select {
+	case c.out <- f:
+		return nil
+	default:
+		c.logger.Printf("outbound buffer full (%d) — dropping %s frame", cap(c.out), f.Kind)
+		return errors.New("outbound buffer full")
 	}
-	return conn.Send(f)
+}
+
+// writeLoop drains queued frames, retrying each on the current connection until
+// it succeeds. This preserves order and makes a daemon restart lossless: frames
+// wait in the queue while disconnected and flush on reconnect.
+func (c *client) writeLoop() {
+	for f := range c.out {
+		for {
+			if conn := c.get(); conn != nil && conn.Send(f) == nil {
+				break // delivered
+			}
+			time.Sleep(200 * time.Millisecond) // wait for (re)connection
+		}
+	}
 }
