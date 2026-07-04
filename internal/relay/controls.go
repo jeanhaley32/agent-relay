@@ -14,13 +14,13 @@ import (
 // identical everywhere.
 func StandardCommands(m *budget.Meter) *command.Registry {
 	r := command.NewRegistry()
-	r.Register(command.Command{Name: "rate", Help: "show usage vs. limit", Run: func([]string) string {
+	r.Register(command.Command{Name: "rate", Help: "show usage vs. limit", Run: func(command.Context, []string) string {
 		return RenderStatus(m.Snapshot())
 	}})
-	r.Register(command.Command{Name: "status", Help: "alias for /rate", Run: func([]string) string {
+	r.Register(command.Command{Name: "status", Help: "alias for /rate", Run: func(command.Context, []string) string {
 		return RenderStatus(m.Snapshot())
 	}})
-	r.Register(command.Command{Name: "tier", Help: "set account tier: /tier max5", Run: func(a []string) string {
+	r.Register(command.Command{Name: "tier", Help: "set account tier: /tier max5", Run: func(_ command.Context, a []string) string {
 		if len(a) == 0 {
 			return "usage: /tier free|pro|max5|max20"
 		}
@@ -29,11 +29,11 @@ func StandardCommands(m *budget.Meter) *command.Registry {
 		}
 		return "tier set to " + a[0] + "\n" + RenderStatus(m.Snapshot())
 	}})
-	r.Register(command.Command{Name: "pause", Help: "stop forwarding to the model", Run: func([]string) string {
+	r.Register(command.Command{Name: "pause", Help: "stop forwarding to the model", Run: func(command.Context, []string) string {
 		m.Pause()
 		return "⏸ relay paused"
 	}})
-	r.Register(command.Command{Name: "resume", Help: "resume forwarding", Run: func([]string) string {
+	r.Register(command.Command{Name: "resume", Help: "resume forwarding", Run: func(command.Context, []string) string {
 		m.Resume()
 		return "▶ relay resumed"
 	}})

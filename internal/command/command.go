@@ -12,9 +12,17 @@ import (
 	"strings"
 )
 
-// Handler runs a command with its whitespace-split arguments and returns the
-// reply text to send back over the frontend.
-type Handler func(args []string) string
+// Context carries who/where a command came from, so handlers can gate on the
+// sender (e.g. admin-only commands). Fields are strings so the command layer
+// stays platform-neutral; the broker fills them from the message Meta.
+type Context struct {
+	SenderID string // frontend sender id (e.g. Telegram from_id)
+	ChatID   string // conversation/chat id
+}
+
+// Handler runs a command with the caller context and whitespace-split
+// arguments, and returns the reply text to send back over the frontend.
+type Handler func(ctx Context, args []string) string
 
 // Command is one registered slash command.
 type Command struct {
@@ -32,7 +40,9 @@ type Registry struct {
 // NewRegistry returns an empty registry with a built-in /help.
 func NewRegistry() *Registry {
 	r := &Registry{cmds: map[string]Command{}}
-	r.Register(Command{Name: "help", Help: "list commands", Run: r.help})
+	r.Register(Command{Name: "help", Help: "list commands", Run: func(_ Context, _ []string) string {
+		return r.help()
+	}})
 	return r
 }
 
@@ -46,25 +56,25 @@ func IsCommand(text string) bool {
 
 // Dispatch handles a command line. handled is false if text is not a command,
 // in which case the caller forwards the message to the backend as normal.
-func (r *Registry) Dispatch(text string) (reply string, handled bool) {
+func (r *Registry) Dispatch(ctx Context, text string) (reply string, handled bool) {
 	text = strings.TrimSpace(text)
 	if !strings.HasPrefix(text, "/") {
 		return "", false
 	}
 	fields := strings.Fields(text[1:]) // drop the slash
 	if len(fields) == 0 {
-		return r.help(nil), true
+		return r.help(), true
 	}
 	name, args := fields[0], fields[1:]
 	c, ok := r.cmds[name]
 	if !ok {
 		return "unknown command: /" + name + "  (try /help)", true
 	}
-	return c.Run(args), true
+	return c.Run(ctx, args), true
 }
 
 // help renders the command list, sorted for stable output.
-func (r *Registry) help(_ []string) string {
+func (r *Registry) help() string {
 	names := make([]string, 0, len(r.cmds))
 	for n := range r.cmds {
 		names = append(names, n)

@@ -1,7 +1,9 @@
 {
   "telegram": {
     "token_env": "TELEGRAM_BOT_TOKEN",
-    "allowlist": [123456789],
+    "admins": [123456789],
+    "allowlist": [],
+    "allowlist_file": "allowlist.json",
     "poll_timeout": 30
   },
   "claude": {
