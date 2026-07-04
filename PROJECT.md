@@ -34,7 +34,7 @@ Repo: `github.com/jeanhaley32/agent-relay` (private). Local: `~/agent-relay`. Go
 | MCP: reusable stdio JSON-RPC server | ✅ done | `internal/mcp` |
 | **PoC-1: Go↔Claude Code channel dialect** | ✅ **validated live** | `internal/channel` + `cmd/channel-spike`; see §5 |
 | PoC-2: control-plane demo (CLI+echo) | ✅ done | `cmd/broker-demo` |
-| Telegram frontend endpoint | ⬜ todo | §8 item T1 |
+| Telegram frontend endpoint | 🟡 built + unit-tested | `internal/endpoint/telegram`; live bot round-trip pending a token (§8 T1) |
 | Claude Code backend endpoint (daemon+shim) | ⬜ todo | §8 item C1 |
 | Ollama backend endpoint (+breaker fallback) | ⬜ todo | §8 item O1 |
 | Config loader + daemon wiring | ⬜ todo | §8 item D1 |
@@ -135,11 +135,14 @@ output.
 
 Ordered by the critical path. Each item names files to add and a "done when" bar.
 
-- **T1 — Telegram frontend endpoint** *(next)*
-  `internal/endpoint/telegram`. Long-poll `getUpdates`, normalize to `relay.Message`,
-  send via `sendMessage`. **Mandatory sender allowlist** (gate on `from.id`, not chat id).
-  Token from `TELEGRAM_BOT_TOKEN` env. *Done when:* a broker wires Telegram↔echo and a real
-  bot DM round-trips through it with a non-allowlisted sender dropped.
+- **T1 — Telegram frontend endpoint** 🟡 *built + unit-tested; live round-trip pending token*
+  `internal/endpoint/telegram` — long-polls `getUpdates`, normalizes to `relay.Message`
+  (chat_id/from_id in Meta), sends via `sendMessage`, gates on the **sender allowlist**
+  (`from.id`, fail-closed on empty). Injectable HTTP client + base URL; unit-tested against
+  httptest (gating, normalization, send). **Remaining:** create a bot via BotFather, pass
+  `TELEGRAM_BOT_TOKEN`, wire a `cmd` (or reuse broker-demo) as Telegram↔echo, and confirm a
+  real DM round-trips with a non-allowlisted sender dropped. Bootstrap the allowlist via a
+  pairing flow or config.
 
 - **C1 — Claude Code backend endpoint** (daemon + shim)
   Wrap PoC-1 into a `relay.Endpoint`. Design the daemon↔shim IPC (unix socket) so the shim
@@ -189,6 +192,10 @@ description.
 
 ## 11. Work log (newest first)
 
+- **2026-07-03** — Built the **Telegram frontend endpoint** (`internal/endpoint/telegram`):
+  long-poll getUpdates, sender allowlist (fail-closed), message normalization, sendMessage.
+  Injectable HTTP client/base URL; unit-tested via httptest (gating + normalize + send).
+  Live bot round-trip still pending a BotFather token.
 - **2026-07-03** — PoC-1 built and **validated live** against Claude Code v2.1.200 (full
   round-trip). Added `internal/channel`, `cmd/channel-spike`, `.mcp.json`,
   `scripts/live-test.sh`, tests. Opened PR #1. Fixed i3/tmux PATH via `~/.xinitrc`.
