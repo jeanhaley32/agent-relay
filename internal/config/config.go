@@ -18,9 +18,11 @@ type Config struct {
 
 // TelegramConfig configures the Telegram frontend.
 type TelegramConfig struct {
-	TokenEnv    string  `json:"token_env"`   // env var holding the bot token
-	Allowlist   []int64 `json:"allowlist"`   // permitted sender user ids
-	PollTimeout int     `json:"poll_timeout"` // long-poll seconds
+	TokenEnv    string  `json:"token_env"`     // env var holding the bot token
+	Admins      []int64 `json:"admins"`        // ids that may run /handshake (also allowed)
+	Allowlist   []int64 `json:"allowlist"`     // permitted sender user ids
+	AllowlistFile string `json:"allowlist_file"` // optional: persist approved ids here
+	PollTimeout int     `json:"poll_timeout"`  // long-poll seconds
 }
 
 // ClaudeConfig configures the Claude backend.

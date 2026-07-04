@@ -81,6 +81,7 @@ Two backend control-flow shapes hidden behind the one interface:
 | `internal/endpoint/telegram` | Telegram frontend `Endpoint`: long-poll, allowlist, sendMessage. | `New(token, opts…)` | platform |
 | `cmd/relay-shim` | Thin bridge Claude spawns over stdio; connects to daemon socket; translates inject↔reply. | `main`, `--socket` | — |
 | `internal/config` | JSON config loader (dependency-free); token via env var name, not stored. | `Load`, `Config`, `Token` | platform |
+| `internal/access` | Allowlist + admins + pending-request queue; file-persisted. Backs `/handshake`. | `New`, `Allowed`, `IsAdmin`, `Record`, `Pending`, `Approve/Deny` | ✅ any allowlist/approval |
 | `cmd/relayd` | **MVP daemon**: wires Telegram ⇄ broker (budget+commands) ⇄ Claude from config. | `main`, `--config` | — |
 
 ## 5. Validated results
@@ -206,6 +207,12 @@ description.
 
 ## 11. Work log (newest first)
 
+- **2026-07-03** — Added **`/handshake` access control**: `internal/access` (allowlist +
+  admins + pending queue, file-persisted), admin-gated `/handshake` list/approve/deny in
+  `relayd`. Refactored `command` to thread a `Context{SenderID,ChatID}` so commands can gate
+  on sender; Telegram frontend now uses an `Authorizer` (records unauthorized senders as
+  pending instead of dropping silently). Config gains `admins` + `allowlist_file`
+  (relay-managed, gitignored). Tests for access flow + persistence.
 - **2026-07-03** — Built **D1 MVP daemon**: `internal/config` (JSON loader + test) and
   `cmd/relayd` wiring Telegram ⇄ broker ⇄ Claude with graceful shutdown. Added
   `config.example.json`, registered `relay-shim` in `.mcp.json`, factored shared control-plane
