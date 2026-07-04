@@ -207,6 +207,12 @@ description.
 
 ## 11. Work log (newest first)
 
+- **2026-07-03** — **MVP validated LIVE** end-to-end (Telegram DM → Claude → reply). Added
+  **permission relay**: Claude's tool-approval prompts are forwarded down the pipeline to
+  admins' Telegram; `/allow <id>` / `/deny <id>` (admin-only) answer them, so an unattended
+  session never hangs at the terminal. `ipc` gains perm_request/perm_verdict frames;
+  `internal/channel` gains `EnablePermissionRelay`/`SendVerdict`; `claude.Endpoint` gains
+  `Permissions()` + `Decide()`. Tested on the socket bridge.
 - **2026-07-03** — Added **`/handshake` access control**: `internal/access` (allowlist +
   admins + pending queue, file-persisted), admin-gated `/handshake` list/approve/deny in
   `relayd`. Refactored `command` to thread a `Context{SenderID,ChatID}` so commands can gate

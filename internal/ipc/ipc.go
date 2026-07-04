@@ -21,16 +21,26 @@ import (
 type Kind string
 
 const (
-	KindInject Kind = "inject" // daemon -> shim
-	KindReply  Kind = "reply"  // shim -> daemon
+	KindInject      Kind = "inject"       // daemon -> shim: push a message into the session
+	KindReply       Kind = "reply"        // shim -> daemon: Claude called the reply tool
+	KindPermRequest Kind = "perm_request" // shim -> daemon: Claude wants a tool approved
+	KindPermVerdict Kind = "perm_verdict" // daemon -> shim: allow/deny a pending tool request
 )
 
-// Frame is one message on the link.
+// Frame is one message on the link. Message fields (ChatID/Text/Meta) are used
+// by inject/reply; permission fields (RequestID/Tool/Detail/Allow) by the
+// perm_* kinds.
 type Frame struct {
 	Kind   Kind              `json:"kind"`
-	ChatID string            `json:"chat_id"`
-	Text   string            `json:"text"`
+	ChatID string            `json:"chat_id,omitempty"`
+	Text   string            `json:"text,omitempty"`
 	Meta   map[string]string `json:"meta,omitempty"`
+
+	// Permission-relay fields.
+	RequestID string `json:"request_id,omitempty"` // id of the tool-approval request
+	Tool      string `json:"tool,omitempty"`       // tool name (e.g. "Bash")
+	Detail    string `json:"detail,omitempty"`     // human-readable description
+	Allow     bool   `json:"allow,omitempty"`      // verdict (perm_verdict only)
 }
 
 // Conn is a framed JSON connection. Send is safe for concurrent use; Recv must
