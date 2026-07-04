@@ -19,10 +19,21 @@ import (
 
 // Channel-specific protocol constants (Claude Code extensions to MCP).
 const (
-	capabilityKey  = "claude/channel"
-	notifyMethod   = "notifications/claude/channel"
-	replyToolName  = "reply"
+	capabilityKey    = "claude/channel"
+	permCapabilityKey = "claude/channel/permission"
+	notifyMethod     = "notifications/claude/channel"
+	permRequestMethod = "notifications/claude/channel/permission_request"
+	permVerdictMethod = "notifications/claude/channel/permission"
+	replyToolName    = "reply"
 )
+
+// PermissionRequest is a tool-approval prompt forwarded from Claude Code.
+type PermissionRequest struct {
+	RequestID    string // echo this back in the verdict
+	ToolName     string // e.g. "Bash", "Write"
+	Description  string // human-readable summary of the call
+	InputPreview string // tool args (truncated) as JSON
+}
 
 // ReplyFunc is invoked when Claude calls the reply tool. chatID is the routing
 // key echoed from the inbound event's meta; text is Claude's message.
@@ -80,6 +91,43 @@ func (s *Server) Inject(content string, meta map[string]string) error {
 	return s.mcp.Notify(notifyMethod, map[string]any{
 		"content": content,
 		"meta":    meta,
+	})
+}
+
+// EnablePermissionRelay opts this channel into forwarding Claude Code's tool
+// approval prompts. onRequest is called for each permission request; respond
+// with SendVerdict once a decision is made. Must be called before Serve.
+func (s *Server) EnablePermissionRelay(onRequest func(PermissionRequest)) {
+	s.mcp.AddExperimentalCapability(permCapabilityKey)
+	s.mcp.OnNotification(permRequestMethod, func(_ context.Context, params json.RawMessage) {
+		var p struct {
+			RequestID    string `json:"request_id"`
+			ToolName     string `json:"tool_name"`
+			Description  string `json:"description"`
+			InputPreview string `json:"input_preview"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return
+		}
+		onRequest(PermissionRequest{
+			RequestID:    p.RequestID,
+			ToolName:     p.ToolName,
+			Description:  p.Description,
+			InputPreview: p.InputPreview,
+		})
+	})
+}
+
+// SendVerdict answers a pending permission request. allow=true lets the tool
+// call proceed; false rejects it. Safe for concurrent use with Serve.
+func (s *Server) SendVerdict(requestID string, allow bool) error {
+	behavior := "deny"
+	if allow {
+		behavior = "allow"
+	}
+	return s.mcp.Notify(permVerdictMethod, map[string]any{
+		"request_id": requestID,
+		"behavior":   behavior,
 	})
 }
 

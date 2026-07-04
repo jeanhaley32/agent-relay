@@ -1,0 +1,15 @@
+{
+  "telegram": {
+    "token_env": "TELEGRAM_BOT_TOKEN",
+    "admins": [123456789],
+    "allowlist": [],
+    "allowlist_file": "allowlist.json",
+    "poll_timeout": 30
+  },
+  "claude": {
+    "socket": "/tmp/agent-relay.sock"
+  },
+  "budget": {
+    "tier": "max5"
+  }
+}
