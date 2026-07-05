@@ -14,9 +14,19 @@ import (
 
 // Config is the top-level daemon configuration.
 type Config struct {
-	Telegram TelegramConfig `json:"telegram"`
-	Claude   ClaudeConfig   `json:"claude"`
-	Budget   BudgetConfig   `json:"budget"`
+	Telegram  TelegramConfig  `json:"telegram"`
+	Claude    ClaudeConfig    `json:"claude"`
+	Budget    BudgetConfig    `json:"budget"`
+	Scheduler SchedulerConfig `json:"scheduler"`
+}
+
+type SchedulerConfig struct {
+	// File is where reminders are persisted (empty ⇒ "schedules.json"). Relative
+	// paths are resolved against relayd's working directory.
+	File string `json:"file"`
+	// TZ is the timezone cron specs are interpreted in (empty ⇒ host local),
+	// e.g. "America/New_York".
+	TZ string `json:"tz"`
 }
 
 // TelegramConfig configures the Telegram frontend.
@@ -112,6 +122,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Budget.Tier == "" {
 		c.Budget.Tier = DefaultTier
+	}
+	if c.Scheduler.File == "" {
+		c.Scheduler.File = "schedules.json"
 	}
 }
 

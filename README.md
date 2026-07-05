@@ -125,6 +125,21 @@ subagent on Opus to …"* when you want stronger reasoning.
 **Sending a literal command to the model:** prefix with a backslash — `\/help` reaches Claude
 as the text `/help` instead of being intercepted by the relay.
 
+**Scheduled reminders & self-wakeups:** the model has three scheduling tools (served by the
+relay, so schedules persist and fire even when no session is attached). Just ask in plain
+language — *"remind me every morning at 9 to do a 45-minute training session"* or *"ping me in
+20 minutes"* — and the model calls `schedule_message` (`cron` for recurring, `in_seconds` for
+one-shot; times are in the host's timezone). When a schedule fires, the relay pokes the session
+and the model delivers it to you. The model can also schedule a **self-wakeup** to resume a
+long-running task (*"check the deploy in 15 minutes and continue"*). `list_schedules` and
+`cancel_schedule` manage them; schedules survive restarts (persisted to `schedules.json`).
+
+Configure the store/timezone in `config.json` (optional; defaults shown):
+
+```json
+"scheduler": { "file": "schedules.json", "tz": "America/New_York" }
+```
+
 ---
 
 ## Try the control plane without a bot

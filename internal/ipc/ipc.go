@@ -25,6 +25,15 @@ const (
 	KindReply       Kind = "reply"        // shim -> daemon: Claude called the reply tool
 	KindPermRequest Kind = "perm_request" // shim -> daemon: Claude wants a tool approved
 	KindPermVerdict Kind = "perm_verdict" // daemon -> shim: allow/deny a pending tool request
+	KindSchedReq    Kind = "sched_req"    // shim -> daemon: a schedule tool was called
+	KindSchedResp   Kind = "sched_resp"   // daemon -> shim: result of a schedule op
+)
+
+// Schedule op names carried in Frame.Op for KindSchedReq.
+const (
+	OpScheduleCreate = "create"
+	OpScheduleList   = "list"
+	OpScheduleCancel = "cancel"
 )
 
 // Frame is one message on the link. Message fields (ChatID/Text/Meta) are used
@@ -41,6 +50,15 @@ type Frame struct {
 	Tool      string `json:"tool,omitempty"`       // tool name (e.g. "Bash")
 	Detail    string `json:"detail,omitempty"`     // human-readable description
 	Allow     bool   `json:"allow,omitempty"`      // verdict (perm_verdict only)
+
+	// Scheduler fields. RequestID doubles as the correlation id matching a
+	// sched_resp to its sched_req; Text/ChatID carry the reminder.
+	Op        string `json:"op,omitempty"`         // create | list | cancel (sched_req)
+	Cron      string `json:"cron,omitempty"`       // recurring cron spec (create)
+	InSeconds int64  `json:"in_seconds,omitempty"` // one-shot delay in seconds (create)
+	SchedID   string `json:"sched_id,omitempty"`   // schedule id (cancel req / create resp)
+	Result    string `json:"result,omitempty"`     // human-readable result (sched_resp)
+	Err       string `json:"err,omitempty"`        // error text, empty on success (sched_resp)
 }
 
 // Conn is a framed JSON connection. Send is safe for concurrent use; Recv must
