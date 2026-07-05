@@ -14,10 +14,17 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
+
+// inboundBuffer bounds how many inject frames are held while the shim is
+// disconnected (e.g. across a relayd/Claude reconnect), so a message sent in
+// that window is delivered on reconnect instead of silently dropped. Oldest
+// are evicted past this.
+const inboundBuffer = 256
 
 // PermRequest is a tool-approval request surfaced from the Claude session.
 type PermRequest struct {
@@ -32,6 +39,8 @@ type Endpoint struct {
 	ln         net.Listener
 	recv       chan relay.Message
 	perms      chan PermRequest
+	out        chan ipc.Frame // inject frames queued for the shim (buffered)
+	done       chan struct{}
 
 	mu   sync.Mutex
 	conn *ipc.Conn // current shim connection (nil until one connects)
@@ -59,8 +68,11 @@ func New(socketPath string) (*Endpoint, error) {
 		ln:         ln,
 		recv:       make(chan relay.Message, 32),
 		perms:      make(chan PermRequest, 32),
+		out:        make(chan ipc.Frame, inboundBuffer),
+		done:       make(chan struct{}),
 	}
 	go e.acceptLoop()
+	go e.writeLoop() // deliver queued inject frames across reconnects
 	return e, nil
 }
 
@@ -137,38 +149,71 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 	}
 }
 
-// Send injects a message into the connected Claude session. Returns an error if
-// no shim is currently connected.
+// Send queues a message for the Claude session. It never blocks the broker and
+// never drops on a momentary disconnect: the inject frame is buffered and
+// delivered by writeLoop once a shim is connected. If the buffer is full the
+// oldest frame is evicted.
 func (e *Endpoint) Send(_ context.Context, m relay.Message) error {
-	e.mu.Lock()
-	c := e.conn
-	e.mu.Unlock()
-	if c == nil {
-		return ErrNoSession
-	}
 	chatID := m.Meta["chat_id"]
 	if chatID == "" {
 		chatID = m.ConversationID
 	}
-	return c.Send(ipc.Frame{
-		Kind:   ipc.KindInject,
-		ChatID: chatID,
-		Text:   m.Text,
-		Meta:   m.Meta,
-	})
+	f := ipc.Frame{Kind: ipc.KindInject, ChatID: chatID, Text: m.Text, Meta: m.Meta}
+	select {
+	case e.out <- f:
+	default: // buffer full: drop the oldest to make room, then enqueue
+		select {
+		case <-e.out:
+		default:
+		}
+		select {
+		case e.out <- f:
+		default:
+		}
+	}
+	return nil
+}
+
+// writeLoop delivers queued inject frames, retrying on the current connection
+// until each succeeds. This makes a shim reconnect lossless: messages sent while
+// disconnected wait in the queue and flush on reconnect (in order).
+func (e *Endpoint) writeLoop() {
+	for {
+		var f ipc.Frame
+		select {
+		case f = <-e.out:
+		case <-e.done:
+			return
+		}
+		for {
+			e.mu.Lock()
+			c := e.conn
+			e.mu.Unlock()
+			if c != nil && c.Send(f) == nil {
+				break // delivered
+			}
+			select {
+			case <-e.done:
+				return
+			case <-time.After(200 * time.Millisecond): // wait for (re)connection
+			}
+		}
+	}
 }
 
 // Close stops listening and removes the socket.
 func (e *Endpoint) Close() error {
 	var err error
 	e.closeOnce.Do(func() {
+		close(e.done)
 		err = e.ln.Close()
 		_ = os.Remove(e.socketPath)
 	})
 	return err
 }
 
-// ErrNoSession is returned by Send when no Claude session is connected.
+// ErrNoSession is returned by Decide when no Claude session is connected (a
+// permission verdict is time-sensitive, so it is not buffered like Send).
 var ErrNoSession = errNoSession{}
 
 type errNoSession struct{}
