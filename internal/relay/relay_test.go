@@ -28,6 +28,55 @@ func (b *emitBackend) Recv() <-chan Message                { return b.recv }
 func (b *emitBackend) Send(context.Context, Message) error { return nil }
 func (b *emitBackend) Close() error                        { close(b.recv); return nil }
 
+// recordBackend captures what the broker forwards to the model.
+type recordBackend struct {
+	got  chan Message
+	recv chan Message
+}
+
+func (b *recordBackend) Name() string                            { return "rec" }
+func (b *recordBackend) Recv() <-chan Message                    { return b.recv }
+func (b *recordBackend) Send(_ context.Context, m Message) error { b.got <- m; return nil }
+func (b *recordBackend) Close() error                            { close(b.recv); return nil }
+
+// TestCommandEscape: `\/help` is unescaped and forwarded to the model; a real
+// `/help` is handled by the relay and never reaches the backend.
+func TestCommandEscape(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry() // has the built-in /help
+	cmds.IsAdmin = func(string) bool { return true }
+	b := &Broker{Frontend: front, Backend: back, Commands: cmds, Meter: budget.New("pro", nil)}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// Escaped: reaches the backend as "/help".
+	front.recv <- Message{Role: User, Text: `\/help`, Meta: map[string]string{"chat_id": "1"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "/help" {
+			t.Fatalf("escaped command should reach backend as /help, got %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("escaped command never reached the backend")
+	}
+
+	// Real command: handled locally, must NOT reach the backend.
+	front.recv <- Message{Role: User, Text: `/help`, Meta: map[string]string{"chat_id": "1"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("real command leaked to backend: %q", m.Text)
+	case <-time.After(300 * time.Millisecond):
+		// good — dispatched locally
+	}
+	// ...and its reply went to the frontend.
+	select {
+	case <-front.sent:
+	case <-time.After(time.Second):
+		t.Fatal("expected a /help reply to the frontend")
+	}
+}
+
 // TestOutboundGate: the model's replies to non-allowlisted chats are dropped;
 // replies to allowed chats are delivered.
 func TestOutboundGate(t *testing.T) {

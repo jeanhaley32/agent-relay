@@ -66,6 +66,17 @@ func IsCommand(text string) bool {
 	return strings.HasPrefix(strings.TrimSpace(text), "/")
 }
 
+// Escaped recognizes a backslash-escaped command: a leading `\/` means "send the
+// literal /command to the model, don't intercept it here." It returns the
+// unescaped text (the leading `\` removed) and true when text is escaped; the
+// caller forwards the unescaped text to the backend instead of dispatching.
+func Escaped(text string) (unescaped string, ok bool) {
+	if strings.HasPrefix(text, `\/`) {
+		return text[1:], true // drop the escape → "/..." goes to the model
+	}
+	return text, false
+}
+
 // Dispatch handles a command line. handled is false if text is not a command,
 // in which case the caller forwards the message to the backend as normal.
 func (r *Registry) Dispatch(ctx Context, text string) (reply string, handled bool) {
