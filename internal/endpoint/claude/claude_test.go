@@ -30,9 +30,12 @@ func TestEndpointBridge(t *testing.T) {
 		t.Fatalf("socket perms = %o, want 600", perm)
 	}
 
-	// Before any shim connects, Send fails cleanly.
-	if err := e.Send(context.Background(), relay.UserMsg("1", "hi")); err != ErrNoSession {
-		t.Fatalf("expected ErrNoSession before connect, got %v", err)
+	// Inbound buffering: a message sent BEFORE any shim connects is buffered
+	// (Send never errors) and delivered once the shim connects.
+	inject := relay.Message{ConversationID: "42", Role: relay.User, Text: "ping",
+		Meta: map[string]string{"chat_id": "42"}}
+	if err := e.Send(context.Background(), inject); err != nil {
+		t.Fatalf("Send should buffer, not error, before connect: %v", err)
 	}
 
 	// Fake shim connects.
@@ -43,22 +46,7 @@ func TestEndpointBridge(t *testing.T) {
 	defer nc.Close()
 	shim := ipc.NewConn(nc)
 
-	// Send retries until the endpoint has registered the shim. Failed attempts
-	// return ErrNoSession WITHOUT sending, so exactly one inject frame is sent.
-	inject := relay.Message{ConversationID: "42", Role: relay.User, Text: "ping",
-		Meta: map[string]string{"chat_id": "42"}}
-	var sendErr error
-	for i := 0; i < 100; i++ {
-		if sendErr = e.Send(context.Background(), inject); sendErr == nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if sendErr != nil {
-		t.Fatalf("send never succeeded: %v", sendErr)
-	}
-
-	// The shim should receive exactly that inject frame.
+	// The buffered inject frame flushes to the shim on connect.
 	f, err := shim.Recv()
 	if err != nil {
 		t.Fatalf("shim recv: %v", err)
@@ -106,5 +94,54 @@ func TestEndpointBridge(t *testing.T) {
 	}
 	if v.Kind != ipc.KindPermVerdict || v.RequestID != "abcde" || !v.Allow {
 		t.Fatalf("wrong verdict frame: %+v", v)
+	}
+}
+
+// TestInboundBufferAcrossReconnect reproduces the live failure: a message sent
+// while the shim is momentarily disconnected must not be dropped — it is
+// buffered and delivered when a new shim connects.
+func TestInboundBufferAcrossReconnect(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	e, err := New(sock)
+	if err != nil {
+		t.Fatalf("new endpoint: %v", err)
+	}
+	defer e.Close()
+
+	// First shim connects and receives a message.
+	nc1, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	shim1 := ipc.NewConn(nc1)
+	if err := e.Send(context.Background(), relay.Message{Text: "one", Meta: map[string]string{"chat_id": "1"}}); err != nil {
+		t.Fatalf("send one: %v", err)
+	}
+	if f, err := shim1.Recv(); err != nil || f.Text != "one" {
+		t.Fatalf("first delivery: %+v (err %v)", f, err)
+	}
+
+	// Shim drops. Give the endpoint a moment to notice and clear the connection.
+	nc1.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Message sent during the disconnect window: buffered, not dropped.
+	if err := e.Send(context.Background(), relay.Message{Text: "two", Meta: map[string]string{"chat_id": "1"}}); err != nil {
+		t.Fatalf("send two: %v", err)
+	}
+
+	// A new shim reconnects — the buffered message flushes to it.
+	nc2, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer nc2.Close()
+	shim2 := ipc.NewConn(nc2)
+	f, err := shim2.Recv()
+	if err != nil {
+		t.Fatalf("shim2 recv: %v", err)
+	}
+	if f.Kind != ipc.KindInject || f.Text != "two" {
+		t.Fatalf("buffered message not delivered on reconnect: %+v", f)
 	}
 }
