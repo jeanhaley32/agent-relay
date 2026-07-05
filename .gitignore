@@ -26,3 +26,6 @@ allowlist.json
 # operator security profile + generated Claude settings
 security.yaml
 .claude/settings.json
+
+# relay-managed scheduled reminders (may contain user text/ids)
+schedules.json

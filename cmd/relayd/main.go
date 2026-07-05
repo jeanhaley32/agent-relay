@@ -30,7 +30,9 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/config"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
+	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
+	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 )
 
 func main() {
@@ -111,6 +113,36 @@ func main() {
 		}
 	}()
 
+	// Scheduler: reminders/self-wakeups the model creates via the schedule tools.
+	// Firing injects the text back into the Claude session (through the buffered
+	// inject path), so a fire that lands while Claude is briefly down waits and
+	// delivers on reconnect. The prompt is intentionally general: the text may be
+	// a reminder to relay to the user OR a self-wakeup to resume a long task.
+	loc := time.Local
+	if cfg.Scheduler.TZ != "" {
+		if l, err := time.LoadLocation(cfg.Scheduler.TZ); err != nil {
+			logger.Printf("scheduler: bad tz %q, using local: %v", cfg.Scheduler.TZ, err)
+		} else {
+			loc = l
+		}
+	}
+	sched, err := scheduler.New(cfg.Scheduler.File, loc, func(chatID, text string) {
+		prompt := "[scheduled trigger you set earlier fired] " + text +
+			"\n\nAct on it now. If it is a reminder for the user, deliver it by calling the " +
+			"reply tool with chat_id=\"" + chatID + "\". If it is a self-wakeup to resume work, continue that work."
+		_ = back.Send(context.Background(), relay.Message{
+			ConversationID: chatID, Role: relay.User, Text: prompt,
+			Meta: map[string]string{"chat_id": chatID, "scheduled": "1"},
+		})
+	}, logger)
+	if err != nil {
+		logger.Fatalf("scheduler: %v", err)
+	}
+	defer sched.Close()
+
+	// Service schedule-tool calls coming from the model (via the shim).
+	go serveSchedules(back, sched, logger)
+
 	b := &relay.Broker{Frontend: front, Backend: back, Commands: cmds, Meter: meter}
 	// Outbound gate: the model can only reply to allowlisted chats. The inbound
 	// allowlist gates who reaches Claude; this stops Claude messaging strangers.
@@ -144,6 +176,57 @@ func main() {
 		logger.Fatalf("broker: %v", err)
 	}
 	logger.Printf("stopped")
+}
+
+// serveSchedules answers schedule-tool calls from the model: create/list/cancel
+// against the scheduler, replying with a human-readable result the model relays.
+func serveSchedules(back *claudebk.Endpoint, sched *scheduler.Scheduler, logger *log.Logger) {
+	for req := range back.Schedules() {
+		result, errText := handleSchedule(sched, req)
+		if err := back.SchedRespond(req.ReqID, result, errText); err != nil {
+			logger.Printf("schedule respond (%s): %v", req.Op, err)
+		}
+	}
+}
+
+// handleSchedule performs one schedule op and returns (result, errText).
+func handleSchedule(sched *scheduler.Scheduler, req claudebk.SchedRequest) (string, string) {
+	switch req.Op {
+	case ipc.OpScheduleCreate:
+		sc, err := sched.Create(req.Text, req.Cron, time.Duration(req.InSeconds)*time.Second, req.ChatID)
+		if err != nil {
+			return "", err.Error()
+		}
+		when := describeSchedule(sched, sc)
+		return fmt.Sprintf("scheduled (id %s) — %s", sc.ID, when), ""
+	case ipc.OpScheduleList:
+		list := sched.List()
+		if len(list) == 0 {
+			return "no active schedules", ""
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d active schedule(s):\n", len(list))
+		for _, sc := range list {
+			fmt.Fprintf(&b, "  %s — %s — %q\n", sc.ID, describeSchedule(sched, sc), sc.Text)
+		}
+		return strings.TrimRight(b.String(), "\n"), ""
+	case ipc.OpScheduleCancel:
+		if sched.Cancel(req.SchedID) {
+			return "cancelled " + req.SchedID, ""
+		}
+		return "", "no schedule with id " + req.SchedID
+	default:
+		return "", "unknown schedule op: " + req.Op
+	}
+}
+
+// describeSchedule renders when a schedule fires, for the model to relay.
+func describeSchedule(sched *scheduler.Scheduler, sc *scheduler.Schedule) string {
+	next := sched.Next(sc)
+	if sc.Recurring() {
+		return fmt.Sprintf("recurring %q, next %s", sc.Cron, next.Format("Mon 2006-01-02 15:04 MST"))
+	}
+	return "once at " + next.Format("Mon 2006-01-02 15:04 MST")
 }
 
 // verdict returns an /allow or /deny handler that answers a pending tool-approval

@@ -33,12 +33,25 @@ type PermRequest struct {
 	Detail string // human-readable description
 }
 
+// SchedRequest is a schedule-tool call surfaced from the Claude session. The
+// daemon performs the op and answers with SchedRespond, echoing ReqID.
+type SchedRequest struct {
+	ReqID     string // correlation id to echo in the response
+	Op        string // ipc.OpSchedule* (create | list | cancel)
+	Text      string // reminder text (create)
+	Cron      string // recurring cron spec (create)
+	InSeconds int64  // one-shot delay seconds (create)
+	SchedID   string // schedule id (cancel)
+	ChatID    string // requesting conversation (create target / audit)
+}
+
 // Endpoint is the Claude Code backend.
 type Endpoint struct {
 	socketPath string
 	ln         net.Listener
 	recv       chan relay.Message
 	perms      chan PermRequest
+	schedreq   chan SchedRequest
 	out        chan ipc.Frame // inject frames queued for the shim (buffered)
 	done       chan struct{}
 
@@ -68,6 +81,7 @@ func New(socketPath string) (*Endpoint, error) {
 		ln:         ln,
 		recv:       make(chan relay.Message, 32),
 		perms:      make(chan PermRequest, 32),
+		schedreq:   make(chan SchedRequest, 32),
 		out:        make(chan ipc.Frame, inboundBuffer),
 		done:       make(chan struct{}),
 	}
@@ -83,6 +97,22 @@ func (e *Endpoint) Recv() <-chan relay.Message { return e.recv }
 // these and call Decide to answer. If no one consumes them, tool calls that need
 // approval will simply wait (Claude's local dialog stays open).
 func (e *Endpoint) Permissions() <-chan PermRequest { return e.perms }
+
+// Schedules delivers schedule-tool calls from the Claude session. Consume these
+// and call SchedRespond to answer each (the tool call blocks until then).
+func (e *Endpoint) Schedules() <-chan SchedRequest { return e.schedreq }
+
+// SchedRespond answers a pending schedule request by its correlation id. result
+// is a human-readable summary; errText is empty on success.
+func (e *Endpoint) SchedRespond(reqID, result, errText string) error {
+	e.mu.Lock()
+	c := e.conn
+	e.mu.Unlock()
+	if c == nil {
+		return ErrNoSession
+	}
+	return c.Send(ipc.Frame{Kind: ipc.KindSchedResp, RequestID: reqID, Result: result, Err: errText})
+}
 
 // Decide answers a pending permission request: allow=true proceeds, false rejects.
 func (e *Endpoint) Decide(requestID string, allow bool) error {
@@ -100,6 +130,7 @@ func (e *Endpoint) Decide(requestID string, allow bool) error {
 func (e *Endpoint) acceptLoop() {
 	defer close(e.recv)
 	defer close(e.perms)
+	defer close(e.schedreq)
 	for {
 		nc, err := e.ln.Accept()
 		if err != nil {
@@ -142,6 +173,16 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 			select {
 			case e.perms <- PermRequest{ID: f.RequestID, Tool: f.Tool, Detail: f.Detail}:
 			default:
+			}
+		case ipc.KindSchedReq:
+			req := SchedRequest{
+				ReqID: f.RequestID, Op: f.Op, Text: f.Text, Cron: f.Cron,
+				InSeconds: f.InSeconds, SchedID: f.SchedID, ChatID: f.ChatID,
+			}
+			select {
+			case e.schedreq <- req:
+			default: // consumer gone: answer with a busy error so the tool doesn't hang
+				_ = e.SchedRespond(f.RequestID, "", "scheduler busy")
 			}
 		default:
 			// ignore unexpected frames
