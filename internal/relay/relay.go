@@ -118,12 +118,18 @@ func (b *Broker) Run(ctx context.Context) error {
 		if m.Role != User {
 			continue
 		}
-		// 1. Slash commands are handled locally — never hit the model. Sender
-		// identity is threaded through so handlers can gate (e.g. admin-only).
-		cctx := command.Context{SenderID: m.Meta["from_id"], ChatID: m.Meta["chat_id"]}
-		if reply, handled := b.Commands.Dispatch(cctx, m.Text); handled {
-			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, reply))
-			continue
+		// 1. Escaped command (`\/…`): strip the backslash and send the literal
+		// "/…" to the model instead of intercepting it as a relay command.
+		if unescaped, esc := command.Escaped(m.Text); esc {
+			m.Text = unescaped
+		} else {
+			// Slash commands are handled locally — never hit the model. Sender
+			// identity is threaded through so handlers can gate (e.g. admin-only).
+			cctx := command.Context{SenderID: m.Meta["from_id"], ChatID: m.Meta["chat_id"]}
+			if reply, handled := b.Commands.Dispatch(cctx, m.Text); handled {
+				_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, reply))
+				continue
+			}
 		}
 		// 2. Budget / circuit gate.
 		if ok, why := b.Meter.Allow(b.Estimate(m.Text)); !ok {
