@@ -84,6 +84,11 @@ func New(name, version, instructions string, onReply ReplyFunc) *Server {
 	return &Server{mcp: m}
 }
 
+// RegisterTool exposes an additional MCP tool on this channel (beyond the
+// built-in reply tool). Must be called before Serve. Used by the shim to add
+// scheduling tools without the channel package knowing their semantics.
+func (s *Server) RegisterTool(t mcp.Tool) { s.mcp.RegisterTool(t) }
+
 // Inject pushes an inbound event into the Claude session. content is the message
 // body; meta entries become <channel> tag attributes (identifier-char keys only,
 // e.g. chat_id, sender). Safe for concurrent use with Serve.

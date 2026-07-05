@@ -97,6 +97,52 @@ func TestEndpointBridge(t *testing.T) {
 	}
 }
 
+// TestScheduleRoundTrip: a sched_req frame from the shim surfaces on Schedules,
+// and SchedRespond returns a sched_resp the shim receives (correlation echoed).
+func TestScheduleRoundTrip(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	e, err := New(sock)
+	if err != nil {
+		t.Fatalf("new endpoint: %v", err)
+	}
+	defer e.Close()
+
+	nc, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer nc.Close()
+	shim := ipc.NewConn(nc)
+
+	// Shim calls schedule_message -> sched_req frame.
+	if err := shim.Send(ipc.Frame{
+		Kind: ipc.KindSchedReq, RequestID: "c1", Op: ipc.OpScheduleCreate,
+		Text: "train", Cron: "0 9 * * *", ChatID: "42",
+	}); err != nil {
+		t.Fatalf("shim send sched_req: %v", err)
+	}
+
+	select {
+	case req := <-e.Schedules():
+		if req.ReqID != "c1" || req.Op != ipc.OpScheduleCreate || req.Text != "train" || req.Cron != "0 9 * * *" {
+			t.Fatalf("wrong sched request: %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for schedule request")
+	}
+
+	if err := e.SchedRespond("c1", "scheduled (id abc) — recurring", ""); err != nil {
+		t.Fatalf("sched respond: %v", err)
+	}
+	resp, err := shim.Recv()
+	if err != nil {
+		t.Fatalf("shim recv resp: %v", err)
+	}
+	if resp.Kind != ipc.KindSchedResp || resp.RequestID != "c1" || resp.Err != "" || resp.Result == "" {
+		t.Fatalf("wrong sched response: %+v", resp)
+	}
+}
+
 // TestInboundBufferAcrossReconnect reproduces the live failure: a message sent
 // while the shim is momentarily disconnected must not be dropped — it is
 // buffered and delivered when a new shim connects.
