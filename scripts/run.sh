@@ -13,6 +13,9 @@
 #   SECURITY=   security profile (default security.yaml → falls back to the example).
 #               Set mode: full in that file for unrestricted tools.
 #   MODEL=      session model (default sonnet). e.g. MODEL=opus.
+#   CONTINUE=1  resume the previous session in the working dir (default). Claude
+#               always launches in the same dir so history is found; CONTINUE=0
+#               starts fresh (use it on the very first run).
 #
 #   bash scripts/run.sh                    # safe defaults
 #   ISOLATE=0 bash scripts/run.sh          # run in the repo (trusted operator)
@@ -32,6 +35,7 @@ SOCK="${SOCK:-${XDG_RUNTIME_DIR:-/tmp}/agent-relay.sock}"  # private per-user di
 SECURITY="${SECURITY:-security.yaml}"
 ISOLATE="${ISOLATE:-1}"                              # 1 = isolated workspace, 0 = run in repo
 WORKSPACE="${WORKSPACE:-$HOME/.agent-relay/workspace}"
+CONTINUE="${CONTINUE:-1}"                            # 1 = resume the previous session in this dir
 
 # Bot token from .env (never committed).
 [ -f .env ] && { set -a; . ./.env; set +a; }
@@ -79,17 +83,29 @@ else
   echo "relayd started (pid $!) → logs in relayd.log"
 fi
 
-# (Re)launch Claude in the chosen directory with the relay channel.
+# Resume the previous conversation in this directory, so the bot picks up where
+# it left off across restarts. Claude Code keys session history to the working
+# directory — which is why we always launch in the same CLAUDE_DIR. Set
+# CONTINUE=0 for a fresh session (use it on the very first run, no history yet).
+CONT_FLAG=""
+CONT_NOTE="fresh session"
+if [ "$CONTINUE" = "1" ]; then
+  CONT_FLAG="--continue"
+  CONT_NOTE="continuing previous session (CONTINUE=0 for fresh)"
+fi
+
+# (Re)launch Claude in the (stable) chosen directory with the relay channel.
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -c "$CLAUDE_DIR"
 tmux send-keys -t "$SESSION" \
-  "$CLAUDE --model $MODEL $SEC_FLAGS --dangerously-load-development-channels server:relay" C-m
+  "$CLAUDE --model $MODEL $SEC_FLAGS $CONT_FLAG --dangerously-load-development-channels server:relay" C-m
 
 cat <<EOF
 Claude launching in tmux session '$SESSION'.
   model:    $MODEL
   security: $SECURITY
-  workdir:  $ISO_NOTE
+  workdir:  $CLAUDE_DIR  ($ISO_NOTE)
+  session:  $CONT_NOTE
 Next:
   tmux attach -t $SESSION      # approve the one-time "development channels" prompt
 Then DM your bot. Strong work: ask it to "spawn a subagent on Opus to …".
