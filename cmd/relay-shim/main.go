@@ -71,7 +71,7 @@ func main() {
 			if _, ok := meta["chat_id"]; !ok {
 				meta["chat_id"] = f.ChatID
 			}
-			if err := srv.Inject(f.Text, meta); err != nil {
+			if err := srv.Inject(f.Text+replyReminder(meta["chat_id"]), meta); err != nil {
 				logger.Printf("inject error: %v", err)
 			}
 		case ipc.KindPermVerdict:
@@ -93,6 +93,17 @@ func main() {
 // outboundBuffer bounds how many frames the shim holds while disconnected from
 // the daemon. Sized for restart windows; if it fills, the oldest are dropped.
 const outboundBuffer = 256
+
+// replyReminder is appended to every injected event body. The "reply via the
+// reply tool" contract is stated once in the channel's MCP init instructions,
+// but over a long or resumed session the model drifts off it and answers in
+// plain text — which never leaves the terminal, so the user sees silence.
+// Re-asserting the contract on each message (terse, clearly namespaced) makes
+// that drift impossible. chatID is echoed because the reply tool needs it.
+func replyReminder(chatID string) string {
+	return "\n\n(relay: reply by calling the reply tool with chat_id=\"" + chatID +
+		"\". A plain-text answer stays in the terminal and is NOT delivered.)"
+}
 
 // client is a reconnecting IPC link to the daemon. Outbound frames are queued
 // and retried across reconnects so a relayd restart is lossless; onFrame is
