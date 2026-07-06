@@ -49,6 +49,14 @@ func main() {
 	srv := channel.New("relay", "0.0.1",
 		`Events arrive as <channel source="relay" chat_id="...">. When you have an `+
 			`answer, call the reply tool with the chat_id from the tag. `+
+			`You are running HEADLESS over this relay: there is NO interactive terminal `+
+			`the user can see or type into. Never use interactive menus, selection lists, `+
+			`plan-mode prompts, or anything that waits for a keypress — the user only ever `+
+			`sees text you send with the reply tool, and such prompts silently freeze this `+
+			`session. When you need the user to choose between options, send them as a plain `+
+			`numbered list via the reply tool and ask them to reply with the number (their `+
+			`answer comes back as an ordinary channel message). Likewise ask any question as `+
+			`plain reply-tool text. `+
 			`You can also schedule things for later: when the user asks to be reminded `+
 			`or to run something on a schedule, call schedule_message (cron for recurring, `+
 			`in_seconds for a one-shot). You may also schedule a self-wakeup to resume a `+
