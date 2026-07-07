@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/jeanhaley32/agent-relay/internal/security"
 )
@@ -44,7 +45,15 @@ func main() {
 	fmt.Fprintf(os.Stderr, "apply-security: mode=%s → wrote %s\n", sc.Mode, *out)
 
 	// Launch flags for the launcher to consume on stdout.
+	var flags []string
 	if sc.SkipPermissions() {
-		fmt.Print("--dangerously-skip-permissions")
+		flags = append(flags, "--dangerously-skip-permissions")
 	}
+	// Strip interactive-prompt tools in every mode: a headless relay session has
+	// no terminal for a human to answer a modal, so leaving them in freezes it.
+	if dt := sc.DisallowedTools(); len(dt) > 0 {
+		flags = append(flags, "--disallowedTools")
+		flags = append(flags, dt...)
+	}
+	fmt.Print(strings.Join(flags, " "))
 }

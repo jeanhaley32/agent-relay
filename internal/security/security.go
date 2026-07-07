@@ -34,6 +34,20 @@ const (
 	channelServer = "relay"             // enabled so the channel loads without a prompt
 )
 
+// interactivePromptTools are built-in tools that render a modal and block on
+// human keyboard input (a multiple-choice menu, a plan-approval prompt). A relay
+// session runs HEADLESS — there is no terminal a human can type into — so if the
+// model ever calls one it freezes the whole session waiting for a keypress no one
+// can send (observed repeatedly in practice). They are stripped from every
+// session via --disallowedTools regardless of mode; with them absent from the
+// toolset the model falls back to asking in plain text, which the relay delivers.
+var interactivePromptTools = []string{"AskUserQuestion"}
+
+// DisallowedTools returns the tools to strip from the session with
+// --disallowedTools. These are enforced in all modes (a headless session must
+// never be able to block on an interactive prompt).
+func (c *Config) DisallowedTools() []string { return interactivePromptTools }
+
 // Config is a parsed security.yaml.
 type Config struct {
 	Mode  Mode     `yaml:"mode"`
