@@ -32,6 +32,27 @@ func TestFullMode(t *testing.T) {
 	}
 }
 
+// Interactive-prompt tools must be stripped in EVERY mode: a headless relay
+// session freezes if the model can render a modal no human can answer.
+func TestDisallowsInteractivePromptsInAllModes(t *testing.T) {
+	for _, mode := range []string{"mode: full\n", "mode: restricted\n"} {
+		c, err := Load(write(t, mode))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dt := c.DisallowedTools()
+		found := false
+		for _, tool := range dt {
+			if tool == "AskUserQuestion" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%q: AskUserQuestion must be disallowed, got %v", mode, dt)
+		}
+	}
+}
+
 func TestRestrictedMode(t *testing.T) {
 	c, err := Load(write(t, "mode: restricted\nallow: [Read, Grep]\ndeny: [Bash, Write]\n"))
 	if err != nil {
