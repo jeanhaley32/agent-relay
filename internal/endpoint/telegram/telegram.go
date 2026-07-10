@@ -157,7 +157,8 @@ type tgUser struct {
 }
 
 type tgChat struct {
-	ID int64 `json:"id"`
+	ID   int64  `json:"id"`
+	Type string `json:"type"` // "private" | "group" | "supergroup" | "channel"
 }
 
 type tgMessage struct {
@@ -208,6 +209,19 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 				continue
 			}
 			if m.From.ID <= 0 { // no/invalid sender (e.g. anonymous channel post) — ignore
+				continue
+			}
+			// Groups/supergroups/channels are refused outright, not just
+			// unauthenticated: chat_id == from_id only holds in a private
+			// 1:1 chat, and the admin session gate (internal/relay) keys
+			// entirely on chat_id under that assumption. A compromised
+			// admin account messaging from a group would bypass the gate
+			// entirely, since the group's chat_id was never enrolled as a
+			// gated identity. BotFather is also configured to disallow
+			// group invites, but this is the code-level backstop in case
+			// that setting is ever changed or reset.
+			if m.Chat.Type != "" && m.Chat.Type != "private" {
+				f.logger.Printf("dropped message from non-private chat id=%d type=%q sender=%d", m.Chat.ID, m.Chat.Type, m.From.ID)
 				continue
 			}
 			if !f.auth.Allowed(m.From.ID) {
