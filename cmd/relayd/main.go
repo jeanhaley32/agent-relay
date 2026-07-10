@@ -14,9 +14,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -25,6 +29,7 @@ import (
 	"time"
 
 	"github.com/jeanhaley32/agent-relay/internal/access"
+	"github.com/jeanhaley32/agent-relay/internal/approval"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	"github.com/jeanhaley32/agent-relay/internal/config"
@@ -33,6 +38,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
+	"github.com/jeanhaley32/agent-relay/internal/session"
 )
 
 func main() {
@@ -85,13 +91,32 @@ func main() {
 		telegram.WithLogger(logger),
 	)
 
-	// Handshake: verify the token and identify the bot before serving. Fails
-	// fast with a clear message instead of silently long-polling a bad token.
-	hctx, hcancel := context.WithTimeout(context.Background(), 15*time.Second)
-	info, err := front.Me(hctx)
-	hcancel()
-	if err != nil {
-		logger.Fatalf("bot connection failed (check the %s env var): %v", cfg.Telegram.TokenEnv, err)
+	// Handshake: verify the token and identify the bot before serving. Retries
+	// with backoff for up to ~2 minutes before giving up - a bare Fatalf here
+	// made relayd fatally fragile against a boot-time DNS race (this process
+	// can start before network-online.target is meaningfully ready,
+	// especially as a systemd --user unit where that target doesn't gate
+	// anything), even though getUpdates() below already retries forever.
+	// Still fails fast with a clear message for a genuinely bad token/config -
+	// just not on the very first attempt.
+	var info telegram.BotInfo
+	handshakeDeadline := time.Now().Add(2 * time.Minute)
+	backoff := time.Second
+	for {
+		hctx, hcancel := context.WithTimeout(context.Background(), 15*time.Second)
+		info, err = front.Me(hctx)
+		hcancel()
+		if err == nil {
+			break
+		}
+		if time.Now().After(handshakeDeadline) {
+			logger.Fatalf("bot connection failed after retrying for 2m (check the %s env var): %v", cfg.Telegram.TokenEnv, err)
+		}
+		logger.Printf("bot handshake failed, retrying in %s: %v", backoff, err)
+		time.Sleep(backoff)
+		if backoff < 15*time.Second {
+			backoff *= 2
+		}
 	}
 	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
 
@@ -126,24 +151,116 @@ func main() {
 			loc = l
 		}
 	}
-	sched, err := scheduler.New(cfg.Scheduler.File, loc, func(chatID, text string) {
-		prompt := "[scheduled trigger you set earlier fired] " + text +
-			"\n\nAct on it now. If it is a reminder for the user, deliver it by calling the " +
-			"reply tool with chat_id=\"" + chatID + "\". If it is a self-wakeup to resume work, continue that work."
+	// adminChatID is the target for direct-to-Jean escalations and ack receipts.
+	// (Also used by the Grafana webhook below.)
+	adminChatID := ""
+	if len(cfg.Telegram.Admins) > 0 {
+		adminChatID = strconv.FormatInt(cfg.Telegram.Admins[0], 10)
+	}
+
+	// Pending-event tracker: follows every fired trigger until the agent
+	// acknowledges it, escalating (re-inject → direct message to Jean) if it is
+	// silently buried in a busy session. inject reports whether the frame
+	// reached a live shim (vs was buffered while disconnected); fallback and
+	// receipt reach Jean directly via the frontend.
+	eventsPath := cfg.Scheduler.File + ".events"
+	inject := func(chatID, text string) bool {
 		_ = back.Send(context.Background(), relay.Message{
-			ConversationID: chatID, Role: relay.User, Text: prompt,
+			ConversationID: chatID, Role: relay.User, Text: text,
 			Meta: map[string]string{"chat_id": chatID, "scheduled": "1"},
 		})
+		return back.Connected()
+	}
+	// sendToAdmin returns the send error so the tracker's fallback path can
+	// avoid marking a failed last-line-of-defense escalation as delivered.
+	sendToAdmin := func(text string) error {
+		if adminChatID == "" {
+			return nil
+		}
+		return front.Send(context.Background(), relay.Message{
+			ConversationID: adminChatID, Text: text,
+			Meta: map[string]string{"chat_id": adminChatID},
+		})
+	}
+	// receipt is fire-and-forget (a best-effort audit ping), so it discards the
+	// error; the fallback path uses the error-returning form directly.
+	sendReceipt := func(text string) { _ = sendToAdmin(text) }
+	tracker, err := scheduler.NewTracker(eventsPath, inject, sendToAdmin, sendReceipt, scheduler.TrackerConfig{}, logger)
+	if err != nil {
+		logger.Fatalf("event tracker: %v", err)
+	}
+	defer tracker.Close()
+
+	sched, err := scheduler.New(cfg.Scheduler.File, loc, func(scheduleID, chatID, text string) error {
+		// Record a pending event (persisted first) and inject it; the tracker
+		// follows it to acknowledgment and escalates if it is ignored. An error
+		// here means the event was NOT durably recorded — return it so the
+		// scheduler keeps a one-shot schedule for retry instead of deleting it.
+		if _, err := tracker.Fire(scheduleID, chatID, text); err != nil {
+			logger.Printf("event tracker fire: %v", err)
+			return err
+		}
+		return nil
 	}, logger)
 	if err != nil {
 		logger.Fatalf("scheduler: %v", err)
 	}
 	defer sched.Close()
 
-	// Service schedule-tool calls coming from the model (via the shim).
-	go serveSchedules(back, sched, logger)
+	// Grafana alert webhook: alerts are routed through the model backend
+	// (same injection path as scheduled triggers), not straight to Telegram -
+	// so alerts get judgment/context applied before they reach the user,
+	// instead of Grafana paging directly. Loopback-only: Grafana runs on
+	// this same host, no need to expose it beyond localhost.
+	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, tracker, logger)
+
+	// Tailnet-bound approval flow for high-risk actions: a loopback-only
+	// /request+/status API this agent calls (via curl) to ask for a human
+	// decision, and a Tailscale-interface-only /approve page the request
+	// link points at. Being able to load the approve page at all is proof
+	// of tailnet membership - stronger than trusting a Telegram chat_id
+	// alone, which is spoofable if that account is ever compromised. See
+	// 2026-07-10 relay conversation with Jean for the design rationale.
+	appr := approval.NewManager("http://100.99.212.119:9212")
+	reqListener, err := net.Listen("tcp", "127.0.0.1:9211")
+	if err != nil {
+		logger.Fatalf("approval request listener: %v", err)
+	}
+	go func() {
+		if err := http.Serve(reqListener, appr.RequestHandler()); err != nil {
+			logger.Printf("approval request server: %v", err)
+		}
+	}()
+	// The Tailscale interface address may not be assigned yet this early at
+	// boot (tailscaled racing relayd) - retry with backoff instead of
+	// silently running with a broken gate, which would permanently lock the
+	// admin out of Telegram control (the re-auth link would 404 forever).
+	appListener, err := listenWithRetry("tcp", "100.99.212.119:9212", 30*time.Second, logger)
+	if err != nil {
+		logger.Fatalf("approval page listener: %v", err)
+	}
+	go func() {
+		if err := http.Serve(appListener, appr.ApproveHandler()); err != nil {
+			logger.Printf("approval page server: %v", err)
+		}
+	}()
+
+	// Service schedule-tool and event-tool calls coming from the model (via the shim).
+	go serveSchedules(back, sched, tracker, logger)
 
 	b := &relay.Broker{Frontend: front, Backend: back, Commands: cmds, Meter: meter}
+	// Reply-inferred acknowledgment: a model reply landing on a chat after a
+	// trigger fired there is strong evidence the trigger was handled, so
+	// auto-resolve any still-open events for that chat. Supplements ack_event.
+	b.OnBackendReply = func(m relay.Message) {
+		chatID := m.Meta["chat_id"]
+		if chatID == "" {
+			chatID = m.ConversationID
+		}
+		if chatID != "" {
+			tracker.NoteReply(chatID, time.Now())
+		}
+	}
 	// Outbound gate: the model can only reply to allowlisted chats. The inbound
 	// allowlist gates who reaches Claude; this stops Claude messaging strangers.
 	b.OutboundAllowed = func(chatID string) bool {
@@ -153,6 +270,56 @@ func main() {
 			return false
 		}
 		return true
+	}
+
+	cmds.Register(command.Command{
+		Name:  "lockdown",
+		Help:  "admin: /lockdown on|off - block all non-admin senders from reaching the model",
+		Admin: true,
+		Run: func(_ command.Context, args []string) string {
+			if len(args) == 0 {
+				if b.Lockdown.Load() {
+					return "lockdown is ON"
+				}
+				return "lockdown is OFF"
+			}
+			switch args[0] {
+			case "on":
+				b.Lockdown.Store(true)
+				return "🔒 lockdown ON - non-admin senders are now blocked"
+			case "off":
+				b.Lockdown.Store(false)
+				return "🔓 lockdown OFF - non-admin senders can message normally again"
+			default:
+				return "usage: /lockdown on|off"
+			}
+		},
+	})
+
+	// Admin session gate: every chat_id in the admin list must re-prove
+	// tailnet presence (via the approval page) after 30 min idle, closing
+	// the gap where a compromised Telegram account alone would otherwise be
+	// trusted. Tracked independently per admin chat_id. Currently just
+	// Jean, but generalized since the admin list can grow.
+	if len(cfg.Telegram.Admins) > 0 {
+		gated := make(map[string]bool, len(cfg.Telegram.Admins))
+		for _, admin := range cfg.Telegram.Admins {
+			gated[strconv.FormatInt(admin, 10)] = true
+		}
+		b.Session = session.NewManager(30 * time.Minute)
+		b.Approval = appr
+		b.SessionGatedChats = gated
+		b.SessionTTL = 10 * time.Minute
+
+		cmds.Register(command.Command{
+			Name:  "reauth",
+			Help:  "admin: force every admin session (including yours) to expire, requiring tailnet re-approval",
+			Admin: true,
+			Run: func(command.Context, []string) string {
+				b.Session.ExpireAll()
+				return "All admin sessions expired. Your next message (including this reply's delivery) will trigger a tailnet re-auth challenge."
+			},
+		})
 	}
 
 	logger.Printf("relayd up — tier=%s, socket=%s, allowed=%d sender(s), admins=%d",
@@ -178,14 +345,213 @@ func main() {
 	logger.Printf("stopped")
 }
 
+// listenWithRetry binds addr, retrying with a fixed 1s backoff until
+// deadline elapses. Used for listeners bound to an interface address (like
+// the Tailscale IP) that may not exist yet this early at boot.
+func listenWithRetry(network, addr string, deadline time.Duration, logger *log.Logger) (net.Listener, error) {
+	giveUp := time.Now().Add(deadline)
+	var lastErr error
+	for {
+		l, err := net.Listen(network, addr)
+		if err == nil {
+			return l, nil
+		}
+		lastErr = err
+		if time.Now().After(giveUp) {
+			return nil, lastErr
+		}
+		logger.Printf("listen %s: %v, retrying...", addr, err)
+		time.Sleep(1 * time.Second)
+	}
+}
+
+// grafanaWebhookPayload is the subset of Grafana's unified-alerting webhook
+// contact-point JSON we actually use. See:
+// https://grafana.com/docs/grafana/latest/alerting/configure-notifications/manage-contact-points/integrations/webhook-notifier/
+type grafanaWebhookPayload struct {
+	Status string `json:"status"`
+	Alerts []struct {
+		Status      string            `json:"status"`
+		Labels      map[string]string `json:"labels"`
+		Annotations map[string]string `json:"annotations"`
+	} `json:"alerts"`
+}
+
+// serveGrafanaWebhook listens on loopback-only for Grafana's alert webhook
+// and injects each alert into the Claude session via the same buffered-inject
+// path the scheduler uses (back.Send), rather than notifying Telegram
+// directly - so the model applies judgment/context before anything reaches
+// the user, instead of Grafana paging around it.
+func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, tracker *scheduler.Tracker, logger *log.Logger) {
+	if adminChatID == "" {
+		logger.Printf("grafana webhook: no admin chat configured, not starting listener")
+		return
+	}
+	mux := http.NewServeMux()
+	// Real gaps closed 2026-07-09, both requested directly by Jean: (1)
+	// unauthorized Telegram senders were already queued internally
+	// (access.Manager.Record, surfaced only via the /handshake admin
+	// command) but nothing alerted proactively; (2) there was no admin
+	// visibility into relayd's own budget/circuit-breaker state at all -
+	// both now exposed here for the admin dashboard + alert rule.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		snap := meter.Snapshot()
+		stateNum := 0
+		switch snap.State {
+		case budget.Open:
+			stateNum = 1
+		case budget.HalfOpen:
+			stateNum = 2
+		}
+		pausedNum := 0
+		if snap.Paused {
+			pausedNum = 1
+		}
+		body := fmt.Sprintf(
+			"# HELP relayd_unrecognized_access_attempts_total Distinct non-allowlisted Telegram senders who have messaged the bot since relayd started.\n"+
+				"# TYPE relayd_unrecognized_access_attempts_total counter\n"+
+				"relayd_unrecognized_access_attempts_total %d\n"+
+				"# HELP relayd_pending_access_requests Currently unresolved (not yet approved/denied) access requests.\n"+
+				"# TYPE relayd_pending_access_requests gauge\n"+
+				"relayd_pending_access_requests %d\n"+
+				"# HELP relayd_allowlist_size Number of Telegram user ids currently allowlisted.\n"+
+				"# TYPE relayd_allowlist_size gauge\n"+
+				"relayd_allowlist_size %d\n"+
+				"# HELP relayd_budget_percent_used Percent of the rolling token-budget window used.\n"+
+				"# TYPE relayd_budget_percent_used gauge\n"+
+				"relayd_budget_percent_used %f\n"+
+				"# HELP relayd_budget_used_tokens Tokens used in the current rolling window.\n"+
+				"# TYPE relayd_budget_used_tokens gauge\n"+
+				"relayd_budget_used_tokens %d\n"+
+				"# HELP relayd_budget_limit_tokens Configured token limit for the current rolling window.\n"+
+				"# TYPE relayd_budget_limit_tokens gauge\n"+
+				"relayd_budget_limit_tokens %d\n"+
+				"# HELP relayd_budget_window_seconds_left Seconds remaining in the current rolling budget window.\n"+
+				"# TYPE relayd_budget_window_seconds_left gauge\n"+
+				"relayd_budget_window_seconds_left %f\n"+
+				"# HELP relayd_circuit_breaker_state 0=closed (normal), 1=open (tripped, traffic rejected), 2=half-open (probing).\n"+
+				"# TYPE relayd_circuit_breaker_state gauge\n"+
+				"relayd_circuit_breaker_state %d\n"+
+				"# HELP relayd_circuit_breaker_paused 1 if the breaker is manually paused.\n"+
+				"# TYPE relayd_circuit_breaker_paused gauge\n"+
+				"relayd_circuit_breaker_paused %d\n"+
+				"# HELP relayd_telegram_send_failures_total Failed Telegram sendMessage attempts since relayd started (includes retries).\n"+
+				"# TYPE relayd_telegram_send_failures_total counter\n"+
+				"relayd_telegram_send_failures_total %d\n"+
+				"# HELP relayd_telegram_permanent_drops_total Messages that exhausted all retry attempts and were permanently dropped.\n"+
+				"# TYPE relayd_telegram_permanent_drops_total counter\n"+
+				"relayd_telegram_permanent_drops_total %d\n"+
+				"# HELP relayd_telegram_retry_queue_depth Messages currently queued for background retry.\n"+
+				"# TYPE relayd_telegram_retry_queue_depth gauge\n"+
+				"relayd_telegram_retry_queue_depth %d\n"+
+				"# HELP relayd_telegram_getupdates_failures_total Failed getUpdates poll attempts since relayd started - the real signal of a Telegram-side outage.\n"+
+				"# TYPE relayd_telegram_getupdates_failures_total counter\n"+
+				"relayd_telegram_getupdates_failures_total %d\n"+
+				"# HELP relayd_telegram_last_poll_success_seconds Unix timestamp of the last successful getUpdates poll.\n"+
+				"# TYPE relayd_telegram_last_poll_success_seconds gauge\n"+
+				"relayd_telegram_last_poll_success_seconds %d\n"+
+				"# HELP relayd_pending_events_open Currently-open (unacknowledged) fired triggers being followed to completion.\n"+
+				"# TYPE relayd_pending_events_open gauge\n"+
+				"relayd_pending_events_open %d\n"+
+				"# HELP relayd_pending_events_oldest_age_seconds Age of the oldest still-open pending event in seconds (0 if none open).\n"+
+				"# TYPE relayd_pending_events_oldest_age_seconds gauge\n"+
+				"relayd_pending_events_oldest_age_seconds %f\n",
+			acc.TotalRecorded(), len(acc.Pending()), len(acc.Allowlist()),
+			snap.PercentUsed, snap.Used, snap.Limit, snap.WindowLeft.Seconds(),
+			stateNum, pausedNum,
+			front.SendFailures(), front.PermanentDrops(), front.QueueDepth(),
+			front.GetUpdatesFailures(), front.LastPollSuccess(),
+			tracker.OpenCount(), tracker.OldestOpenAge().Seconds(),
+		)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/webhook/grafana", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var payload grafanaWebhookPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			logger.Printf("grafana webhook: bad payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		for _, a := range payload.Alerts {
+			name := a.Labels["alertname"]
+			severity := a.Labels["severity"]
+			summary := a.Annotations["summary"]
+			prompt := fmt.Sprintf(
+				"[Grafana alert, status=%s, severity=%s] %s: %s\n\n"+
+					"Use your judgment on how urgently to surface this to the user via the "+
+					"reply tool (chat_id=\"%s\") - a firing critical alert probably warrants an "+
+					"immediate message, a resolved one may just be worth a brief note, and if "+
+					"you're already mid-investigation on the same subsystem you can fold it into "+
+					"that instead of sending a separate ping.",
+				a.Status, severity, name, summary, adminChatID,
+			)
+			_ = back.Send(context.Background(), relay.Message{
+				ConversationID: adminChatID, Role: relay.User, Text: prompt,
+				Meta: map[string]string{"chat_id": adminChatID, "grafana_alert": "1"},
+			})
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	addr := "127.0.0.1:9210"
+	logger.Printf("grafana webhook listening on %s/webhook/grafana", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		logger.Printf("grafana webhook server stopped: %v", err)
+	}
+}
+
 // serveSchedules answers schedule-tool calls from the model: create/list/cancel
 // against the scheduler, replying with a human-readable result the model relays.
-func serveSchedules(back *claudebk.Endpoint, sched *scheduler.Scheduler, logger *log.Logger) {
+func serveSchedules(back *claudebk.Endpoint, sched *scheduler.Scheduler, tracker *scheduler.Tracker, logger *log.Logger) {
 	for req := range back.Schedules() {
-		result, errText := handleSchedule(sched, req)
+		var result, errText string
+		switch req.Op {
+		case ipc.OpEventAck, ipc.OpEventList:
+			result, errText = handleEvent(tracker, req)
+		default:
+			result, errText = handleSchedule(sched, req)
+		}
 		if err := back.SchedRespond(req.ReqID, result, errText); err != nil {
 			logger.Printf("schedule respond (%s): %v", req.Op, err)
 		}
+	}
+}
+
+// handleEvent performs one pending-event op (ack/list) and returns (result, errText).
+func handleEvent(tracker *scheduler.Tracker, req claudebk.SchedRequest) (string, string) {
+	switch req.Op {
+	case ipc.OpEventAck:
+		if err := tracker.Ack(req.SchedID, req.Text); err != nil {
+			return "", err.Error()
+		}
+		return "acknowledged " + req.SchedID, ""
+	case ipc.OpEventList:
+		list := tracker.ListPending()
+		if len(list) == 0 {
+			return "no open pending events", ""
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d open pending event(s):\n", len(list))
+		for _, ev := range list {
+			nudged := "never"
+			if !ev.LastNudgeAt.IsZero() {
+				nudged = ev.LastNudgeAt.Format("15:04:05 MST")
+			}
+			fmt.Fprintf(&b, "  %s — fired %s, last nudge %s — %q\n",
+				ev.ID, ev.FiredAt.Format("Mon 15:04:05 MST"), nudged, ev.Text)
+		}
+		return strings.TrimRight(b.String(), "\n"), ""
+	default:
+		return "", "unknown event op: " + req.Op
 	}
 }
 
