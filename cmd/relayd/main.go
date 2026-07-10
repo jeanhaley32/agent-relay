@@ -296,11 +296,12 @@ func main() {
 		},
 	})
 
-	// Admin session gate: every chat_id in the admin list must re-prove
+	// Admin session gate: every admin user_id (from_id) must re-prove
 	// tailnet presence (via the approval page) after 30 min idle, closing
 	// the gap where a compromised Telegram account alone would otherwise be
-	// trusted. Tracked independently per admin chat_id. Currently just
-	// Jean, but generalized since the admin list can grow.
+	// trusted. Keyed on user_id, not chat_id - see SessionGatedUsers doc
+	// comment in internal/relay/relay.go. Tracked independently per admin.
+	// Currently just Jean, but generalized since the admin list can grow.
 	if len(cfg.Telegram.Admins) > 0 {
 		gated := make(map[string]bool, len(cfg.Telegram.Admins))
 		for _, admin := range cfg.Telegram.Admins {
@@ -308,7 +309,7 @@ func main() {
 		}
 		b.Session = session.NewManager(30 * time.Minute)
 		b.Approval = appr
-		b.SessionGatedChats = gated
+		b.SessionGatedUsers = gated
 		b.SessionTTL = 10 * time.Minute
 
 		cmds.Register(command.Command{

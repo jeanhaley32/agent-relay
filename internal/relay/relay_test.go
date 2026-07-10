@@ -173,7 +173,7 @@ func TestLockdown(t *testing.T) {
 	defer close(front.recv)
 
 	// Non-admin sender: blocked, gets the lockdown message, never reaches backend.
-	front.recv <- Message{Role: User, Text: "hi", Meta: map[string]string{"chat_id": "1", "from_id": "stranger-id"}}
+	front.recv <- Message{Role: User, Text: "hi", Meta: map[string]string{"chat_id": "stranger-id", "from_id": "stranger-id"}}
 	select {
 	case m := <-front.sent:
 		if m.Text != LockdownMessage {
@@ -189,7 +189,7 @@ func TestLockdown(t *testing.T) {
 	}
 
 	// Admin sender: unaffected.
-	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "2", "from_id": "admin-id"}}
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-id", "from_id": "admin-id"}}
 	select {
 	case m := <-back.got:
 		if m.Text != "hello" {
@@ -197,6 +197,48 @@ func TestLockdown(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("admin message was blocked by lockdown")
+	}
+}
+
+// TestIdentityPairInvariant verifies a message whose chat_id and from_id are
+// both present but mismatched (which should never happen given the Telegram
+// frontend's own private-chat-only guarantee, but every downstream gate here
+// silently depends on that invariant holding) is dropped rather than
+// processed under a possibly-wrong identity.
+func TestIdentityPairInvariant(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+	b := &Broker{Frontend: front, Backend: back, Commands: cmds, Meter: budget.New("pro", nil)}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// Mismatched pair: must be dropped entirely - no backend forward, no
+	// frontend reply.
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "group-999", "from_id": "111"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("mismatched identity pair reached the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good — dropped
+	}
+	select {
+	case m := <-front.sent:
+		t.Fatalf("mismatched identity pair got a reply instead of being silently dropped: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+
+	// A matched pair (or from_id absent entirely) proceeds normally.
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "111", "from_id": "111"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("matched identity pair was incorrectly dropped")
 	}
 }
 
@@ -218,16 +260,18 @@ func TestSessionGate(t *testing.T) {
 		Meter:             budget.New("pro", nil),
 		Session:           session.NewManager(30 * time.Minute),
 		Approval:          appr,
-		SessionGatedChats: map[string]bool{"admin-chat": true},
+		SessionGatedUsers: map[string]bool{"admin-chat": true},
 		SessionTTL:        2 * time.Second,
 	}
 	go b.Run(context.Background())
 	defer close(front.recv)
 
-	// 1. First message from the gated chat, with no active session: must be
+	// 1. First message from the gated user, with no active session: must be
 	// dropped (not forwarded to the backend, not dispatched as a command),
 	// and a challenge with an approval link must go to the frontend instead.
-	front.recv <- Message{Role: User, Text: "/help", Meta: map[string]string{"chat_id": "admin-chat"}}
+	// chat_id == from_id, matching the private-1:1-chat invariant the real
+	// Telegram frontend enforces.
+	front.recv <- Message{Role: User, Text: "/help", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
 
 	var link string
 	select {
@@ -271,7 +315,7 @@ func TestSessionGate(t *testing.T) {
 	}
 
 	// 4. A message sent now should be admitted normally.
-	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-chat"}}
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
 	select {
 	case m := <-back.got:
 		if m.Text != "hello" {
