@@ -29,3 +29,7 @@ security.yaml
 
 # relay-managed scheduled reminders (may contain user text/ids)
 schedules.json
+schedules.json.events
+
+# runtime session-id capture for ops/reboot-relay-safe.sh (per-boot artifact, not source)
+.relay_session_id

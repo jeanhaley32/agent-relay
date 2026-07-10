@@ -42,6 +42,11 @@ type Manager struct {
 	pending map[int64]Request
 	order   []int64 // FIFO of pending ids, for bounded eviction
 	denied  map[int64]bool
+	// totalRecorded counts every genuinely NEW pending request ever queued
+	// (not re-attempts from the same still-pending sender) - the metric
+	// behind an "unrecognized access attempt" alert, distinct from
+	// PendingCount() which only reflects the current unresolved queue.
+	totalRecorded int64
 
 	savePath string
 	saveMu   sync.Mutex // serializes disk writes (independent of mu)
@@ -133,6 +138,18 @@ func (m *Manager) Record(id int64, name string) {
 	}
 	m.pending[id] = Request{ID: id, Name: sanitizeName(name), FirstSeen: m.now()}
 	m.order = append(m.order, id)
+	m.totalRecorded++
+}
+
+// TotalRecorded returns the count of distinct unauthorized senders ever
+// queued as a pending request since this process started - a monotonic
+// counter suitable for Prometheus (unlike len(Pending()), which drops once
+// a request is approved/denied and would look like the alert "resolved" on
+// its own).
+func (m *Manager) TotalRecorded() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.totalRecorded
 }
 
 // sanitizeName strips control characters/newlines and truncates, so a sender's

@@ -34,6 +34,11 @@ const (
 	OpScheduleCreate = "create"
 	OpScheduleList   = "list"
 	OpScheduleCancel = "cancel"
+
+	// Pending-event ops (carried in Frame.Op for KindSchedReq): the agent
+	// acknowledges a fired event or lists currently-open events.
+	OpEventAck  = "event_ack"
+	OpEventList = "event_list"
 )
 
 // Frame is one message on the link. Message fields (ChatID/Text/Meta) are used

@@ -40,11 +40,12 @@ type collector struct {
 }
 
 func newCollector() *collector { return &collector{fire: make(chan struct{}, 8)} }
-func (c *collector) deliver(chatID, text string) {
+func (c *collector) deliver(scheduleID, chatID, text string) error {
 	c.mu.Lock()
 	c.got = append(c.got, chatID+"|"+text)
 	c.mu.Unlock()
 	c.fire <- struct{}{}
+	return nil
 }
 func (c *collector) count() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.got) }
 
