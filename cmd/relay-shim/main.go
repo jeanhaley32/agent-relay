@@ -54,7 +54,9 @@ func main() {
 			`in_seconds for a one-shot). You may also schedule a self-wakeup to resume a `+
 			`long-running task — the scheduled text is injected back into this session when `+
 			`it fires. Use list_schedules and cancel_schedule to manage them. A fired event `+
-			`arrives prefixed with "[scheduled trigger you set earlier fired]".`,
+			`arrives prefixed with "[scheduled trigger you set earlier fired]". When you have `+
+			`handled a fired trigger, call ack_event with its id and a short note of what you did, `+
+			`or it will keep escalating; list_pending_events shows what is still open.`,
 		func(_ context.Context, chatID, text string) error {
 			return cl.send(ipc.Frame{Kind: ipc.KindReply, ChatID: chatID, Text: text})
 		})
@@ -74,6 +76,7 @@ func main() {
 	// fires later (by poking this session to deliver them). Each round-trips to
 	// the daemon and returns its result to the model.
 	registerScheduleTools(srv, cl)
+	registerEventTools(srv, cl)
 
 	// daemon → Claude: inject messages, apply verdicts.
 	cl.onFrame = func(f ipc.Frame) {
@@ -199,6 +202,59 @@ func registerScheduleTools(srv *channel.Server, cl *client) {
 				return "", err
 			}
 			return do(ipc.Frame{Op: ipc.OpScheduleCancel, SchedID: a.ID})
+		},
+	})
+}
+
+// registerEventTools adds ack_event/list_pending_events. A fired scheduled
+// trigger becomes a "pending event" the daemon follows until the agent
+// acknowledges it; ignoring one escalates (re-inject, then a direct message to
+// the admin). These tools let the model close the loop and inspect open events.
+func registerEventTools(srv *channel.Server, cl *client) {
+	do := func(f ipc.Frame) (string, error) {
+		f.Kind = ipc.KindSchedReq
+		resp, err := cl.request(f, schedTimeout)
+		if err != nil {
+			return "", err
+		}
+		if resp.Err != "" {
+			return "", errors.New(resp.Err)
+		}
+		return resp.Result, nil
+	}
+
+	srv.RegisterTool(mcp.Tool{
+		Name: "ack_event",
+		Description: "Acknowledge a fired scheduled trigger once you have handled it, so it stops " +
+			"escalating. A non-empty `note` describing what you actually did is REQUIRED (a bare ack " +
+			"is rejected) — it becomes a visible audit trail. `id` is the event id from the fired " +
+			"trigger message or list_pending_events.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":   map[string]any{"type": "string", "description": "The pending event id to acknowledge"},
+				"note": map[string]any{"type": "string", "description": "Short description of what you did to handle it (required)"},
+			},
+			"required": []string{"id", "note"},
+		},
+		Handler: func(_ context.Context, args json.RawMessage) (string, error) {
+			var a struct {
+				ID   string `json:"id"`
+				Note string `json:"note"`
+			}
+			if err := json.Unmarshal(args, &a); err != nil {
+				return "", err
+			}
+			return do(ipc.Frame{Op: ipc.OpEventAck, SchedID: a.ID, Text: a.Note})
+		},
+	})
+
+	srv.RegisterTool(mcp.Tool{
+		Name:        "list_pending_events",
+		Description: "List currently-open (unacknowledged) fired triggers, with their fired-at and last-nudge times, so you can see what still needs handling.",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		Handler: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return do(ipc.Frame{Op: ipc.OpEventList})
 		},
 	})
 }
