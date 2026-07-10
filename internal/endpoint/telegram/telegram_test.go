@@ -132,6 +132,61 @@ func TestPollGateAndSend(t *testing.T) {
 	}
 }
 
+// TestGroupChatDropped verifies messages from a non-private chat (group/
+// supergroup/channel) are refused outright, even from an allowlisted
+// sender - the admin session gate keys on chat_id under the assumption
+// that chat_id == from_id, which only holds in a private 1:1 chat.
+func TestGroupChatDropped(t *testing.T) {
+	sent := make(chan map[string]any, 4)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bot"+testToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("offset") == "" {
+			fmt.Fprint(w, `{"ok":true,"result":[
+				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"jean"},"chat":{"id":555,"type":"group"},"text":"hello from a group"}},
+				{"update_id":11,"message":{"message_id":2,"from":{"id":111,"username":"jean"},"chat":{"id":111,"type":"private"},"text":"hello from DM"}}
+			]}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	})
+	mux.HandleFunc("/bot"+testToken+"/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent <- body
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := New(testToken,
+		WithBaseURL(srv.URL),
+		WithHTTPClient(srv.Client()),
+		WithAllowlist(111),
+		WithPollTimeout(0),
+	)
+	defer f.Close()
+
+	// Only the private-chat message should surface - the group one is dropped.
+	select {
+	case msg := <-f.Recv():
+		if msg.Text != "hello from DM" {
+			t.Fatalf("expected the DM message, got %q (group message leaked through)", msg.Text)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for the private-chat message")
+	}
+	select {
+	case extra := <-f.Recv():
+		t.Fatalf("group-chat message leaked through: %+v", extra)
+	case <-time.After(300 * time.Millisecond):
+		// good — dropped
+	}
+}
+
 // TestSendRetryQueue verifies a failed Send is retried in the background and
 // eventually delivered once the endpoint recovers - the real gap found
 // 2026-07-10 (a ~1h Telegram outage silently dropped a message with zero
