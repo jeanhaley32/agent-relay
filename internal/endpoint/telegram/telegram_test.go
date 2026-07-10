@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,5 +129,122 @@ func TestPollGateAndSend(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("sendMessage was not called")
+	}
+}
+
+// TestGroupChatDropped verifies messages from a non-private chat (group/
+// supergroup/channel) are refused outright, even from an allowlisted
+// sender - the admin session gate keys on chat_id under the assumption
+// that chat_id == from_id, which only holds in a private 1:1 chat.
+func TestGroupChatDropped(t *testing.T) {
+	sent := make(chan map[string]any, 4)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bot"+testToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("offset") == "" {
+			fmt.Fprint(w, `{"ok":true,"result":[
+				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"jean"},"chat":{"id":555,"type":"group"},"text":"hello from a group"}},
+				{"update_id":11,"message":{"message_id":2,"from":{"id":111,"username":"jean"},"chat":{"id":111,"type":"private"},"text":"hello from DM"}}
+			]}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	})
+	mux.HandleFunc("/bot"+testToken+"/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent <- body
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := New(testToken,
+		WithBaseURL(srv.URL),
+		WithHTTPClient(srv.Client()),
+		WithAllowlist(111),
+		WithPollTimeout(0),
+	)
+	defer f.Close()
+
+	// Only the private-chat message should surface - the group one is dropped.
+	select {
+	case msg := <-f.Recv():
+		if msg.Text != "hello from DM" {
+			t.Fatalf("expected the DM message, got %q (group message leaked through)", msg.Text)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for the private-chat message")
+	}
+	select {
+	case extra := <-f.Recv():
+		t.Fatalf("group-chat message leaked through: %+v", extra)
+	case <-time.After(300 * time.Millisecond):
+		// good — dropped
+	}
+}
+
+// TestSendRetryQueue verifies a failed Send is retried in the background and
+// eventually delivered once the endpoint recovers - the real gap found
+// 2026-07-10 (a ~1h Telegram outage silently dropped a message with zero
+// retry and zero trace, since every caller does `_ = frontend.Send(...)`).
+func TestSendRetryQueue(t *testing.T) {
+	sent := make(chan map[string]any, 4)
+	var failFirst atomic.Bool
+	failFirst.Store(true)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bot"+testToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	})
+	mux.HandleFunc("/bot"+testToken+"/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		if failFirst.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent <- body
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithPollTimeout(0))
+	defer f.Close()
+
+	// First attempt fails - Send() still returns the error immediately
+	// (unchanged caller-facing behavior), but the message is queued.
+	err := f.Send(context.Background(), relay.Message{
+		ConversationID: "222",
+		Text:           "resend me",
+		Meta:           map[string]string{"chat_id": "222"},
+	})
+	if err == nil {
+		t.Fatal("expected the first attempt to fail")
+	}
+	if got := f.SendFailures(); got != 1 {
+		t.Fatalf("SendFailures = %d, want 1", got)
+	}
+	if got := f.QueueDepth(); got != 1 {
+		t.Fatalf("QueueDepth = %d, want 1", got)
+	}
+
+	// Endpoint recovers - the background retry worker's first backoff is
+	// 1s, so give it a few seconds to succeed.
+	failFirst.Store(false)
+	select {
+	case body := <-sent:
+		if body["chat_id"] != "222" || body["text"] != "resend me" {
+			t.Fatalf("wrong redelivered payload: %+v", body)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("queued message was never redelivered")
 	}
 }
