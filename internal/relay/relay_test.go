@@ -2,11 +2,17 @@ package relay
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/approval"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
+	"github.com/jeanhaley32/agent-relay/internal/session"
 )
 
 // capFrontend captures everything Send'd to it.
@@ -112,5 +118,166 @@ func TestOutboundGate(t *testing.T) {
 		t.Fatalf("outbound gate leaked a reply to a stranger: %+v", m)
 	case <-time.After(300 * time.Millisecond):
 		// good — dropped
+	}
+}
+
+// TestOnBackendReplyGated: OnBackendReply must fire only for replies that pass
+// the outbound gate and are actually delivered — a reply dropped by the gate is
+// not evidence a trigger was handled and must not auto-ack anything.
+func TestOnBackendReplyGated(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &emitBackend{recv: make(chan Message, 8)}
+	seen := make(chan string, 8)
+	b := &Broker{
+		Frontend:        front,
+		Backend:         back,
+		Commands:        command.NewRegistry(),
+		Meter:           budget.New("pro", nil),
+		OutboundAllowed: func(chatID string) bool { return chatID == "111" },
+		OnBackendReply:  func(m Message) { seen <- m.Meta["chat_id"] },
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	back.recv <- Message{Role: Assistant, Text: "hi", Meta: map[string]string{"chat_id": "111"}}   // allowed
+	back.recv <- Message{Role: Assistant, Text: "leak", Meta: map[string]string{"chat_id": "999"}} // dropped
+
+	select {
+	case id := <-seen:
+		if id != "111" {
+			t.Fatalf("OnBackendReply fired for the wrong (dropped) chat: %q", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnBackendReply never fired for the delivered reply")
+	}
+	// The dropped reply must not trigger OnBackendReply.
+	select {
+	case id := <-seen:
+		t.Fatalf("OnBackendReply fired for a gate-dropped reply (chat %q)", id)
+	case <-time.After(300 * time.Millisecond):
+		// good — gated out
+	}
+}
+
+// TestLockdown verifies that when active, non-admin senders are blocked
+// entirely (never reach commands or the backend) while admin senders pass
+// through normally.
+func TestLockdown(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(id string) bool { return id == "admin-id" }
+	b := &Broker{Frontend: front, Backend: back, Commands: cmds, Meter: budget.New("pro", nil)}
+	b.Lockdown.Store(true)
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// Non-admin sender: blocked, gets the lockdown message, never reaches backend.
+	front.recv <- Message{Role: User, Text: "hi", Meta: map[string]string{"chat_id": "1", "from_id": "stranger-id"}}
+	select {
+	case m := <-front.sent:
+		if m.Text != LockdownMessage {
+			t.Fatalf("expected lockdown message, got %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a lockdown reply to the non-admin sender")
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("lockdown leaked a non-admin message to the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Admin sender: unaffected.
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "2", "from_id": "admin-id"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("admin message was blocked by lockdown")
+	}
+}
+
+// TestSessionGate exercises the real, end-to-end integration path: an
+// expired admin session blocks everything (including slash commands) until
+// the tailnet-side approval page is hit, at which point a background
+// poller activates the session and the admin's next message is admitted.
+func TestSessionGate(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+	appr := approval.NewManager("http://tailnet.example")
+
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Session:           session.NewManager(30 * time.Minute),
+		Approval:          appr,
+		SessionGatedChats: map[string]bool{"admin-chat": true},
+		SessionTTL:        2 * time.Second,
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// 1. First message from the gated chat, with no active session: must be
+	// dropped (not forwarded to the backend, not dispatched as a command),
+	// and a challenge with an approval link must go to the frontend instead.
+	front.recv <- Message{Role: User, Text: "/help", Meta: map[string]string{"chat_id": "admin-chat"}}
+
+	var link string
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "http://tailnet.example/approve/") {
+			t.Fatalf("expected a challenge with an approval link, got %q", m.Text)
+		}
+		link = m.Text[strings.Index(m.Text, "http://tailnet.example/approve/"):]
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a session-expired challenge on the frontend")
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expired session leaked a message to the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good — the /help command was NOT dispatched either (no reply here
+		// would come from the frontend queue, and back.got must stay empty)
+	}
+
+	token := link[strings.LastIndex(link, "/")+1:]
+
+	// 2. Approve via the same HTTP surface a human would hit (the tailnet
+	// page), not by poking the Manager directly.
+	appSrv := httptest.NewServer(appr.ApproveHandler())
+	defer appSrv.Close()
+	resp, err := http.PostForm(appSrv.URL+"/approve/"+token, url.Values{"decision": {"approve"}})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	resp.Body.Close()
+
+	// 3. The background poller should activate the session and notify the
+	// frontend.
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "re-authenticated") {
+			t.Fatalf("expected a re-authenticated confirmation, got %q", m.Text)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("session was never activated after approval")
+	}
+
+	// 4. A message sent now should be admitted normally.
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-chat"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("message after re-auth was not forwarded to the backend")
 	}
 }
