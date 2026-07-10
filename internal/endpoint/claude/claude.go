@@ -93,6 +93,16 @@ func New(socketPath string) (*Endpoint, error) {
 func (e *Endpoint) Name() string               { return "claude" }
 func (e *Endpoint) Recv() <-chan relay.Message { return e.recv }
 
+// Connected reports whether a shim session is currently connected. The
+// pending-event tracker uses this to tell a real delivery (injected into a live
+// session) from a frame merely buffered while the shim is down — a meaningfully
+// better signal than Send's unconditional nil return.
+func (e *Endpoint) Connected() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.conn != nil
+}
+
 // Permissions delivers tool-approval requests from the Claude session. Consume
 // these and call Decide to answer. If no one consumes them, tool calls that need
 // approval will simply wait (Claude's local dialog stays open).
