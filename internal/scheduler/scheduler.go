@@ -38,9 +38,13 @@ type Schedule struct {
 // Recurring reports whether this is a cron schedule (vs a one-shot).
 func (s *Schedule) Recurring() bool { return s.Cron != "" }
 
-// DeliverFunc is invoked when a schedule is due. It must not block for long; the
-// daemon's implementation just enqueues an inject.
-type DeliverFunc func(chatID, text string)
+// DeliverFunc is invoked when a schedule is due. scheduleID is the firing
+// schedule's id (so the daemon can coalesce repeat fires of a recurring
+// schedule onto one pending event). It must not block for long; the daemon's
+// implementation just records a pending event and enqueues an inject. It
+// returns an error if the fired event could not be durably recorded, so fire()
+// can skip deleting a one-shot schedule and leave it for a retry.
+type DeliverFunc func(scheduleID, chatID, text string) error
 
 // Scheduler owns the cron runner, one-shot timers, and the persisted set.
 type Scheduler struct {
@@ -223,18 +227,31 @@ func (s *Scheduler) fire(id string) {
 		s.mu.Unlock()
 		return
 	}
-	chatID, text, oneShot := sc.ChatID, sc.Text, !sc.Recurring()
+	schedID, chatID, text, oneShot := sc.ID, sc.ChatID, sc.Text, !sc.Recurring()
+	s.mu.Unlock()
+
+	s.logger.Printf("firing schedule %s -> chat %s", id, chatID)
+	// Deliver BEFORE any one-shot cleanup so the durable pending event is
+	// created (and persisted by the deliver callback) before this schedule is
+	// deleted from its own file. A crash in between then loses neither: worst
+	// case the schedule fires again on reload, which the tracker coalesces.
+	if err := s.deliver(schedID, chatID, text); err != nil {
+		// The pending event was NOT durably recorded. Keep the schedule intact
+		// (skip the one-shot deletion) so the next fire retries, rather than
+		// deleting the durable schedule and losing the event on a crash.
+		s.logger.Printf("warning: deliver of schedule %s failed, keeping it for retry: %v", id, err)
+		return
+	}
+
 	if oneShot {
+		s.mu.Lock()
 		s.disarm(id)
 		delete(s.items, id)
 		if err := s.save(); err != nil {
 			s.logger.Printf("warning: persist failed: %v", err)
 		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
-
-	s.logger.Printf("firing schedule %s -> chat %s", id, chatID)
-	s.deliver(chatID, text)
 }
 
 // load reads persisted schedules and arms them. Missing file ⇒ empty set. Holds
