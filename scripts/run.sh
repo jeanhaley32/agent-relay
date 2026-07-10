@@ -16,12 +16,23 @@
 #   CONTINUE=1  resume the previous session in the working dir (default). Claude
 #               always launches in the same dir so history is found; CONTINUE=0
 #               starts fresh (use it on the very first run).
+#   SESSION_ID= resume this EXACT session ID via --resume instead of the fuzzy
+#               --continue "most recent" heuristic. Takes priority over CONTINUE
+#               when set. Needed for reboot-safety: --continue can't be trusted
+#               to pick the right session if anything else has touched this
+#               directory's session history.
+#   UNATTENDED= 1 = auto-clear the one-time "development channels" startup modal
+#               (sends Enter to the tmux pane after Claude's had time to boot to
+#               it) instead of requiring a human to attach and confirm. Default
+#               0 (interactive) - only set this for unattended boots (systemd),
+#               since it blindly accepts the modal without a human reading it.
 #
 #   bash scripts/run.sh                    # safe defaults
 #   ISOLATE=0 bash scripts/run.sh          # run in the repo (trusted operator)
 #   MODEL=opus bash scripts/run.sh
+#   SESSION_ID=<uuid> UNATTENDED=1 ISOLATE=0 bash scripts/run.sh   # boot-time use
 #
-# After it starts, attach to approve the one-time dev-channel prompt:
+# If UNATTENDED=0 (default), attach to approve the one-time dev-channel prompt:
 #   tmux attach -t relay
 set -euo pipefail
 
@@ -36,6 +47,8 @@ SECURITY="${SECURITY:-security.yaml}"
 ISOLATE="${ISOLATE:-1}"                              # 1 = isolated workspace, 0 = run in repo
 WORKSPACE="${WORKSPACE:-$HOME/.agent-relay/workspace}"
 CONTINUE="${CONTINUE:-1}"                            # 1 = resume the previous session in this dir
+SESSION_ID="${SESSION_ID:-}"                         # exact session to --resume (overrides CONTINUE)
+UNATTENDED="${UNATTENDED:-0}"                        # 1 = auto-clear the dev-channels modal, no human
 
 # Bot token from .env (never committed).
 [ -f .env ] && { set -a; . ./.env; set +a; }
@@ -87,9 +100,13 @@ fi
 # it left off across restarts. Claude Code keys session history to the working
 # directory — which is why we always launch in the same CLAUDE_DIR. Set
 # CONTINUE=0 for a fresh session (use it on the very first run, no history yet).
+# SESSION_ID (exact --resume) takes priority over the fuzzy --continue when set.
 CONT_FLAG=""
 CONT_NOTE="fresh session"
-if [ "$CONTINUE" = "1" ]; then
+if [ -n "$SESSION_ID" ]; then
+  CONT_FLAG="--resume $SESSION_ID"
+  CONT_NOTE="resuming exact session $SESSION_ID"
+elif [ "$CONTINUE" = "1" ]; then
   CONT_FLAG="--continue"
   CONT_NOTE="continuing previous session (CONTINUE=0 for fresh)"
 fi
@@ -100,14 +117,33 @@ tmux new-session -d -s "$SESSION" -c "$CLAUDE_DIR"
 tmux send-keys -t "$SESSION" \
   "$CLAUDE --model $MODEL $SEC_FLAGS $CONT_FLAG --dangerously-load-development-channels server:relay" C-m
 
+# The "development channels" prompt is a CLI startup modal emitted before the
+# session even exists (not an in-session tool, so --disallowedTools doesn't
+# touch it). Under an unattended boot there's no human to press Enter and
+# Claude wedges there forever, looking perfectly alive to ps/systemd the whole
+# time. UNATTENDED=1 clears it automatically once Claude's had time to render
+# it — only use this for boot-time/systemd launches, never for a human running
+# this interactively, since it blindly accepts without anyone reading it.
+if [ "$UNATTENDED" = "1" ]; then
+  sleep 6
+  tmux send-keys -t "$SESSION" C-m
+  echo "UNATTENDED=1: sent Enter to clear the dev-channels modal automatically"
+fi
+
 cat <<EOF
 Claude launching in tmux session '$SESSION'.
   model:    $MODEL
   security: $SECURITY
   workdir:  $CLAUDE_DIR  ($ISO_NOTE)
   session:  $CONT_NOTE
+EOF
+if [ "$UNATTENDED" != "1" ]; then
+cat <<EOF
 Next:
   tmux attach -t $SESSION      # approve the one-time "development channels" prompt
+EOF
+fi
+cat <<EOF
 Then DM your bot. Strong work: ask it to "spawn a subagent on Opus to …".
 Stop everything:
   tmux kill-session -t $SESSION && pkill -x relayd
