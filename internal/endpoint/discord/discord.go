@@ -138,8 +138,8 @@ type Frontend struct {
 	client     *bot.Client   // real gateway connection; nil when using a fake transport in tests
 
 	recv     chan relay.Message
-	recvOnce sync.Once // guards close(recv) so Connect's closer goroutine and any other
-	// closer can't double-close or race with sends — see Connect's doc comment.
+	recvOnce sync.Once // guards close(recv) so Close() and any other closer
+	// can't double-close or race with sends — see Close's doc comment.
 	cancel context.CancelFunc
 
 	// convChannels remembers, for every ConversationID gate() has ever seen
@@ -374,7 +374,14 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		return fmt.Errorf("discord: build client: %w", err)
 	}
 	f.client = client
-	f.selfID = client.ID()
+	// Only fill selfID from the real client if WithSelfID wasn't already
+	// supplied — otherwise Connect would silently void that option's
+	// contract for any caller that also connects (e.g. a test wiring a fake
+	// transport but still exercising Connect). client.ID() is authoritative
+	// in production, where selfID starts zero-valued.
+	if f.selfID == 0 {
+		f.selfID = client.ID()
+	}
 
 	if err := client.OpenGateway(ctx); err != nil {
 		return fmt.Errorf("discord: open gateway: %w", err)
