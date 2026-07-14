@@ -10,6 +10,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,10 +21,31 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
 const defaultBaseURL = "https://api.telegram.org"
+
+// maxMessageLen is Telegram's hard per-message character cap (sendMessage
+// rejects anything longer with HTTP 400 "message is too long"). Checked
+// before ever making the HTTP call, and the resulting error is marked
+// permanent (see permanentSendError) so it is never queued for retry -
+// retrying an oversized message just repeats the identical, guaranteed
+// failure. Real incident 2026-07-11: several long replies were silently
+// dropped this way (12 pointless retries then a permanent drop) with no
+// error surfaced to the model that sent them.
+const maxMessageLen = 4096
+
+// permanentSendError marks a Send failure as non-retryable: the same input
+// will fail identically no matter how many times it's resent (an oversized
+// message, a missing chat_id), as opposed to a transient failure (network
+// blip, Telegram outage) that background retry can legitimately fix.
+//
+// This is the shared senderr.Permanent type (extracted once Discord needed
+// the identical semantics) rather than a package-local definition, so the
+// two frontends' retry-classification logic can't silently drift apart.
+type permanentSendError = senderr.Permanent
 
 // Authorizer decides whether a sender may use the relay and records requests
 // from those who may not (so an admin can approve them later). An access.Manager
@@ -315,13 +337,23 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 }
 
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
-// to m.ConversationID) via sendMessage.
+// to m.ConversationID) via sendMessage. A permanent failure (oversized
+// message, missing chat_id) is returned as-is and NOT queued for retry - see
+// permanentSendError. Anything else is assumed transient and gets queued for
+// background retry same as before.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	err := f.sendOnce(ctx, m)
 	if err == nil {
 		return nil
 	}
 	f.sendFailures.Add(1)
+	var perm permanentSendError
+	if errors.As(err, &perm) {
+		if f.logger != nil {
+			f.logger.Printf("telegram send permanently failed (not retrying): %v", err)
+		}
+		return err
+	}
 	if f.logger != nil {
 		f.logger.Printf("telegram send failed, queuing for background retry: %v", err)
 	}
@@ -337,7 +369,11 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 		chatID = m.ConversationID
 	}
 	if chatID == "" {
-		return fmt.Errorf("telegram send: no chat_id")
+		return permanentSendError{Err: fmt.Errorf("telegram send: no chat_id")}
+	}
+	if n := len(m.Text); n > maxMessageLen {
+		return permanentSendError{Err: fmt.Errorf(
+			"message too long (%d chars, Telegram's limit is %d) - split it into multiple replies", n, maxMessageLen)}
 	}
 	body, _ := json.Marshal(map[string]any{"chat_id": chatID, "text": m.Text})
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", f.base, f.token)
@@ -353,7 +389,17 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram sendMessage status %d: %s", resp.StatusCode, string(b))
+		sendErr := fmt.Errorf("telegram sendMessage status %d: %s", resp.StatusCode, string(b))
+		// 429 (rate limited) is the one 4xx worth retrying - Telegram expects
+		// the caller to back off and resend the identical payload. Every
+		// other 4xx (400 malformed/too-long, 403 blocked-by-user, etc.) will
+		// fail identically on retry, so mark it permanent rather than
+		// burning 12 retry attempts on a guaranteed-repeat failure (see
+		// maxMessageLen's doc comment for the incident that motivated this).
+		if resp.StatusCode/100 == 4 && resp.StatusCode != http.StatusTooManyRequests {
+			return permanentSendError{Err: sendErr}
+		}
+		return sendErr
 	}
 	return nil
 }
