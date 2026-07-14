@@ -401,6 +401,20 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 		}
 		return sendErr
 	}
+	// Log Telegram's own assigned message_id on success, so a "the daemon
+	// said success" claim can be cross-checked directly against the
+	// platform afterward rather than trusting the ack alone — mirrors the
+	// same log added to discord.go after the 2026-07-14 incident where a
+	// reply_ack reported success but the message never actually appeared.
+	var parsed struct {
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(b, &parsed); err == nil && f.logger != nil {
+		f.logger.Printf("telegram send ok: chat=%s message_id=%d", chatID, parsed.Result.MessageID)
+	}
 	return nil
 }
 
