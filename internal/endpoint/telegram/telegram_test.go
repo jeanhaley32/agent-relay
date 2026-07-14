@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -246,5 +247,79 @@ func TestSendRetryQueue(t *testing.T) {
 		}
 	case <-time.After(8 * time.Second):
 		t.Fatal("queued message was never redelivered")
+	}
+}
+
+// TestOversizedMessageSplitAndDelivered locks in the fix for the real
+// 2026-07-14 incident: a message over Telegram's 4096-char limit used to be
+// permanently dropped with no message ever reaching the user (the
+// 2026-07-11 fix only made the failure visible as an error, it didn't
+// deliver anything). Send now splits it via senderr.Split and delivers every
+// chunk in order instead.
+func TestOversizedMessageSplitAndDelivered(t *testing.T) {
+	var sendMessageCalls atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bot"+testToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	})
+	mux.HandleFunc("/bot"+testToken+"/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		sendMessageCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithPollTimeout(0))
+	defer f.Close()
+
+	oversized := strings.Repeat("x", maxMessageLen*2+500)
+	err := f.Send(context.Background(), relay.Message{
+		ConversationID: "333",
+		Text:           oversized,
+		Meta:           map[string]string{"chat_id": "333"},
+	})
+	if err != nil {
+		t.Fatalf("Send returned an error for an oversized message that should have been split: %v", err)
+	}
+	if got := sendMessageCalls.Load(); got < 2 {
+		t.Errorf("sendMessage called %d time(s), want at least 2 - the message should have been split into multiple chunks", got)
+	}
+	if got := f.QueueDepth(); got != 0 {
+		t.Errorf("QueueDepth = %d, want 0 - a fully successful split-send must not be queued for retry", got)
+	}
+}
+
+// TestPermanentHTTPErrorNotQueued mirrors the oversized-message case for a
+// deterministic 4xx Telegram actually returns (as opposed to the client-side
+// length guard) - a 400 will fail identically on retry, so it must not be
+// queued either. 429 is the one 4xx that IS worth retrying and is exempted.
+func TestPermanentHTTPErrorNotQueued(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bot"+testToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	})
+	mux.HandleFunc("/bot"+testToken+"/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"description":"Bad Request: message is too long"}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithPollTimeout(0))
+	defer f.Close()
+
+	err := f.Send(context.Background(), relay.Message{
+		ConversationID: "444",
+		Text:           "short but the server still 400s",
+		Meta:           map[string]string{"chat_id": "444"},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := f.QueueDepth(); got != 0 {
+		t.Errorf("QueueDepth = %d, want 0 - a deterministic 400 must not be queued for retry", got)
 	}
 }

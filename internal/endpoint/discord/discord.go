@@ -631,11 +631,32 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 
 // Send delivers a message to the channel named by m.Meta["channel_id"]
 // (falling back to m.ConversationID) via the REST CreateMessage endpoint. A
-// permanent failure (oversized message, missing channel_id, non-429 4xx) is
-// returned as-is and NOT queued for retry — see senderr.Permanent. Anything
-// else is assumed transient and gets queued for background retry, mirroring
-// telegram.Frontend.Send exactly.
+// message over Discord's real 2000-char limit is split into multiple
+// messages and sent in order (see senderr.Split) rather than permanently
+// dropped — the old behavior silently lost the whole reply with no error
+// surfaced to the sender (2026-07-14 incident). A missing channel_id or
+// non-429 4xx is still returned as-is and NOT queued for retry — see
+// senderr.Permanent. Anything else is assumed transient and gets queued for
+// background retry, mirroring telegram.Frontend.Send.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
+	chunks := senderr.Split(m.Text, maxMessageLen)
+	if len(chunks) > 1 {
+		for _, chunk := range chunks {
+			cm := m
+			cm.Text = chunk
+			if err := f.sendChunk(ctx, cm); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return f.sendChunk(ctx, m)
+}
+
+// sendChunk is Send's single-message path — the pre-split body of what used
+// to be Send, still doing the retry/permanent-failure classification for one
+// already-within-limit message.
+func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	err := f.sendOnce(ctx, m)
 	if err == nil {
 		return nil
