@@ -140,6 +140,7 @@ type Frontend struct {
 	recv     chan relay.Message
 	recvOnce sync.Once // guards close(recv) so Close() and any other closer
 	// can't double-close or race with sends — see Close's doc comment.
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	// convChannels remembers, for every ConversationID gate() has ever seen
@@ -322,6 +323,7 @@ func New(token string, opts ...Option) (*Frontend, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	f.ctx = ctx
 	f.cancel = cancel
 	go f.startRetryWorker(ctx)
 	return f, nil
@@ -394,7 +396,35 @@ func (f *Frontend) Connect(ctx context.Context) error {
 	if err := client.OpenGateway(ctx); err != nil {
 		return fmt.Errorf("discord: open gateway: %w", err)
 	}
+	go f.watchHeartbeat(client)
 	return nil
+}
+
+// watchHeartbeat periodically checks the gateway's heartbeat-ack latency and
+// treats a nonzero value as proof the connection is alive, refreshing
+// lastGatewayEventAt independent of Ready/Resumed/message traffic. Without
+// this, a healthy but quiet DM-only bot (no reconnects, no new messages) goes
+// "stale" by lastGatewayEventAt after any 5+ minute lull — a real false
+// positive the Discord Connectivity Lost alert hit on 2026-07-14, since
+// Ready/Resumed only fire on (re)connect, not on an ongoing idle-but-healthy
+// session. 30s poll interval, well under the alert's 5-minute threshold, so a
+// genuinely dead gateway (Latency() staying 0) still goes stale and fires.
+func (f *Frontend) watchHeartbeat(client *bot.Client) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-f.ctx.Done():
+			return
+		case <-ticker.C:
+			if client.Gateway == nil {
+				continue
+			}
+			if client.Gateway.Latency() > 0 {
+				f.lastGatewayEventAt.Store(time.Now().Unix())
+			}
+		}
+	}
 }
 
 func (f *Frontend) Name() string               { return "discord" }
