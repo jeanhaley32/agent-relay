@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,6 +45,15 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 	"github.com/jeanhaley32/agent-relay/internal/session"
 )
+
+// replyDriftTotal counts turns where the model produced assistant text in
+// response to a relay channel event but never called the reply tool - the
+// class of bug behind the 2026-07-14 incident (an answer composed entirely
+// in the terminal, never sent, invisible to every existing metric since no
+// send was ever attempted). Incremented by detect-reply-drift.py, a Claude
+// Code Stop hook that scans the session transcript for exactly this pattern;
+// see scripts/detect-reply-drift.py.
+var replyDriftTotal atomic.Int64
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to JSON config file")
@@ -633,7 +643,10 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 				"relayd_discord_gateway_reconnects_total %d\n"+
 				"# HELP relayd_discord_last_gateway_event_seconds Unix timestamp of the last event received from the Discord gateway (0 if the Discord frontend is disabled or has seen no events yet).\n"+
 				"# TYPE relayd_discord_last_gateway_event_seconds gauge\n"+
-				"relayd_discord_last_gateway_event_seconds %d\n",
+				"relayd_discord_last_gateway_event_seconds %d\n"+
+				"# HELP relayd_reply_drift_total Turns where the model answered a relay event in plain terminal text without calling the reply tool, so nothing was ever sent - detected by a Stop hook scanning the transcript, see scripts/detect-reply-drift.py.\n"+
+				"# TYPE relayd_reply_drift_total counter\n"+
+				"relayd_reply_drift_total %d\n",
 			acc.TotalRecorded(), len(acc.Pending()), len(acc.Allowlist()),
 			snap.PercentUsed, snap.Used, snap.Limit, snap.WindowLeft.Seconds(),
 			stateNum, pausedNum,
@@ -642,9 +655,27 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 			tracker.OpenCount(), tracker.OldestOpenAge().Seconds(),
 			discordSendFailures, discordPermanentDrops, discordQueueDepth,
 			discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt,
+			replyDriftTotal.Load(),
 		)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(body))
+	})
+	// /webhook/reply-drift: called by scripts/detect-reply-drift.py (a Claude
+	// Code Stop hook) when it finds a turn that answered a relay event in
+	// plain terminal text without ever calling the reply tool. Loopback-only,
+	// same as every other endpoint on this mux - this process's threat model
+	// already assumes localhost is trusted. Just increments a counter; see
+	// replyDriftTotal's doc comment for why this stays observability-only
+	// rather than auto-forwarding the orphaned text (Jean's call, 2026-07-14:
+	// auto-forward risks sending unintended draft/mid-thought text).
+	mux.HandleFunc("/webhook/reply-drift", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		replyDriftTotal.Add(1)
+		logger.Printf("reply drift detected: model answered a relay event in terminal text without calling the reply tool")
+		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/webhook/grafana", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
