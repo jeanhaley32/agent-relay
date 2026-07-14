@@ -330,9 +330,20 @@ func New(token string, opts ...Option) (*Frontend, error) {
 // ctx.Done() against onMessageCreate's own `f.recv <- msg` sends — the
 // previous version closed recv from a separate goroutine watching ctx.Done,
 // which could fire while disgo was still mid-delivery of a callback,
-// panicking on a send-to-closed-channel. Close() also cancels the SAME
-// context Connect was given (via context.WithCancel wrapping, below) so a
-// caller's ctx outliving Close() can no longer leave recv open forever.
+// panicking on a send-to-closed-channel.
+//
+// IMPORTANT — Close() does NOT cancel the ctx given here. The ctx passed to
+// Connect is only used for the initial client.OpenGateway(ctx) dial; f.cancel
+// (called by Close) is a SEPARATE context created in New(), used only to stop
+// the retry worker. There is deliberately no context.WithCancel wrapping
+// tying the two together. This means: if the caller's ctx is cancelled
+// without ever calling Close(), the gateway connection is NOT torn down by
+// that alone and f.recv is never closed — a goroutine blocked reading Recv()
+// (e.g. the Broker) can wait forever. Close() MUST always be called to
+// release recv, regardless of ctx state. Harmless in relayd's current wiring
+// (it passes context.Background() to Connect and always calls Close on
+// shutdown), but a future caller that expects ctx cancellation alone to be
+// sufficient will hang.
 func (f *Frontend) Connect(ctx context.Context) error {
 	intents := []gateway.Intents{gateway.IntentGuilds, gateway.IntentDirectMessages}
 	if f.allowGuildMessages {
@@ -511,6 +522,43 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 		msg.Meta["guild_id"] = m.guildID.String()
 	}
 	return msg, true
+}
+
+// discordSnowflakeFloor is a lower bound on any snowflake id minted by the
+// real Discord network today. Discord's snowflake epoch is 2015-01-01; the
+// timestamp component occupies the high 42 bits (shifted left 22), so any id
+// generated since roughly 2020 already exceeds 1e17. Telegram chat/user ids
+// (int64, but in practice at most a handful of digits, or negative for
+// groups/supergroups) never reach this magnitude. Used by
+// OwnsConversationID to disambiguate a bare numeric ConversationID between
+// frontends when relay.MultiFrontend has never seen it delivered inbound —
+// see relay.Claimer's doc comment.
+const discordSnowflakeFloor = 1_000_000_000_000_000 // 1e15, well below current real ids, well above any Telegram id
+
+// OwnsConversationID implements relay.Claimer: it reports whether id is
+// plausibly a Discord conversation id (DM user id or guild channel id) based
+// on snowflake syntax and magnitude, without requiring the id to have been
+// seen inbound this process lifetime.
+func (f *Frontend) OwnsConversationID(id string) bool {
+	sf, err := snowflake.Parse(id)
+	if err != nil {
+		return false
+	}
+	return int64(sf) >= discordSnowflakeFloor
+}
+
+// KnownConversation reports whether chatID is a conversation id this
+// Frontend has already seen and gated inbound — i.e. it's a DM user id or a
+// guild channel id from an allowed guild that passed gate()'s checks. Used
+// by relayd's outbound allowlist (OutboundAllowed in cmd/relayd/main.go) to
+// permit replies into guild channels: guild channels are never present in
+// the Discord access.Manager's user-id allowlist (that only holds sender
+// ids), so without this every model reply into an allowed guild channel
+// would be silently dropped even though the inbound message that prompted
+// it was itself allowlisted. Fail-closed for anything never seen inbound.
+func (f *Frontend) KnownConversation(chatID string) bool {
+	_, ok := f.convChannels.Load(chatID)
+	return ok
 }
 
 // Send delivers a message to the channel named by m.Meta["channel_id"]

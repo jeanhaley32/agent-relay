@@ -300,11 +300,14 @@ func main() {
 	// allowlist gates who reaches Claude; this stops Claude messaging strangers.
 	// Checks both the Telegram (int64) and, when enabled, Discord (snowflake)
 	// allowlists — chatID is a Telegram chat id (== user id) or, for Discord,
-	// gate()'s convID (== user id for DMs, == channel id for guild messages;
-	// guild channels are inherently multi-party so acc-style single-id
-	// allowlisting doesn't apply there — DESIGN.md §5 leaves guild outbound
-	// policy to allow_guild_messages/allowed_guild_ids at the frontend, not
-	// here).
+	// gate()'s convID (== user id for DMs, == channel id for guild messages).
+	// Guild channels are inherently multi-party so acc-style single-id
+	// allowlisting doesn't apply there; instead we allow any chatID the
+	// Discord frontend has already seen and gated inbound (KnownConversation)
+	// — i.e. a guild channel from an allowed guild, or a DM user id. That
+	// covers scheduled reminders / relayd-originated replies into a channel
+	// the model was legitimately talking in, while still failing closed for
+	// anything never seen inbound.
 	b.OutboundAllowed = func(chatID string) bool {
 		if id, err := strconv.ParseInt(chatID, 10, 64); err == nil && acc.Allowed(id) {
 			return true
@@ -313,6 +316,9 @@ func main() {
 			if id, err := snowflake.Parse(chatID); err == nil && discordAcc.Allowed(int64(id)) {
 				return true
 			}
+		}
+		if discordFront != nil && discordFront.KnownConversation(chatID) {
+			return true
 		}
 		logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
 		return false

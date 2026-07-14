@@ -5,6 +5,18 @@ import (
 	"sync"
 )
 
+// Claimer is an optional interface a sub-frontend can implement to say
+// whether a given ConversationID plausibly belongs to it, independent of
+// whether it has ever seen that id delivered inbound this process lifetime.
+// MultiFrontend consults it as a fallback for the "never seen inbound" case
+// (see Send below) so a relayd-originated message (a scheduled reminder
+// firing before the recipient has ever messaged the bot this run, an admin
+// notice, etc.) still lands on the right platform instead of always going to
+// frontends[0].
+type Claimer interface {
+	OwnsConversationID(id string) bool
+}
+
 // MultiFrontend fans multiple frontend Endpoints (e.g. Telegram + Discord)
 // into the single Frontend slot the Broker knows how to drive. The Broker
 // itself stays platform-agnostic; MultiFrontend is just wiring glue so
@@ -66,11 +78,25 @@ func (mf *MultiFrontend) Name() string         { return "multi" }
 func (mf *MultiFrontend) Recv() <-chan Message { return mf.recv }
 
 // Send routes to whichever sub-frontend last delivered an inbound message
-// for m.ConversationID, or the first-registered frontend if none has.
+// for m.ConversationID. If none has (this process lifetime), it asks each
+// frontend that implements Claimer whether the id is plausibly theirs (e.g.
+// Discord snowflake magnitude vs. a Telegram chat id) before falling back to
+// frontends[0], so a relayd-originated message (scheduler reminder, admin
+// notice) doesn't get silently misrouted to the wrong platform and dropped —
+// see Claimer's doc comment.
 func (mf *MultiFrontend) Send(ctx context.Context, m Message) error {
 	mf.mu.RLock()
 	fe, ok := mf.owner[m.ConversationID]
 	mf.mu.RUnlock()
+	if !ok {
+		for _, cand := range mf.frontends {
+			if claimer, isClaimer := cand.(Claimer); isClaimer && claimer.OwnsConversationID(m.ConversationID) {
+				fe = cand
+				ok = true
+				break
+			}
+		}
+	}
 	if !ok {
 		fe = mf.frontends[0]
 	}
