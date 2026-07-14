@@ -231,6 +231,35 @@ func (b *Broker) addConversationUsage(chatID string, tokens int) {
 	w.tokens += int64(tokens)
 }
 
+// SetConversationUsage overwrites (does not add to) chatID's usage for the
+// current window with an authoritative real number - used by the token
+// attribution hook (scripts/token-usage-hook.py via cmd/relayd's
+// /webhook/token-usage) to replace the interim chars/4 text-length estimate
+// with real per-conversation token usage pulled from the Claude API's own
+// usage data in the session transcript (2026-07-14: the estimate
+// undercounted real usage by roughly 2-3x since it only sees reply text, not
+// reasoning/tool-call tokens). A no-op if chatID has no configured cap.
+// Rolls the window first (same as every other accessor) so a call arriving
+// just after a rollover doesn't stomp on a legitimately-fresh window with a
+// stale pre-rollover number.
+func (b *Broker) SetConversationUsage(chatID string, tokens int64) {
+	if _, ok := b.ConversationCaps[chatID]; !ok {
+		return
+	}
+	b.conversationUsedMu.Lock()
+	defer b.conversationUsedMu.Unlock()
+	if b.conversationUsed == nil {
+		b.conversationUsed = map[string]*conversationWindow{}
+	}
+	b.rollIfExpired(chatID)
+	w := b.conversationUsed[chatID]
+	if w == nil {
+		w = &conversationWindow{windowStart: b.now()}
+		b.conversationUsed[chatID] = w
+	}
+	w.tokens = tokens
+}
+
 // LockdownMessage is sent to any non-admin sender while lockdown is active.
 const LockdownMessage = "This assistant is currently in lockdown - only admins can send messages right now. Try again later."
 
