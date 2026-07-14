@@ -706,8 +706,15 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	}
 
 	create := discord.MessageCreate{Content: m.Text}
-	_, err = f.channels.CreateMessage(channelID, create, rest.WithCtx(ctx))
+	sent, err := f.channels.CreateMessage(channelID, create, rest.WithCtx(ctx))
 	if err == nil {
+		// Log the real Discord message id Discord itself assigned, so a
+		// "the daemon said success" claim can be cross-checked directly
+		// against the platform afterward (e.g. via GET .../messages) rather
+		// than trusting the ack alone — see the 2026-07-14 incident where a
+		// reply_ack reported success but the message never actually
+		// appeared in the channel history.
+		f.logger.Printf("discord send ok: channel=%s message=%s", channelID, sent.ID)
 		return nil
 	}
 
