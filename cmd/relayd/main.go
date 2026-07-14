@@ -262,13 +262,6 @@ func main() {
 	}
 	defer sched.Close()
 
-	// Grafana alert webhook: alerts are routed through the model backend
-	// (same injection path as scheduled triggers), not straight to Telegram -
-	// so alerts get judgment/context applied before they reach the user,
-	// instead of Grafana paging directly. Loopback-only: Grafana runs on
-	// this same host, no need to expose it beyond localhost.
-	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger)
-
 	// Tailnet-bound approval flow for high-risk actions: a loopback-only
 	// /request+/status API this agent calls (via curl) to ask for a human
 	// decision, and a Tailscale-interface-only /approve page the request
@@ -305,6 +298,16 @@ func main() {
 
 	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter,
 		ConversationCaps: cfg.Budget.ConversationCaps}
+
+	// Grafana alert webhook: alerts are routed through the model backend
+	// (same injection path as scheduled triggers), not straight to Telegram -
+	// so alerts get judgment/context applied before they reach the user,
+	// instead of Grafana paging directly. Loopback-only: Grafana runs on
+	// this same host, no need to expose it beyond localhost. Also hosts
+	// /webhook/reply-drift and /webhook/token-usage, hence needing b now
+	// that it exists.
+	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b)
+
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
 	// auto-resolve any still-open events for that chat. Supplements ack_event.
@@ -540,7 +543,7 @@ type grafanaWebhookPayload struct {
 // path the scheduler uses (back.Send), rather than notifying Telegram
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
-func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger) {
+func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker) {
 	if adminChatID == "" {
 		logger.Printf("grafana webhook: no admin chat configured, not starting listener")
 		return
@@ -676,6 +679,36 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 		}
 		replyDriftTotal.Add(1)
 		logger.Printf("reply drift detected: model answered a relay event in terminal text without calling the reply tool")
+		w.WriteHeader(http.StatusOK)
+	})
+	// /webhook/token-usage: called by scripts/token-usage-hook.py (a Claude
+	// Code Stop hook) with real per-conversation token usage computed from
+	// the session transcript's own Claude-API usage data - replacing the
+	// interim chars/4 text-length estimate the Broker uses live between hook
+	// runs. Jean's explicit request, 2026-07-14: the estimate was found to
+	// undercount real usage by roughly 2-3x for a capped conversation. Body:
+	// {"usage": {"<chat_id>": <int64 tokens>, ...}} - a batch of every
+	// currently-capped conversation's real usage in one call, since the hook
+	// recomputes attribution for the whole transcript each run anyway.
+	// SetConversationUsage is a no-op for any chat_id without a configured
+	// cap, so this endpoint can't be used to inject usage for an uncapped
+	// conversation.
+	mux.HandleFunc("/webhook/token-usage", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var payload struct {
+			Usage map[string]int64 `json:"usage"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			logger.Printf("token-usage webhook: bad payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		for chatID, tokens := range payload.Usage {
+			b.SetConversationUsage(chatID, tokens)
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/webhook/grafana", func(w http.ResponseWriter, r *http.Request) {

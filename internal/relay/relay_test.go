@@ -523,3 +523,40 @@ func TestConversationCapRollsOverOnWindow(t *testing.T) {
 		t.Fatal("message after the window rolled over should have been forwarded - cap must reset, not stay a lifetime ban")
 	}
 }
+
+// TestSetConversationUsageOverridesEstimate covers the 2026-07-14 real
+// attribution hook: SetConversationUsage overwrites the interim chars/4
+// estimate with an authoritative real number, and takes effect immediately
+// for the next cap check - no double counting with prior estimate-based
+// addConversationUsage calls.
+func TestSetConversationUsageOverridesEstimate(t *testing.T) {
+	b := &Broker{
+		ConversationCaps: map[string]int64{"999": 100},
+	}
+
+	// Estimate-based tracking says 10 tokens used - well under cap.
+	b.addConversationUsage("999", 10)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("should not be exceeded yet (10 < 100)")
+	}
+
+	// Real attribution says the actual usage was much higher - overwrite,
+	// not add (10 + 150 would also exceed, but this proves it's a set).
+	b.SetConversationUsage("999", 150)
+	if !b.conversationCapExceeded("999") {
+		t.Fatal("expected the real usage override (150) to exceed the cap (100)")
+	}
+
+	// A lower real number can also bring a conversation back under cap -
+	// proves it's a true overwrite, not a monotonic add.
+	b.SetConversationUsage("999", 5)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("expected the corrected-down real usage (5) to no longer exceed the cap")
+	}
+
+	// No-op for an uncapped chat_id.
+	b.SetConversationUsage("111", 999999)
+	if b.conversationCapExceeded("111") {
+		t.Fatal("SetConversationUsage must be a no-op for a chat_id with no configured cap")
+	}
+}
