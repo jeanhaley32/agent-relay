@@ -149,6 +149,14 @@ type Frontend struct {
 	// chat_id and no Meta["channel_id"] at all.
 	convChannels sync.Map // ConversationID (string) -> snowflake.ID
 
+	// dmConvs marks which convChannels entries are DMs (chatID == sender user
+	// id) rather than guild channels, so KnownConversation can re-check
+	// f.auth.Allowed live for DMs without misclassifying guild channel ids
+	// (which are never valid auth-manager entries and must stay allowed
+	// purely by virtue of having been seen inbound). See KnownConversation's
+	// doc comment.
+	dmConvs sync.Map // ConversationID (string) -> struct{}
+
 	// dmChannels caches user-id -> resolved DM channel id, so a reply to a
 	// user we have never actually seen a convChannels entry for yet (e.g. the
 	// very first scheduled reminder to a user, before they've DMed the bot in
@@ -506,6 +514,9 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 	// ConversationID/chat_id — never Meta["channel_id"] — can still be
 	// routed by sendOnce. See the convChannels field doc comment.
 	f.convChannels.Store(convID, m.channelID)
+	if m.guildID == nil {
+		f.dmConvs.Store(convID, struct{}{})
+	}
 
 	msg := relay.Message{
 		ConversationID: convID,
@@ -563,9 +574,29 @@ func (f *Frontend) OwnsConversationID(id string) bool {
 // ids), so without this every model reply into an allowed guild channel
 // would be silently dropped even though the inbound message that prompted
 // it was itself allowlisted. Fail-closed for anything never seen inbound.
+//
+// For DMs specifically, chatID IS the sender's user id (see gate()'s convID
+// comment), so we additionally re-check f.auth.Allowed(chatID) live rather
+// than trusting the cached convChannels entry alone: convChannels is never
+// purged, so without this a user denied/removed from the allowlist after an
+// earlier authorized DM would stay reachable for outbound replies until
+// process restart — an asymmetry with Telegram, whose outbound gate consults
+// acc.Allowed live. Guild channel ids are never valid entries in the
+// user-id-keyed auth manager, so this check is a no-op (harmlessly false)
+// for the guild-channel path and doesn't change that behavior.
 func (f *Frontend) KnownConversation(chatID string) bool {
 	_, ok := f.convChannels.Load(chatID)
-	return ok
+	if !ok {
+		return false
+	}
+	if sf, err := snowflake.Parse(chatID); err == nil && f.auth.Allowed(sf) {
+		return true
+	}
+	// Not currently allowed as a DM sender - only still "known" if this is a
+	// guild channel id, tracked separately in dmConvs (never set for guild
+	// channels, so this always allows the guild-channel path through).
+	_, isDM := f.dmConvs.Load(chatID)
+	return !isDM
 }
 
 // Send delivers a message to the channel named by m.Meta["channel_id"]
@@ -590,13 +621,6 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	return err
 }
 
-// sendOnce is the actual single REST attempt — both Send() and the retry
-// worker call this, so there's exactly one code path that talks to Discord.
-// Per DESIGN.md §4, rate-limit (429) handling is intentionally NOT
-// duplicated here: disgo's REST client already parses Discord's
-// X-RateLimit-* headers and per-route buckets, which is the whole reason
-// disgo was chosen over discordgo. This only classifies the resulting error
-// as permanent vs. retryable for the outer retry-queue layer.
 // resolveChannel figures out which physical channel to CreateMessage into
 // for m, in priority order:
 //
@@ -664,6 +688,13 @@ func (f *Frontend) resolveChannel(ctx context.Context, m relay.Message) (snowfla
 	return dm.ID(), nil
 }
 
+// sendOnce is the actual single REST attempt — both Send() and the retry
+// worker call this, so there's exactly one code path that talks to Discord.
+// Per DESIGN.md §4, rate-limit (429) handling is intentionally NOT
+// duplicated here: disgo's REST client already parses Discord's
+// X-RateLimit-* headers and per-route buckets, which is the whole reason
+// disgo was chosen over discordgo. This only classifies the resulting error
+// as permanent vs. retryable for the outer retry-queue layer.
 func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	channelID, err := f.resolveChannel(ctx, m)
 	if err != nil {
