@@ -470,6 +470,16 @@ func (f *Frontend) onMessageEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
+	// Short-circuit the two cheap gate() checks that need no network lookup
+	// (the bot's own echo, and ordinary empty-content events) before paying
+	// for the JoinedMembers round trip below: gate() would discard both
+	// anyway, so doing the member-count lookup first only adds a homeserver
+	// round trip per self-echo in uncached rooms plus a misleading "refusing
+	// to guess" drop log for content gate() was always going to drop.
+	if in.senderIsMe || in.content == "" {
+		return
+	}
+
 	// Member count distinguishes a DM (<=2 members) from a multi-member room
 	// (DESIGN.md §3). This MUST be a real lookup, not left at the
 	// zero-value "assume DM": onMemberEvent auto-joins any room an
@@ -556,6 +566,23 @@ func (f *Frontend) onMemberEvent(ctx context.Context, evt *event.Event) {
 	// 2-member room that later grows to 3+ must stop being routed to
 	// convRooms as if it were still the sender's private DM room).
 	f.roomMemberCount.Delete(string(evt.RoomID))
+
+	// A DM room that grows a third member must also stop being reachable
+	// via the stale convRooms/dmConvs entries recorded while it was still
+	// 2-member: otherwise a relayd-originated reply addressed only by
+	// chat_id (a scheduled reminder, an mcp reply) resolves via
+	// convRooms[sender]->room and lands in the now-multi-member room even
+	// though gate() will correctly reclassify the NEXT inbound message from
+	// this room as a group. Purge any convRooms/dmConvs entry whose stored
+	// room id is this room so resolveRoom can no longer find it that way.
+	roomID := string(evt.RoomID)
+	f.convRooms.Range(func(k, v any) bool {
+		if v.(string) == roomID {
+			f.convRooms.Delete(k)
+			f.dmConvs.Delete(k)
+		}
+		return true
+	})
 
 	if evt.StateKey == nil || f.selfID == "" || *evt.StateKey != f.selfID {
 		return // not an event about this bot's own membership
@@ -713,14 +740,21 @@ func (f *Frontend) OwnsConversationID(id string) bool {
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
+		// A transient failure on one chunk must not abort the rest: that
+		// chunk gets queued for background retry (sendChunk), but if we
+		// returned here the remaining chunks would never be sent at all,
+		// turning a delayed chunk into a permanently dropped one and
+		// garbling the split message's order. Send every chunk regardless,
+		// and report the first error (if any) once all have been attempted.
+		var firstErr error
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
-			if err := f.sendChunk(ctx, cm); err != nil {
-				return err
+			if err := f.sendChunk(ctx, cm); err != nil && firstErr == nil {
+				firstErr = err
 			}
 		}
-		return nil
+		return firstErr
 	}
 	return f.sendChunk(ctx, m)
 }
