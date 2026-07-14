@@ -257,7 +257,7 @@ func main() {
 	// so alerts get judgment/context applied before they reach the user,
 	// instead of Grafana paging directly. Loopback-only: Grafana runs on
 	// this same host, no need to expose it beyond localhost.
-	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, tracker, logger)
+	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger)
 
 	// Tailnet-bound approval flow for high-risk actions: a loopback-only
 	// /request+/status API this agent calls (via curl) to ask for a human
@@ -377,14 +377,23 @@ func main() {
 
 	// Admin session gate: every admin user_id (from_id) must re-prove
 	// tailnet presence (via the approval page) after 30 min idle, closing
-	// the gap where a compromised Telegram account alone would otherwise be
+	// the gap where a compromised messenger account alone would otherwise be
 	// trusted. Keyed on user_id, not chat_id - see SessionGatedUsers doc
 	// comment in internal/relay/relay.go. Tracked independently per admin.
-	// Currently just Jean, but generalized since the admin list can grow.
-	if len(cfg.Telegram.Admins) > 0 {
-		gated := make(map[string]bool, len(cfg.Telegram.Admins))
+	// Covers both Telegram admins (int64 ids) and, when enabled, Discord
+	// admins (snowflake ids) - the gate is the guard against a compromised
+	// admin account on EITHER frontend, so both id spaces must feed it or a
+	// Discord admin could run /handshake approve, /allow, /lockdown etc
+	// indefinitely with zero tailnet proof.
+	if len(cfg.Telegram.Admins) > 0 || len(cfg.Discord.Admins) > 0 {
+		gated := make(map[string]bool, len(cfg.Telegram.Admins)+len(cfg.Discord.Admins))
 		for _, admin := range cfg.Telegram.Admins {
 			gated[strconv.FormatInt(admin, 10)] = true
+		}
+		if discordAdminIDs, err := cfg.Discord.AdminIDs(); err == nil {
+			for _, admin := range discordAdminIDs {
+				gated[admin.String()] = true
+			}
 		}
 		b.Session = session.NewManager(30 * time.Minute)
 		b.Approval = appr
@@ -520,7 +529,7 @@ type grafanaWebhookPayload struct {
 // path the scheduler uses (back.Send), rather than notifying Telegram
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
-func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, tracker *scheduler.Tracker, logger *log.Logger) {
+func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger) {
 	if adminChatID == "" {
 		logger.Printf("grafana webhook: no admin chat configured, not starting listener")
 		return
@@ -544,6 +553,19 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 		pausedNum := 0
 		if snap.Paused {
 			pausedNum = 1
+		}
+		// Discord frontend is optional (cfg.Discord.Enabled) - report zeros
+		// rather than omitting the series when it's off, so alert rules
+		// that reference these metrics don't need conditional queries.
+		var discordSendFailures, discordPermanentDrops, discordQueueDepth int64
+		var discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt int64
+		if discordFront != nil {
+			discordSendFailures = discordFront.SendFailures()
+			discordPermanentDrops = discordFront.PermanentDrops()
+			discordQueueDepth = discordFront.QueueDepth()
+			discordRecvDrops = discordFront.RecvDrops()
+			discordGatewayReconnects = discordFront.GatewayReconnects()
+			discordLastGatewayEventAt = discordFront.LastGatewayEventAt()
 		}
 		body := fmt.Sprintf(
 			"# HELP relayd_unrecognized_access_attempts_total Distinct non-allowlisted Telegram senders who have messaged the bot since relayd started.\n"+
@@ -593,13 +615,33 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 				"relayd_pending_events_open %d\n"+
 				"# HELP relayd_pending_events_oldest_age_seconds Age of the oldest still-open pending event in seconds (0 if none open).\n"+
 				"# TYPE relayd_pending_events_oldest_age_seconds gauge\n"+
-				"relayd_pending_events_oldest_age_seconds %f\n",
+				"relayd_pending_events_oldest_age_seconds %f\n"+
+				"# HELP relayd_discord_send_failures_total Failed Discord message-send attempts since relayd started (includes retries). 0 if the Discord frontend is disabled.\n"+
+				"# TYPE relayd_discord_send_failures_total counter\n"+
+				"relayd_discord_send_failures_total %d\n"+
+				"# HELP relayd_discord_permanent_drops_total Discord messages that exhausted all retry attempts and were permanently dropped.\n"+
+				"# TYPE relayd_discord_permanent_drops_total counter\n"+
+				"relayd_discord_permanent_drops_total %d\n"+
+				"# HELP relayd_discord_retry_queue_depth Discord messages currently queued for background retry.\n"+
+				"# TYPE relayd_discord_retry_queue_depth gauge\n"+
+				"relayd_discord_retry_queue_depth %d\n"+
+				"# HELP relayd_discord_recv_drops_total Inbound Discord gateway events dropped without being relayed since relayd started - the Discord analogue of a getUpdates outage.\n"+
+				"# TYPE relayd_discord_recv_drops_total counter\n"+
+				"relayd_discord_recv_drops_total %d\n"+
+				"# HELP relayd_discord_gateway_reconnects_total Discord gateway reconnects since relayd started.\n"+
+				"# TYPE relayd_discord_gateway_reconnects_total counter\n"+
+				"relayd_discord_gateway_reconnects_total %d\n"+
+				"# HELP relayd_discord_last_gateway_event_seconds Unix timestamp of the last event received from the Discord gateway (0 if the Discord frontend is disabled or has seen no events yet).\n"+
+				"# TYPE relayd_discord_last_gateway_event_seconds gauge\n"+
+				"relayd_discord_last_gateway_event_seconds %d\n",
 			acc.TotalRecorded(), len(acc.Pending()), len(acc.Allowlist()),
 			snap.PercentUsed, snap.Used, snap.Limit, snap.WindowLeft.Seconds(),
 			stateNum, pausedNum,
 			front.SendFailures(), front.PermanentDrops(), front.QueueDepth(),
 			front.GetUpdatesFailures(), front.LastPollSuccess(),
 			tracker.OpenCount(), tracker.OldestOpenAge().Seconds(),
+			discordSendFailures, discordPermanentDrops, discordQueueDepth,
+			discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt,
 		)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(body))
