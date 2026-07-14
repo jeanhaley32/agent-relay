@@ -137,8 +137,27 @@ type Broker struct {
 	// count against the cap: an inbound message's estimate is added before
 	// it's forwarded to the backend, and a reply's estimate is added when
 	// it comes back - see conversationCapExceeded and addConversationUsage.
-	// nil map ⇒ no caps configured.
+	// Set at construction only; mutated at runtime exclusively through
+	// SetCaps (capsMu-guarded), which cmd/relayd's /webhook/reload-caps
+	// calls to pick up config.json changes without a process restart
+	// (Jean's explicit request, 2026-07-14). nil map ⇒ no explicit caps.
 	ConversationCaps map[string]int64
+
+	// DefaultConversationCap, if > 0, applies to any chat_id NOT explicitly
+	// listed in ConversationCaps and not exempted by ConversationCapExempt -
+	// a blanket per-individual cap (Jean's explicit request, 2026-07-14:
+	// "set our default cap to 300k per every three hours") rather than
+	// requiring every contact to be added by hand. Same construction/
+	// SetCaps mutation rule as ConversationCaps.
+	DefaultConversationCap int64
+
+	// ConversationCapExempt, if set, reports whether chatID should never be
+	// capped regardless of ConversationCaps/DefaultConversationCap - wired
+	// in cmd/relayd to exempt admins, since a blanket default cap is meant
+	// for arbitrary allowlisted contacts, not the operator. nil ⇒ nothing
+	// exempted (only relevant when DefaultConversationCap > 0, since an
+	// explicit ConversationCaps entry is an explicit choice either way).
+	ConversationCapExempt func(chatID string) bool
 
 	// ConversationCapWindow is how long a conversation's usage counts
 	// against its cap before rolling over to a fresh window (Jean's
@@ -149,8 +168,40 @@ type Broker struct {
 	// clock is overridden in tests; nil ⇒ time.Now.
 	clock func() time.Time
 
+	capsMu sync.RWMutex // guards ConversationCaps/DefaultConversationCap after construction
+
 	conversationUsedMu sync.Mutex
 	conversationUsed   map[string]*conversationWindow
+}
+
+// SetCaps atomically replaces both ConversationCaps and
+// DefaultConversationCap - the only way either is mutated after Run starts.
+// Existing per-conversation usage/window state is left untouched, so a live
+// cap change (e.g. via cmd/relayd's /webhook/reload-caps) takes effect on
+// the very next message without resetting anyone's accumulated usage.
+func (b *Broker) SetCaps(caps map[string]int64, defaultCap int64) {
+	b.capsMu.Lock()
+	defer b.capsMu.Unlock()
+	b.ConversationCaps = caps
+	b.DefaultConversationCap = defaultCap
+}
+
+// capLimit returns the effective cap for chatID and whether it's capped at
+// all: an explicit ConversationCaps entry always wins; otherwise
+// DefaultConversationCap applies unless ConversationCapExempt(chatID).
+func (b *Broker) capLimit(chatID string) (limit int64, capped bool) {
+	b.capsMu.RLock()
+	defer b.capsMu.RUnlock()
+	if limit, ok := b.ConversationCaps[chatID]; ok {
+		return limit, true
+	}
+	if b.DefaultConversationCap <= 0 {
+		return 0, false
+	}
+	if b.ConversationCapExempt != nil && b.ConversationCapExempt(chatID) {
+		return 0, false
+	}
+	return b.DefaultConversationCap, true
 }
 
 // defaultConversationCapWindow is used when ConversationCapWindow is unset.
@@ -196,8 +247,8 @@ func (b *Broker) rollIfExpired(chatID string) {
 // if ConversationCapWindow has elapsed, so this is a rate limit, not a
 // lifetime ban.
 func (b *Broker) conversationCapExceeded(chatID string) bool {
-	limit, ok := b.ConversationCaps[chatID]
-	if !ok {
+	limit, capped := b.capLimit(chatID)
+	if !capped {
 		return false
 	}
 	b.conversationUsedMu.Lock()
@@ -216,7 +267,7 @@ func (b *Broker) conversationCapExceeded(chatID string) bool {
 // crosses the cap) should explain why, the limit, current usage, and time
 // until the window resets, rather than the conversation just going silent.
 func (b *Broker) conversationCapRejectionNotice(chatID string) string {
-	limit := b.ConversationCaps[chatID]
+	limit, _ := b.capLimit(chatID)
 	b.conversationUsedMu.Lock()
 	w := b.conversationUsed[chatID]
 	var used int64
@@ -239,7 +290,7 @@ func (b *Broker) conversationCapRejectionNotice(chatID string) string {
 // current window, a no-op if chatID has no configured cap (avoids growing
 // the map for every conversation when caps are rarely configured).
 func (b *Broker) addConversationUsage(chatID string, tokens int) {
-	if _, ok := b.ConversationCaps[chatID]; !ok {
+	if _, capped := b.capLimit(chatID); !capped {
 		return
 	}
 	b.conversationUsedMu.Lock()
@@ -268,7 +319,7 @@ func (b *Broker) addConversationUsage(chatID string, tokens int) {
 // just after a rollover doesn't stomp on a legitimately-fresh window with a
 // stale pre-rollover number.
 func (b *Broker) SetConversationUsage(chatID string, tokens int64) {
-	if _, ok := b.ConversationCaps[chatID]; !ok {
+	if _, capped := b.capLimit(chatID); !capped {
 		return
 	}
 	b.conversationUsedMu.Lock()

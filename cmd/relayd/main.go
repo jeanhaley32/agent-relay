@@ -297,7 +297,16 @@ func main() {
 	go serveSchedules(back, sched, tracker, logger)
 
 	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter,
-		ConversationCaps: cfg.Budget.ConversationCaps}
+		ConversationCaps:       cfg.Budget.ConversationCaps,
+		DefaultConversationCap: cfg.Budget.DefaultConversationCap,
+		// Admins are exempt from DefaultConversationCap - the blanket cap is
+		// for arbitrary allowlisted contacts, not the operator. Reuses
+		// cmds.IsAdmin directly: chat_id == from_id for any private 1:1
+		// conversation (the only kind a per-conversation cap makes sense
+		// for), so the same admin check already used for slash commands
+		// applies unchanged here.
+		ConversationCapExempt: cmds.IsAdmin,
+	}
 
 	// Grafana alert webhook: alerts are routed through the model backend
 	// (same injection path as scheduled triggers), not straight to Telegram -
@@ -306,7 +315,7 @@ func main() {
 	// this same host, no need to expose it beyond localhost. Also hosts
 	// /webhook/reply-drift and /webhook/token-usage, hence needing b now
 	// that it exists.
-	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b)
+	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, *cfgPath)
 
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
@@ -543,7 +552,7 @@ type grafanaWebhookPayload struct {
 // path the scheduler uses (back.Send), rather than notifying Telegram
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
-func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker) {
+func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) {
 	if adminChatID == "" {
 		logger.Printf("grafana webhook: no admin chat configured, not starting listener")
 		return
@@ -709,6 +718,32 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 		for chatID, tokens := range payload.Usage {
 			b.SetConversationUsage(chatID, tokens)
 		}
+		w.WriteHeader(http.StatusOK)
+	})
+	// /webhook/reload-caps: re-reads config.json's budget.conversation_caps
+	// and budget.default_conversation_cap from disk and applies them to the
+	// live Broker via SetCaps, without a relayd process restart - Jean's
+	// explicit request, 2026-07-14: cap tuning was happening often enough
+	// during live testing that a full binary restart each time was real
+	// friction. Only the budget caps are hot-reloaded, not the rest of
+	// config.json (token env vars, allowlists, etc. still require a real
+	// restart) - deliberately narrow rather than a general config-reload
+	// mechanism, which would be a much bigger surface to get right.
+	mux.HandleFunc("/webhook/reload-caps", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		fresh, err := config.Load(cfgPath)
+		if err != nil {
+			logger.Printf("reload-caps: failed to reload %s: %v", cfgPath, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(err.Error()))
+			return
+		}
+		b.SetCaps(fresh.Budget.ConversationCaps, fresh.Budget.DefaultConversationCap)
+		logger.Printf("reload-caps: applied %d explicit cap(s), default=%d",
+			len(fresh.Budget.ConversationCaps), fresh.Budget.DefaultConversationCap)
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/webhook/grafana", func(w http.ResponseWriter, r *http.Request) {
