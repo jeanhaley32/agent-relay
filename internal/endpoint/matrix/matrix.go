@@ -526,14 +526,19 @@ func (f *Frontend) onEncryptedEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
-	if _, alreadySent := f.encryptedNoticeSent.LoadOrStore(string(evt.RoomID), struct{}{}); alreadySent {
+	if _, alreadySent := f.encryptedNoticeSent.Load(string(evt.RoomID)); alreadySent {
 		return
 	}
 	const notice = "This bot does not support end-to-end encrypted rooms yet. Please use an unencrypted room."
 	if _, err := f.api.SendMessageEvent(ctx, evt.RoomID, event.EventMessage,
 		event.MessageEventContent{MsgType: event.MsgText, Body: notice}); err != nil {
 		f.logger.Printf("matrix: failed to send E2E-not-enabled notice to room %s: %v", evt.RoomID, err)
+		return
 	}
+	// Only mark the notice as sent once it actually went out — a failed
+	// send (transient network/homeserver error) must not permanently
+	// suppress the one-time notice for this room.
+	f.encryptedNoticeSent.Store(string(evt.RoomID), struct{}{})
 }
 
 // onMemberEvent handles room-invite events (DESIGN.md §7's room-join
@@ -543,6 +548,15 @@ func (f *Frontend) onEncryptedEvent(ctx context.Context, evt *event.Event) {
 // unsolicited invite is itself an unauthenticated-sender surface, the
 // Matrix analogue of Discord's guild-invite surface.
 func (f *Frontend) onMemberEvent(ctx context.Context, evt *event.Event) {
+	// Any membership change in a room we've cached a member count for
+	// invalidates that cache — a join/leave by ANY member (not just the
+	// bot) changes the count, and a stale low count is exactly what lets
+	// gate() misclassify a now-multi-member room as a DM (see
+	// roomMemberCountFor's doc comment and the hijack this closes: a
+	// 2-member room that later grows to 3+ must stop being routed to
+	// convRooms as if it were still the sender's private DM room).
+	f.roomMemberCount.Delete(string(evt.RoomID))
+
 	if evt.StateKey == nil || f.selfID == "" || *evt.StateKey != f.selfID {
 		return // not an event about this bot's own membership
 	}
@@ -854,7 +868,8 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 					continue
 				}
 				item.attempts++
-				if item.attempts >= maxRetryAttempts {
+				var perm permanentSendError
+				if item.attempts >= maxRetryAttempts || errors.As(err, &perm) {
 					f.permanentDrops.Add(1)
 					f.logger.Printf("matrix retry gave up after %d attempts for room %s: %v",
 						item.attempts, item.msg.Meta["room_id"], err)
