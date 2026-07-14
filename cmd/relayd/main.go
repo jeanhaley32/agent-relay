@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -65,19 +66,42 @@ func main() {
 	// Access manager: allowlist + admins + pending-request queue (persisted).
 	acc := access.New(cfg.Telegram.Admins, cfg.Telegram.Allowlist, cfg.Telegram.AllowlistFile, logger)
 
+	// discordAcc is the Discord frontend's own access manager (own id
+	// namespace: Discord snowflakes, not Telegram user ids). It is declared
+	// here — ahead of the Discord frontend actually being started below — so
+	// the admin gate and /handshake closures below can capture it by
+	// reference: mustStartDiscord() assigns into it later, once
+	// cfg.Discord.Enabled is known, but both admin commands need to consult
+	// whichever access manager(s) are actually live.
+	var discordAcc *access.Manager
+
 	// Budget + shared control-plane commands + the admin /handshake command.
 	meter := budget.New(cfg.Budget.Tier, nil)
 	cmds := relay.StandardCommands(meter)
-	// Central admin gating for all Admin-flagged commands.
+	// Central admin gating for all Admin-flagged commands. Consults both the
+	// Telegram and (if enabled) Discord access managers — each frontend's
+	// admin ids live in its own manager, so a Discord admin's id is only
+	// ever found in discordAcc, and would otherwise never satisfy IsAdmin.
 	cmds.IsAdmin = func(senderID string) bool {
 		id, err := strconv.ParseInt(senderID, 10, 64)
-		return err == nil && acc.IsAdmin(id)
+		if err != nil {
+			return false
+		}
+		if acc.IsAdmin(id) {
+			return true
+		}
+		return discordAcc != nil && discordAcc.IsAdmin(id)
 	}
 	cmds.Register(command.Command{
 		Name:  "handshake",
 		Help:  "admin: list/approve/deny access requests",
 		Admin: true,
-		Run:   handshake(acc),
+		Run: handshake(func() []*access.Manager {
+			if discordAcc != nil {
+				return []*access.Manager{acc, discordAcc}
+			}
+			return []*access.Manager{acc}
+		}),
 	})
 
 	// Claude backend: listen on the socket for the shim.
@@ -132,7 +156,10 @@ func main() {
 	// Frontend slot via relay.MultiFrontend alongside Telegram.
 	frontendEndpoint := relay.Endpoint(front)
 	var discordFront *discord.Frontend
-	var discordAcc *access.Manager
+	// discordAcc itself is declared earlier (near cmds.IsAdmin) so the admin
+	// gate and /handshake closures can capture it by reference; assign into
+	// it here rather than redeclaring, or those closures would keep seeing
+	// the original nil.
 	if cfg.Discord.Enabled {
 		discordFront, discordAcc = mustStartDiscord(cfg, logger)
 		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
@@ -728,14 +755,26 @@ func verdict(back *claudebk.Endpoint, allow bool) command.Handler {
 //	/handshake              list pending access requests
 //	/handshake approve <id> grant access to a pending id
 //	/handshake deny <id>    drop a pending request
-func handshake(acc *access.Manager) command.Handler {
+//
+// managers() returns every access manager currently in play (Telegram, plus
+// Discord's own if that frontend is enabled) — each frontend has its own id
+// namespace and its own pending queue, so a request recorded by one manager
+// is otherwise invisible to (and unapprovable from) the other. Listing merges
+// all of them; approve/deny try each manager in turn and act on whichever one
+// actually has the id pending/denied, so an admin on either frontend can
+// resolve any request without knowing which frontend it came from.
+func handshake(managers func() []*access.Manager) command.Handler {
 	const maxList = 20 // cap the listing so it stays under Telegram's message limit
 	return func(_ command.Context, args []string) string {
 		if len(args) == 0 {
-			pend := acc.Pending()
+			var pend []access.Request
+			for _, acc := range managers() {
+				pend = append(pend, acc.Pending()...)
+			}
 			if len(pend) == 0 {
 				return "no pending requests"
 			}
+			sort.Slice(pend, func(i, j int) bool { return pend[i].FirstSeen.Before(pend[j].FirstSeen) })
 			var b strings.Builder
 			b.WriteString("pending requests:\n")
 			for i, r := range pend {
@@ -757,13 +796,17 @@ func handshake(acc *access.Manager) command.Handler {
 		}
 		switch args[0] {
 		case "approve":
-			if acc.Approve(id) {
-				return fmt.Sprintf("✅ approved %d", id)
+			for _, acc := range managers() {
+				if acc.Approve(id) {
+					return fmt.Sprintf("✅ approved %d", id)
+				}
 			}
 			return fmt.Sprintf("%d is not pending or denied — not approved (use an id from /handshake)", id)
 		case "deny":
-			if acc.Deny(id) {
-				return fmt.Sprintf("denied %d", id)
+			for _, acc := range managers() {
+				if acc.Deny(id) {
+					return fmt.Sprintf("denied %d", id)
+				}
 			}
 			return fmt.Sprintf("%d was not pending", id)
 		default:
