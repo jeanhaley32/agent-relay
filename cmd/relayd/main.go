@@ -28,12 +28,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/disgoorg/snowflake/v2"
+
 	"github.com/jeanhaley32/agent-relay/internal/access"
 	"github.com/jeanhaley32/agent-relay/internal/approval"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	"github.com/jeanhaley32/agent-relay/internal/config"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -119,6 +122,21 @@ func main() {
 		}
 	}
 	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
+
+	// Discord frontend (optional, DESIGN.md §9): the endpoint has existed on
+	// disk since the previous PR but nothing constructed/started it, so
+	// discord.enabled=true validated cleanly and then did nothing — a config
+	// that silently ran no Discord frontend at all. Wired here the same way
+	// Telegram is: its own access manager (converted to snowflake ids), its
+	// own New/Connect handshake, then fanned into the Broker's single
+	// Frontend slot via relay.MultiFrontend alongside Telegram.
+	frontendEndpoint := relay.Endpoint(front)
+	var discordFront *discord.Frontend
+	var discordAcc *access.Manager
+	if cfg.Discord.Enabled {
+		discordFront, discordAcc = mustStartDiscord(cfg, logger)
+		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
+	}
 
 	// Permission relay: admins approve tool-use prompts via /allow and /deny.
 	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Admin: true, Run: verdict(back, true)})
@@ -248,7 +266,7 @@ func main() {
 	// Service schedule-tool and event-tool calls coming from the model (via the shim).
 	go serveSchedules(back, sched, tracker, logger)
 
-	b := &relay.Broker{Frontend: front, Backend: back, Commands: cmds, Meter: meter}
+	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter}
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
 	// auto-resolve any still-open events for that chat. Supplements ack_event.
@@ -261,15 +279,43 @@ func main() {
 			tracker.NoteReply(chatID, time.Now())
 		}
 	}
+	// Surface the real Send outcome back to the reply tool call that
+	// originated it (by RequestID, carried in Meta["reply_id"]), instead of
+	// the tool call always returning "sent" regardless of what actually
+	// happened - real incident 2026-07-11, see AckBackendReply's doc comment.
+	b.AckBackendReply = func(m relay.Message, sendErr error) {
+		reqID := m.Meta["reply_id"]
+		if reqID == "" {
+			return // reply carries no correlation id (e.g. an internal/system reply) - nothing waiting
+		}
+		errText := ""
+		if sendErr != nil {
+			errText = sendErr.Error()
+		}
+		if err := back.ReplyRespond(reqID, errText); err != nil {
+			logger.Printf("reply ack for %s: %v", reqID, err)
+		}
+	}
 	// Outbound gate: the model can only reply to allowlisted chats. The inbound
 	// allowlist gates who reaches Claude; this stops Claude messaging strangers.
+	// Checks both the Telegram (int64) and, when enabled, Discord (snowflake)
+	// allowlists — chatID is a Telegram chat id (== user id) or, for Discord,
+	// gate()'s convID (== user id for DMs, == channel id for guild messages;
+	// guild channels are inherently multi-party so acc-style single-id
+	// allowlisting doesn't apply there — DESIGN.md §5 leaves guild outbound
+	// policy to allow_guild_messages/allowed_guild_ids at the frontend, not
+	// here).
 	b.OutboundAllowed = func(chatID string) bool {
-		id, err := strconv.ParseInt(chatID, 10, 64)
-		if err != nil || !acc.Allowed(id) {
-			logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
-			return false
+		if id, err := strconv.ParseInt(chatID, 10, 64); err == nil && acc.Allowed(id) {
+			return true
 		}
-		return true
+		if discordAcc != nil {
+			if id, err := snowflake.Parse(chatID); err == nil && discordAcc.Allowed(int64(id)) {
+				return true
+			}
+		}
+		logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
+		return false
 	}
 
 	cmds.Register(command.Command{
@@ -336,7 +382,7 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		logger.Printf("shutting down")
-		_ = front.Close() // closes the frontend Recv -> Broker.Run returns
+		_ = frontendEndpoint.Close() // closes the frontend Recv -> Broker.Run returns
 		cancel()
 	}()
 
@@ -344,6 +390,64 @@ func main() {
 		logger.Fatalf("broker: %v", err)
 	}
 	logger.Printf("stopped")
+}
+
+// mustStartDiscord builds the Discord frontend from cfg.Discord, connects
+// its gateway, and returns it along with the access.Manager backing its
+// allowlist (so the caller can also consult it for outbound gating).
+// Fatal on error, mirroring the Telegram handshake's posture: an operator
+// who set discord.enabled=true with a bad token/config wants a clear
+// startup failure, not a frontend that silently never came up (the exact
+// gap this function exists to close - see DESIGN.md §9 / finding 3).
+func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend, *access.Manager) {
+	token, err := cfg.DiscordToken()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+	adminIDs, err := cfg.Discord.AdminIDs()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+	allowIDs, err := cfg.Discord.AllowlistIDs()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+	guildIDs, err := cfg.Discord.AllowedGuildSnowflakes()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+
+	// access.Manager is int64-keyed and platform-agnostic by design; Discord
+	// snowflakes are uint64 but real values are time-based and well under
+	// math.MaxInt64, so the conversion is lossless in practice (same
+	// reasoning as discord.Int64Authorizer's doc comment).
+	toInt64 := func(ids []snowflake.ID) []int64 {
+		out := make([]int64, len(ids))
+		for i, id := range ids {
+			out[i] = int64(id)
+		}
+		return out
+	}
+	discordAcc := access.New(toInt64(adminIDs), toInt64(allowIDs), cfg.Discord.AllowlistFile, logger)
+
+	front, err := discord.New(token,
+		discord.WithAuthorizer(discord.Int64Authorizer(discordAcc)),
+		discord.WithLogger(logger),
+		discord.WithAllowGuildMessages(cfg.Discord.AllowGuildMessages),
+		discord.WithAllowedGuildIDs(guildIDs...),
+		discord.WithRequireMentionInGuild(cfg.Discord.RequireMentionInGuild()),
+	)
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := front.Connect(ctx); err != nil {
+		logger.Fatalf("discord: connect: %v", err)
+	}
+	logger.Printf("connected to Discord (admins=%d, allowlist=%d, guild_messages=%v)",
+		len(adminIDs), len(allowIDs), cfg.Discord.AllowGuildMessages)
+	return front, discordAcc
 }
 
 // listenWithRetry binds addr, retrying with a fixed 1s backoff until
