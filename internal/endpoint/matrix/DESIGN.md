@@ -537,6 +537,12 @@ Concrete, mapped to this design:
       pending for manual admin action, mirroring the
       allowlist-pending-request pattern both existing frontends already
       use for unauthorized senders.
+      **Known trade-off:** `DontProcessOldEvents` (see §6/replay-guard in
+      matrix.go's `Connect()`) also suppresses invite-state events carried
+      in the very first post-restart `/sync` response, so an admin invite
+      sent while relayd was down is never auto-joined — the admin must
+      re-invite after the bot comes back up. Logged at connect time; not
+      worth a one-time invite-state scan for the MVP's scope.
 - [ ] **`M_FORBIDDEN`/`M_TOO_LARGE`/other permanent 4xx reviewed** before
       shipping (§4) so these don't silently burn `maxRetryAttempts`
       retries each, the exact class of incident that motivated

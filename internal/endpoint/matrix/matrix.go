@@ -136,6 +136,15 @@ type Frontend struct {
 	// reply) that only carries ConversationID/chat_id can still be routed.
 	convRooms sync.Map // ConversationID (string) -> room id (string)
 
+	// dmConvs marks which convRooms entries are DMs (chatID == sender user
+	// id) rather than group rooms, so KnownConversation can re-check auth
+	// only for the DM case and allow group-room chat_ids (room ids) purely
+	// by virtue of having been seen inbound — mirrors discord.go's dmConvs.
+	// A group room id is never present in the user-id allowlist, so without
+	// this split KnownConversation would unconditionally reject every
+	// outbound reply into a multi-member room. Never set for group rooms.
+	dmConvs sync.Map // ConversationID (string) -> struct{}
+
 	// roomMemberCount caches the joined-member count for a room id, looked up
 	// via JoinedMembers the first time a message arrives from a room this
 	// process hasn't seen yet — used by onMessageEvent to populate
@@ -313,6 +322,15 @@ func (f *Frontend) Connect(ctx context.Context) error {
 				return fmt.Errorf("matrix: token auth but no user_id configured and GET /whoami failed: %w — set matrix.user_id alongside access_token_env", err)
 			}
 			f.selfID = string(resp.UserID)
+			// Re-apply credentials now that selfID is known: the earlier
+			// SetCredentials call above used f.userID (possibly empty on
+			// the token-only auth path), so the underlying mautrix.Client's
+			// UserID field would otherwise stay "" for the rest of the
+			// process lifetime. It works today (nothing keys off UserID
+			// yet), but the SyncStore's next-batch key and any future
+			// crypto/Store implementation would key off it, so keep it
+			// correct rather than leave a latent footgun.
+			f.api.SetCredentials(id.UserID(f.selfID), f.accessToken)
 		}
 	case f.userID != "" && f.password != "":
 		resp, err := f.api.Login(ctx, &mautrix.ReqLogin{
@@ -350,6 +368,15 @@ func (f *Frontend) Connect(ctx context.Context) error {
 			// messages it already handled. DontProcessOldEvents detects
 			// since=="" and marks every event in that first response
 			// suppressed before Dispatch fires the OnEventType callbacks.
+			//
+			// Trade-off (DESIGN.md §7): this also suppresses any invite-
+			// state events already pending in that first response, so an
+			// admin invite sent while relayd was down is never auto-joined
+			// — onMemberEvent simply never fires for it, and the admin
+			// must re-invite after the bot is back up. Logged here (not
+			// silently) so this shows up in the journal instead of being a
+			// mystery "why didn't it join" report.
+			f.logger.Printf("matrix: connecting — note: room invites sent while offline are suppressed by the first replay-guarded /sync and must be resent (DESIGN.md §7)")
 			syncer.OnSync(f.client.DontProcessOldEvents)
 		}
 		f.syncDone = make(chan struct{})
@@ -453,7 +480,19 @@ func (f *Frontend) onMessageEvent(ctx context.Context, evt *event.Event) {
 	// relayd-originated reply addressed only by chat_id (a scheduled
 	// reminder, an mcp reply) could be delivered into the group room instead
 	// of the private DM.
-	in.memberCount = f.roomMemberCountFor(ctx, in.roomID)
+	count, known := f.roomMemberCountFor(ctx, in.roomID)
+	if !known {
+		// JoinedMembers failed and this room has no cached count yet (a
+		// transient homeserver hiccup on the very first message from this
+		// room). Defaulting to DM semantics here is exactly the hijack
+		// round-1 fix #4 closed for the zero-value case — a group-room
+		// message would overwrite the sender's real DM room mapping in
+		// convRooms. Hold the message instead: drop it and let the sender
+		// retry, rather than guess.
+		f.logger.Printf("matrix: dropped message from room %s: member count unknown (JoinedMembers lookup failed and nothing cached), refusing to guess DM-vs-group", in.roomID)
+		return
+	}
+	in.memberCount = count
 
 	msg, ok := f.gate(in)
 	if !ok {
@@ -478,6 +517,14 @@ func (f *Frontend) onEncryptedEvent(ctx context.Context, evt *event.Event) {
 	f.lastSyncEventAt.Store(time.Now().Unix())
 	f.logger.Printf("matrix: dropped encrypted event id=%s room=%s sender=%s — E2E is not enabled (DESIGN.md §2)",
 		evt.ID, evt.RoomID, evt.Sender)
+
+	// Gate the notice send on the same Authorizer every other outbound path
+	// in this frontend uses: without this, any stranger in any encrypted
+	// room the bot is in (or gets invited/dragged into) can make the bot
+	// emit a message on demand, simply by sending one encrypted event.
+	if !f.auth.Allowed(string(evt.Sender)) {
+		return
+	}
 
 	if _, alreadySent := f.encryptedNoticeSent.LoadOrStore(string(evt.RoomID), struct{}{}); alreadySent {
 		return
@@ -516,23 +563,25 @@ func (f *Frontend) onMemberEvent(ctx context.Context, evt *event.Event) {
 }
 
 // roomMemberCountFor returns the cached joined-member count for roomID,
-// looking it up via JoinedMembers on a cache miss. On lookup failure it
-// logs and returns 0 rather than caching an error — a subsequent message
-// from the same room will simply retry the lookup — but never guesses "2"
-// (DM), since an under-count here is what causes the DM/group routing
-// hijack described at the roomMemberCountFor call site in onMessageEvent.
-func (f *Frontend) roomMemberCountFor(ctx context.Context, roomID string) int {
+// looking it up via JoinedMembers on a cache miss, plus whether the count is
+// actually known. On lookup failure with nothing cached it logs and returns
+// (0, false) rather than caching an error — a subsequent message from the
+// same room will simply retry the lookup — and never guesses "2" (DM) or
+// otherwise, since an under-count here is what causes the DM/group routing
+// hijack described at the roomMemberCountFor call site in onMessageEvent;
+// the caller must treat known==false as "hold, don't guess."
+func (f *Frontend) roomMemberCountFor(ctx context.Context, roomID string) (int, bool) {
 	if v, ok := f.roomMemberCount.Load(roomID); ok {
-		return v.(int)
+		return v.(int), true
 	}
 	resp, err := f.api.JoinedMembers(ctx, id.RoomID(roomID))
 	if err != nil {
 		f.logger.Printf("matrix: JoinedMembers lookup failed for room %s, treating as unknown: %v", roomID, err)
-		return 0
+		return 0, false
 	}
 	count := len(resp.Joined)
 	f.roomMemberCount.Store(roomID, count)
-	return count
+	return count, true
 }
 
 // gate applies the sender policy from DESIGN.md §3 and, if the message
@@ -571,6 +620,9 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 	}
 
 	f.convRooms.Store(convID, m.roomID)
+	if !isGroup {
+		f.dmConvs.Store(convID, struct{}{})
+	}
 
 	meta := map[string]string{
 		"chat_id":   convID,
@@ -602,12 +654,29 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 // Frontend has already seen and gated inbound — mirrors discord.go's
 // KnownConversation. Used by relayd's outbound allowlist to permit replies
 // into rooms the model was legitimately talking in.
+//
+// For a DM, chatID IS the sender's user id (see gate()'s convID comment),
+// so we re-check f.auth.Allowed(chatID) live rather than trusting the
+// cached convRooms entry alone — a user removed from the allowlist after an
+// earlier authorized DM should not stay reachable for outbound replies
+// until process restart. A group room id is never a valid entry in the
+// user-id-keyed auth manager, so unconditionally requiring
+// f.auth.Allowed(chatID) — as this used to — made KnownConversation always
+// false for group rooms, blocking every outbound reply into them even
+// though the inbound message that prompted the reply was itself
+// allowlisted. Group room ids are tracked separately: dmConvs is only ever
+// set for the DM case (see gate()), so falling through to "known" for
+// anything not in dmConvs correctly allows the group-room path while still
+// gating DMs live.
 func (f *Frontend) KnownConversation(chatID string) bool {
 	_, ok := f.convRooms.Load(chatID)
 	if !ok {
 		return false
 	}
-	return f.auth.Allowed(chatID)
+	if _, isDM := f.dmConvs.Load(chatID); isDM {
+		return f.auth.Allowed(chatID)
+	}
+	return true
 }
 
 // OwnsConversationID implements relay.Claimer: it reports whether id is
