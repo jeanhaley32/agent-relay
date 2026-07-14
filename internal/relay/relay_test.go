@@ -564,3 +564,93 @@ func TestSetConversationUsageOverridesEstimate(t *testing.T) {
 		t.Fatal("SetConversationUsage must be a no-op for a chat_id with no configured cap")
 	}
 }
+
+// TestDefaultConversationCap covers Jean's explicit request (2026-07-14): a
+// blanket default cap applies to any conversation not explicitly listed,
+// admins are exempt, and an explicit ConversationCaps entry always wins
+// over the default.
+func TestDefaultConversationCap(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	b := &Broker{
+		Frontend:               front,
+		Backend:                back,
+		Commands:               command.NewRegistry(),
+		Meter:                  budget.New("pro", nil),
+		Estimate:               func(text string) int { return len(text) },
+		DefaultConversationCap: 10,
+		ConversationCaps:       map[string]int64{"555": 1000}, // explicit override, higher than default
+		ConversationCapExempt:  func(chatID string) bool { return chatID == "admin" },
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// A random, never-configured chat_id gets the default cap (10) - a
+	// message longer than that must be rejected.
+	front.recv <- Message{Role: User, Text: "this text is definitely longer than ten chars", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expected the default cap to reject an over-limit message, got forwarded: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "token budget") {
+			t.Fatalf("expected a cap-rejection notice, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-rejection notice for a default-capped conversation")
+	}
+
+	// An explicit ConversationCaps entry (1000) wins over the default (10) -
+	// the same long message is fine for chat_id 555.
+	front.recv <- Message{Role: User, Text: "this text is definitely longer than ten chars", ConversationID: "555",
+		Meta: map[string]string{"chat_id": "555", "from_id": "555"}}
+	select {
+	case m := <-back.got:
+		if m.Text == "" {
+			t.Fatalf("unexpected empty message forwarded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("explicit cap (1000) should have allowed this message, not the default (10)")
+	}
+
+	// An exempt chat_id (admin) is never capped, even by the default.
+	front.recv <- Message{Role: User, Text: "this text is definitely longer than ten chars, way over the default", ConversationID: "admin",
+		Meta: map[string]string{"chat_id": "admin", "from_id": "admin"}}
+	select {
+	case m := <-back.got:
+		if m.Text == "" {
+			t.Fatalf("unexpected empty message forwarded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an exempt chat_id must never be capped by DefaultConversationCap")
+	}
+}
+
+// TestSetCapsLiveReload covers Jean's explicit request (2026-07-14): caps
+// can be changed at runtime via SetCaps (cmd/relayd's /webhook/reload-caps)
+// without losing already-accumulated usage/window state.
+func TestSetCapsLiveReload(t *testing.T) {
+	b := &Broker{ConversationCaps: map[string]int64{"999": 10}}
+
+	b.addConversationUsage("999", 8)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("should not be exceeded yet (8 < 10)")
+	}
+
+	// Live-reload to a lower cap - existing usage (8) now exceeds it (5),
+	// without needing to resend any messages to re-accumulate usage.
+	b.SetCaps(map[string]int64{"999": 5}, 0)
+	if !b.conversationCapExceeded("999") {
+		t.Fatal("expected the live-reloaded lower cap (5) to already be exceeded by existing usage (8)")
+	}
+
+	// Live-reload removing the cap entirely (empty map, no default) - no
+	// longer capped at all.
+	b.SetCaps(map[string]int64{}, 0)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("expected removing the cap via SetCaps to actually remove it")
+	}
+}
