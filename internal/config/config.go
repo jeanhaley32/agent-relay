@@ -9,12 +9,15 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/disgoorg/snowflake/v2"
+
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 )
 
 // Config is the top-level daemon configuration.
 type Config struct {
 	Telegram  TelegramConfig  `json:"telegram"`
+	Discord   DiscordConfig   `json:"discord"`
 	Claude    ClaudeConfig    `json:"claude"`
 	Budget    BudgetConfig    `json:"budget"`
 	Scheduler SchedulerConfig `json:"scheduler"`
@@ -38,6 +41,69 @@ type TelegramConfig struct {
 	PollTimeout   int     `json:"poll_timeout"`   // long-poll seconds
 }
 
+// DiscordConfig configures the Discord frontend. Discord is fully optional —
+// a config with only a "telegram" block (as today) keeps working unchanged.
+// See internal/endpoint/discord/DESIGN.md §5.
+type DiscordConfig struct {
+	// Enabled gates whether relayd starts the Discord frontend at all. An
+	// explicit flag rather than "block present with non-empty admins" —
+	// per DESIGN.md §5/§9 open question 3 — because an all-zero-value
+	// DiscordConfig{} is otherwise indistinguishable from "block omitted"
+	// once JSON-unmarshaled. Fail-closed default (false): no config block
+	// (or an empty one) means the frontend goroutine never exists, not
+	// "started with an empty allowlist that denies everyone" — see
+	// DESIGN.md §8's fail-closed-defaults checklist item.
+	Enabled bool `json:"enabled"`
+
+	TokenEnv string `json:"token_env"` // env var holding the bot token
+
+	// Admins/Allowlist hold Discord snowflake ids. They're strings in JSON
+	// (not numbers) because a snowflake is a 64-bit value and JSON numbers
+	// are conventionally parsed as float64 by generic tooling — an operator
+	// hand-editing this file could silently lose precision. Discord's own
+	// API returns snowflakes as strings for the same reason. See DESIGN.md
+	// §5.
+	Admins        []string `json:"admins"`         // ids that may run admin commands (also allowed)
+	Allowlist     []string `json:"allowlist"`      // permitted sender user ids
+	AllowlistFile string   `json:"allowlist_file"` // optional: persist approved ids here
+
+	// AllowGuildMessages/AllowedGuildIDs/RequireMentionInGuild are
+	// Discord-specific (no Telegram concept of a guild). Default is the
+	// narrowest posture: DM-only, no guild intents requested at all — see
+	// internal/endpoint/discord DESIGN.md §2/§3.
+	AllowGuildMessages    bool     `json:"allow_guild_messages"`
+	AllowedGuildIDs       []string `json:"allowed_guild_ids"`
+	RequireMentionInGuild bool     `json:"require_mention_in_guild"`
+}
+
+// AdminIDs parses Discord.Admins as snowflake ids, returning a clear error on
+// a malformed entry rather than silently dropping it.
+func (d DiscordConfig) AdminIDs() ([]snowflake.ID, error) {
+	return parseSnowflakes("discord.admins", d.Admins)
+}
+
+// AllowlistIDs parses Discord.Allowlist as snowflake ids.
+func (d DiscordConfig) AllowlistIDs() ([]snowflake.ID, error) {
+	return parseSnowflakes("discord.allowlist", d.Allowlist)
+}
+
+// AllowedGuildSnowflakes parses Discord.AllowedGuildIDs as snowflake ids.
+func (d DiscordConfig) AllowedGuildSnowflakes() ([]snowflake.ID, error) {
+	return parseSnowflakes("discord.allowed_guild_ids", d.AllowedGuildIDs)
+}
+
+func parseSnowflakes(field string, raw []string) ([]snowflake.ID, error) {
+	ids := make([]snowflake.ID, 0, len(raw))
+	for _, s := range raw {
+		id, err := snowflake.Parse(s)
+		if err != nil {
+			return nil, fmt.Errorf("%s: invalid snowflake %q: %w", field, s, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // ClaudeConfig configures the Claude backend.
 type ClaudeConfig struct {
 	Socket string `json:"socket"` // unix socket the shim connects to
@@ -50,9 +116,10 @@ type BudgetConfig struct {
 
 // Defaults applied when fields are omitted.
 const (
-	DefaultTokenEnv    = "TELEGRAM_BOT_TOKEN"
-	DefaultPollTimeout = 30
-	DefaultTier        = "pro"
+	DefaultTokenEnv        = "TELEGRAM_BOT_TOKEN"
+	DefaultPollTimeout     = 30
+	DefaultTier            = "pro"
+	DefaultDiscordTokenEnv = "DISCORD_BOT_TOKEN"
 )
 
 // defaultSocket prefers the per-user runtime dir ($XDG_RUNTIME_DIR, mode 0700)
@@ -107,6 +174,25 @@ func (c *Config) validate() error {
 	if c.Claude.Socket == "" {
 		return fmt.Errorf("claude.socket must not be empty")
 	}
+	if c.Discord.Enabled {
+		if len(c.Discord.Admins) == 0 && len(c.Discord.Allowlist) == 0 {
+			return fmt.Errorf("discord: enabled but no admins or allowlist — the bot would serve nobody; add your Discord user id to \"admins\"")
+		}
+		if _, err := c.Discord.AdminIDs(); err != nil {
+			return err
+		}
+		if _, err := c.Discord.AllowlistIDs(); err != nil {
+			return err
+		}
+		if _, err := c.Discord.AllowedGuildSnowflakes(); err != nil {
+			return err
+		}
+		// allow_guild_messages=true with an empty allowed_guild_ids is
+		// deliberately NOT rejected here: it's a valid (if inert) config —
+		// fail-closed means every guild is denied until at least one is
+		// listed, not that the combination itself is invalid. See
+		// DESIGN.md §5.
+	}
 	return nil
 }
 
@@ -126,13 +212,27 @@ func (c *Config) applyDefaults() {
 	if c.Scheduler.File == "" {
 		c.Scheduler.File = "schedules.json"
 	}
+	if c.Discord.Enabled && c.Discord.TokenEnv == "" {
+		c.Discord.TokenEnv = DefaultDiscordTokenEnv
+	}
 }
 
-// Token resolves the bot token from the configured env var.
+// Token resolves the Telegram bot token from the configured env var.
 func (c *Config) Token() (string, error) {
 	v := os.Getenv(c.Telegram.TokenEnv)
 	if v == "" {
 		return "", fmt.Errorf("bot token env %s is not set", c.Telegram.TokenEnv)
+	}
+	return v, nil
+}
+
+// DiscordToken resolves the Discord bot token from the configured env var —
+// same convention as Token(), extended for the second frontend rather than
+// inventing a new one (DESIGN.md §8).
+func (c *Config) DiscordToken() (string, error) {
+	v := os.Getenv(c.Discord.TokenEnv)
+	if v == "" {
+		return "", fmt.Errorf("discord bot token env %s is not set", c.Discord.TokenEnv)
 	}
 	return v, nil
 }
