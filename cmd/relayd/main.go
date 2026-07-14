@@ -303,7 +303,8 @@ func main() {
 	// Service schedule-tool and event-tool calls coming from the model (via the shim).
 	go serveSchedules(back, sched, tracker, logger)
 
-	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter}
+	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter,
+		ConversationCaps: cfg.Budget.ConversationCaps}
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
 	// auto-resolve any still-open events for that chat. Supplements ack_event.

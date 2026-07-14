@@ -134,6 +134,17 @@ type ClaudeConfig struct {
 // BudgetConfig configures the rate limit / circuit breaker.
 type BudgetConfig struct {
 	Tier string `json:"tier"` // free|pro|max5|max20
+
+	// ConversationCaps optionally bounds cumulative estimated tokens for a
+	// specific conversation (keyed by chat_id, matching relay.Message's
+	// ConversationID/Meta["chat_id"]) - independent of and tighter than the
+	// global Tier budget. For a specific untrusted or resource-testing
+	// contact (e.g. an allowlisted but non-admin user) rather than the
+	// whole relay. Once a conversation's cumulative usage reaches its cap,
+	// further inbound messages from it are dropped before ever reaching
+	// the backend, so no more inference tokens are spent on it at all -
+	// see Broker.conversationCapExceeded's doc comment in relay.go.
+	ConversationCaps map[string]int64 `json:"conversation_caps,omitempty"`
 }
 
 // Defaults applied when fields are omitted.

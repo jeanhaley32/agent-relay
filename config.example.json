@@ -20,6 +20,7 @@
     "socket": "/tmp/agent-relay.sock"
   },
   "budget": {
-    "tier": "max5"
+    "tier": "max5",
+    "conversation_caps": {}
   }
 }
