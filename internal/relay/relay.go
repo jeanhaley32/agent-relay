@@ -129,25 +129,72 @@ type Broker struct {
 	Lockdown atomic.Bool
 
 	// ConversationCaps optionally bounds cumulative estimated tokens for a
-	// specific chat_id, independent of and tighter than the global Meter
-	// budget - for a specific contact (e.g. real 2026-07-14 incident: an
-	// allowlisted-but-non-admin Discord user testing how much inference the
-	// relay would spend on an open-ended request) rather than the whole
-	// relay. Both directions count against the cap: an inbound message's
-	// estimate is added before it's forwarded to the backend, and a reply's
-	// estimate is added when it comes back - see conversationCapExceeded and
-	// addConversationUsage. nil map ⇒ no caps configured.
+	// specific chat_id within a rolling ConversationCapWindow, independent
+	// of and tighter than the global Meter budget - for a specific contact
+	// (e.g. real 2026-07-14 incident: an allowlisted-but-non-admin Discord
+	// user testing how much inference the relay would spend on an
+	// open-ended request) rather than the whole relay. Both directions
+	// count against the cap: an inbound message's estimate is added before
+	// it's forwarded to the backend, and a reply's estimate is added when
+	// it comes back - see conversationCapExceeded and addConversationUsage.
+	// nil map ⇒ no caps configured.
 	ConversationCaps map[string]int64
 
+	// ConversationCapWindow is how long a conversation's usage counts
+	// against its cap before rolling over to a fresh window (Jean's
+	// explicit request, 2026-07-14: "see the cap at every 3 hours" - a
+	// rate limit, not a lifetime ban). Zero ⇒ defaultConversationCapWindow.
+	ConversationCapWindow time.Duration
+
+	// clock is overridden in tests; nil ⇒ time.Now.
+	clock func() time.Time
+
 	conversationUsedMu sync.Mutex
-	conversationUsed   map[string]int64
+	conversationUsed   map[string]*conversationWindow
+}
+
+// defaultConversationCapWindow is used when ConversationCapWindow is unset.
+const defaultConversationCapWindow = 3 * time.Hour
+
+type conversationWindow struct {
+	tokens      int64
+	windowStart time.Time
+}
+
+func (b *Broker) now() time.Time {
+	if b.clock != nil {
+		return b.clock()
+	}
+	return time.Now()
+}
+
+func (b *Broker) capWindow() time.Duration {
+	if b.ConversationCapWindow > 0 {
+		return b.ConversationCapWindow
+	}
+	return defaultConversationCapWindow
+}
+
+// rollIfExpired resets chatID's window if ConversationCapWindow has elapsed
+// since it started. Caller holds conversationUsedMu.
+func (b *Broker) rollIfExpired(chatID string) {
+	w, ok := b.conversationUsed[chatID]
+	if !ok {
+		return
+	}
+	if b.now().Sub(w.windowStart) >= b.capWindow() {
+		w.tokens = 0
+		w.windowStart = b.now()
+	}
 }
 
 // conversationCapExceeded reports whether chatID has a configured cap and
-// has already reached or passed it - checked BEFORE forwarding an inbound
-// message to the backend, so a capped conversation stops consuming
-// inference tokens entirely once it hits the limit, not just outbound
-// send tokens.
+// has already reached or passed it within the current window - checked
+// BEFORE forwarding an inbound message to the backend, so a capped
+// conversation stops consuming inference tokens entirely once it hits the
+// limit, not just outbound send tokens. Rolls over to a fresh window first
+// if ConversationCapWindow has elapsed, so this is a rate limit, not a
+// lifetime ban.
 func (b *Broker) conversationCapExceeded(chatID string) bool {
 	limit, ok := b.ConversationCaps[chatID]
 	if !ok {
@@ -155,12 +202,17 @@ func (b *Broker) conversationCapExceeded(chatID string) bool {
 	}
 	b.conversationUsedMu.Lock()
 	defer b.conversationUsedMu.Unlock()
-	return b.conversationUsed[chatID] >= limit
+	b.rollIfExpired(chatID)
+	w := b.conversationUsed[chatID]
+	if w == nil {
+		return false
+	}
+	return w.tokens >= limit
 }
 
-// addConversationUsage adds tokens to chatID's running total, a no-op if
-// chatID has no configured cap (avoids growing the map for every
-// conversation when caps are rarely configured).
+// addConversationUsage adds tokens to chatID's running total for the
+// current window, a no-op if chatID has no configured cap (avoids growing
+// the map for every conversation when caps are rarely configured).
 func (b *Broker) addConversationUsage(chatID string, tokens int) {
 	if _, ok := b.ConversationCaps[chatID]; !ok {
 		return
@@ -168,9 +220,15 @@ func (b *Broker) addConversationUsage(chatID string, tokens int) {
 	b.conversationUsedMu.Lock()
 	defer b.conversationUsedMu.Unlock()
 	if b.conversationUsed == nil {
-		b.conversationUsed = map[string]int64{}
+		b.conversationUsed = map[string]*conversationWindow{}
 	}
-	b.conversationUsed[chatID] += int64(tokens)
+	b.rollIfExpired(chatID)
+	w := b.conversationUsed[chatID]
+	if w == nil {
+		w = &conversationWindow{windowStart: b.now()}
+		b.conversationUsed[chatID] = w
+	}
+	w.tokens += int64(tokens)
 }
 
 // LockdownMessage is sent to any non-admin sender while lockdown is active.
