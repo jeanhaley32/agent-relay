@@ -195,6 +195,39 @@ func TestSendRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSendOversizedSplitAndDelivered locks in the fix for the real
+// 2026-07-14 incident: a message over Discord's 2000-char limit used to be
+// permanently dropped with no error surfaced and no message ever delivered.
+// Send now splits it via senderr.Split and delivers every chunk in order.
+func TestSendOversizedSplitAndDelivered(t *testing.T) {
+	var callCount int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1","channel_id":"123","content":"hi","author":{"id":"1","username":"bot"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	oversized := strings.Repeat("x", maxMessageLen*2+500)
+	if err := f.Send(context.Background(), relay.Message{
+		Text: oversized,
+		Meta: map[string]string{"channel_id": "123"},
+	}); err != nil {
+		t.Fatalf("Send returned an error for an oversized message that should have been split: %v", err)
+	}
+	if callCount < 2 {
+		t.Errorf("CreateMessage called %d time(s), want at least 2 - the message should have been split into multiple chunks", callCount)
+	}
+}
+
 // TestSend403Permanent covers DESIGN.md §8's incident-class review: a 403
 // (missing SEND_MESSAGES permission, or any other non-429 4xx) must be
 // classified permanent so it's never retried — the failure is guaranteed to

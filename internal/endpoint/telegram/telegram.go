@@ -337,11 +337,32 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 }
 
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
-// to m.ConversationID) via sendMessage. A permanent failure (oversized
-// message, missing chat_id) is returned as-is and NOT queued for retry - see
-// permanentSendError. Anything else is assumed transient and gets queued for
-// background retry same as before.
+// to m.ConversationID) via sendMessage. A message over Telegram's real limit
+// is split into multiple messages and sent in order (see senderr.Split)
+// rather than permanently dropped - the old behavior silently lost the whole
+// reply on anything over 4096 chars (2026-07-14 incident: same class of bug
+// hit Discord's 2000-char limit and the sender got no error at all). Sending
+// stops at the first chunk that fails, so a partial reply can still land
+// instead of nothing.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
+	chunks := senderr.Split(m.Text, maxMessageLen)
+	if len(chunks) > 1 {
+		for _, chunk := range chunks {
+			cm := m
+			cm.Text = chunk
+			if err := f.sendChunk(ctx, cm); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return f.sendChunk(ctx, m)
+}
+
+// sendChunk is Send's single-message path - the pre-split body of what used
+// to be Send, still doing the retry/permanent-failure classification for one
+// already-within-limit message.
+func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	err := f.sendOnce(ctx, m)
 	if err == nil {
 		return nil
