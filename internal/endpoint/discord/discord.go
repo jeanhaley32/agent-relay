@@ -31,8 +31,10 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
@@ -130,12 +132,31 @@ type Frontend struct {
 	selfID snowflake.ID // this bot's own user id, for mention/reply-to-bot checks
 
 	channels   rest.Channels // outbound REST (Send) — injectable for tests
+	users      rest.Users    // outbound REST (DM channel resolution) — injectable for tests
 	baseURL    string        // "" ⇒ disgo's default Discord API base
 	httpClient *http.Client  // injectable for tests
 	client     *bot.Client   // real gateway connection; nil when using a fake transport in tests
 
-	recv   chan relay.Message
+	recv     chan relay.Message
+	recvOnce sync.Once // guards close(recv) so Connect's closer goroutine and any other
+	// closer can't double-close or race with sends — see Connect's doc comment.
 	cancel context.CancelFunc
+
+	// convChannels remembers, for every ConversationID gate() has ever seen
+	// inbound, which physical channel id it maps to. sendOnce falls back to
+	// this when a caller-constructed relay.Message (scheduled reminder, admin
+	// notice, mcp reply — see cmd/relayd/main.go) carries only ConversationID/
+	// chat_id and no Meta["channel_id"] at all.
+	convChannels sync.Map // ConversationID (string) -> snowflake.ID
+
+	// dmChannels caches user-id -> resolved DM channel id, so a reply to a
+	// user we have never actually seen a convChannels entry for yet (e.g. the
+	// very first scheduled reminder to a user, before they've DMed the bot in
+	// this process's lifetime) still routes: sendOnce treats an unresolved
+	// ConversationID as a Discord user id and resolves/creates the DM channel
+	// via POST /users/@me/channels (rest.Users.CreateDMChannel), the path
+	// DESIGN.md §3 Option B flagged as missing. See sendOnce's doc comment.
+	dmChannels sync.Map // user snowflake.ID -> snowflake.ID (DM channel)
 
 	// Same retry-queue rationale as Telegram's Frontend: Send() returns
 	// immediately and callers generally discard the error, so a transient
@@ -154,6 +175,17 @@ type Frontend struct {
 	// are the ones that risk a message gap and burn IDENTIFY budget.
 	gatewayReconnects  atomic.Int64
 	lastGatewayEventAt atomic.Int64 // unix seconds
+
+	// recvDrops counts inbound messages dropped because f.recv was still full
+	// after the 5s wait in onMessageCreate. Divergence from Telegram's
+	// pollLoop (which blocks indefinitely on send instead of ever dropping)
+	// is deliberate here: onMessageCreate runs on disgo's shared event
+	// dispatch goroutine, so blocking it indefinitely would stall ALL gateway
+	// event processing (heartbeats included) for as long as the backend stays
+	// backed up, risking a heartbeat-ack timeout and forced reconnect — worse
+	// than dropping one message. Counted (not just logged) so it's visible on
+	// /metrics instead of only in logs, matching the send-path drop counters.
+	recvDrops atomic.Int64
 }
 
 type retryItem struct {
@@ -183,6 +215,12 @@ func WithHTTPClient(c *http.Client) Option { return func(f *Frontend) { f.httpCl
 // discord_test.go exercise Send()'s permanent-vs-retryable classification
 // without any real or fake HTTP transport at all.
 func WithChannels(c rest.Channels) Option { return func(f *Frontend) { f.channels = c } }
+
+// WithUsers injects the rest.Users implementation used to resolve/create a
+// DM channel for a bare user id when sendOnce has no channel_id to work with
+// (see the DM-routing doc comment on sendOnce). Same test-seam rationale as
+// WithChannels.
+func WithUsers(u rest.Users) Option { return func(f *Frontend) { f.users = u } }
 
 // WithAllowlist sets a fixed set of permitted sender user ids. REQUIRED for
 // real use if no Authorizer is supplied: an empty allowlist denies everyone
@@ -264,6 +302,16 @@ func New(token string, opts ...Option) (*Frontend, error) {
 		}
 		f.channels = rest.NewChannels(rest.NewClient(token, restOpts...), discord.AllowedMentions{})
 	}
+	if f.users == nil {
+		restOpts := []rest.ClientConfigOpt{}
+		if f.httpClient != nil {
+			restOpts = append(restOpts, rest.WithHTTPClient(f.httpClient))
+		}
+		if f.baseURL != "" {
+			restOpts = append(restOpts, rest.WithURL(f.baseURL))
+		}
+		f.users = rest.NewUsers(rest.NewClient(token, restOpts...))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
@@ -276,6 +324,15 @@ func New(token string, opts ...Option) (*Frontend, error) {
 // New() so tests can construct a Frontend (for gate()/Send() unit tests)
 // without ever dialing Discord — mirrors the DESIGN.md §8 checklist item
 // requiring this endpoint be unit-testable without a real bot token.
+//
+// recv is closed from Close() (the same goroutine group as f.cancel, which
+// disgo's callbacks are NOT running under), not from a goroutine racing
+// ctx.Done() against onMessageCreate's own `f.recv <- msg` sends — the
+// previous version closed recv from a separate goroutine watching ctx.Done,
+// which could fire while disgo was still mid-delivery of a callback,
+// panicking on a send-to-closed-channel. Close() also cancels the SAME
+// context Connect was given (via context.WithCancel wrapping, below) so a
+// caller's ctx outliving Close() can no longer leave recv open forever.
 func (f *Frontend) Connect(ctx context.Context) error {
 	intents := []gateway.Intents{gateway.IntentGuilds, gateway.IntentDirectMessages}
 	if f.allowGuildMessages {
@@ -286,6 +343,21 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		bot.WithDefaultGateway(),
 		bot.WithGatewayConfigOpts(gateway.WithIntents(intents...)),
 		bot.WithEventListenerFunc(f.onMessageCreate),
+		// Ready fires on every fresh IDENTIFY (non-resumed reconnect,
+		// including the very first connect); Resumed fires on a successful
+		// RESUME. Both are "the gateway is alive" signals for
+		// lastGatewayEventAt (DESIGN.md §6 says "any gateway event", not just
+		// inbound messages — a quiet channel with a healthy gateway shouldn't
+		// look wedged). Only Ready increments gatewayReconnects: a RESUME
+		// doesn't risk a message gap or burn IDENTIFY budget the way a fresh
+		// session does, so it's deliberately not counted (see field doc).
+		bot.WithEventListenerFunc(func(e *events.Ready) {
+			f.lastGatewayEventAt.Store(time.Now().Unix())
+			f.gatewayReconnects.Add(1)
+		}),
+		bot.WithEventListenerFunc(func(e *events.Resumed) {
+			f.lastGatewayEventAt.Store(time.Now().Unix())
+		}),
 	)
 	if err != nil {
 		return fmt.Errorf("discord: build client: %w", err)
@@ -296,23 +368,26 @@ func (f *Frontend) Connect(ctx context.Context) error {
 	if err := client.OpenGateway(ctx); err != nil {
 		return fmt.Errorf("discord: open gateway: %w", err)
 	}
-	go func() {
-		<-ctx.Done()
-		close(f.recv)
-	}()
 	return nil
 }
 
 func (f *Frontend) Name() string               { return "discord" }
 func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 
-// Close stops the frontend: cancels the retry worker and, if connected,
-// closes the gateway with a clean close frame.
+// Close stops the frontend: closes the gateway with a clean close frame
+// (which blocks until disgo's event-dispatch loop has stopped, so no
+// onMessageCreate callback can still be in flight afterward), THEN closes
+// f.recv, THEN cancels the retry worker's context. Ordering matters: closing
+// recv before the gateway is guaranteed stopped is what caused the
+// send-on-closed-channel panic this replaces (a separate goroutine raced
+// ctx.Done() against onMessageCreate's own `f.recv <- msg`). recvOnce also
+// guards against a double-close if Close is ever called twice.
 func (f *Frontend) Close() error {
-	f.cancel()
 	if f.client != nil {
 		f.client.Close(context.Background())
 	}
+	f.recvOnce.Do(func() { close(f.recv) })
+	f.cancel()
 	return nil
 }
 
@@ -350,6 +425,7 @@ func (f *Frontend) onMessageCreate(e *events.MessageCreate) {
 	select {
 	case f.recv <- msg:
 	case <-time.After(5 * time.Second):
+		f.recvDrops.Add(1)
 		f.logger.Printf("discord: recv channel full/blocked, dropped message from channel %s", in.channelID)
 	}
 }
@@ -407,6 +483,12 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 		convID = m.channelID.String()
 	}
 
+	// Remember convID -> physical channel id so a later relayd-originated
+	// reply (scheduled reminder, admin notice, mcp reply) that only carries
+	// ConversationID/chat_id — never Meta["channel_id"] — can still be
+	// routed by sendOnce. See the convChannels field doc comment.
+	f.convChannels.Store(convID, m.channelID)
+
 	msg := relay.Message{
 		ConversationID: convID,
 		Role:           relay.User,
@@ -419,6 +501,13 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 		},
 	}
 	if m.guildID != nil {
+		// Marks this message as one where chat_id (the channel id) is NOT
+		// expected to equal from_id (the sender's user id) — the Broker's
+		// identity-pair tripwire (relay.go) treats presence of this key as
+		// an explicit per-frontend opt-out of that invariant, per
+		// DESIGN.md §3 Option A. DM messages deliberately don't set this:
+		// there chat_id IS from_id by construction (see convID above), so
+		// the invariant still holds and still guards against a regression.
 		msg.Meta["guild_id"] = m.guildID.String()
 	}
 	return msg, true
@@ -453,19 +542,79 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 // X-RateLimit-* headers and per-route buckets, which is the whole reason
 // disgo was chosen over discordgo. This only classifies the resulting error
 // as permanent vs. retryable for the outer retry-queue layer.
-func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
+// resolveChannel figures out which physical channel to CreateMessage into
+// for m, in priority order:
+//
+//  1. Meta["channel_id"] — set by gate() for a message that IS a reply
+//     within the same inbound turn (the common in-process case).
+//  2. convChannels — the channel id last seen for this ConversationID by
+//     gate(), covering relayd-originated replies (scheduler/admin/mcp)
+//     that only carry ConversationID/chat_id, as long as SOME inbound
+//     message from that conversation has been observed since process start.
+//  3. dmChannels / CreateDMChannel — last resort for a relayd-originated
+//     message whose ConversationID has never been seen inbound this
+//     process lifetime at all (e.g. the very first scheduled reminder to a
+//     user). For a DM, ConversationID IS the recipient's user id (see
+//     gate()'s convID comment), so it's treated as one and resolved via
+//     POST /users/@me/channels, which is idempotent — Discord returns the
+//     existing DM channel if one already exists. This is the missing path
+//     DESIGN.md §3 flagged: without it, every such message fell through to
+//     CreateMessage(<user id>), which 404s (Unknown Channel) and gets
+//     misclassified permanent, silently dropping the reply. A guild
+//     ConversationID reaching this branch (no prior inbound message AND no
+//     channel_id) will also 404 via this path since the id isn't a real
+//     user — that failure is still correctly permanent/logged, just not a
+//     silent one.
+func (f *Frontend) resolveChannel(ctx context.Context, m relay.Message) (snowflake.ID, error) {
 	channelIDStr := m.Meta["channel_id"]
 	if channelIDStr == "" {
-		channelIDStr = m.ConversationID
+		if v, ok := f.convChannels.Load(m.ConversationID); ok {
+			channelIDStr = v.(snowflake.ID).String()
+		}
 	}
-	if channelIDStr == "" {
-		return permanentSendError{Err: fmt.Errorf("discord send: no channel_id")}
+	if channelIDStr != "" {
+		id, err := snowflake.Parse(channelIDStr)
+		if err != nil {
+			return 0, permanentSendError{Err: fmt.Errorf("discord send: invalid channel_id %q: %w", channelIDStr, err)}
+		}
+		return id, nil
 	}
-	channelID, err := snowflake.Parse(channelIDStr)
+
+	if m.ConversationID == "" {
+		return 0, permanentSendError{Err: fmt.Errorf("discord send: no channel_id and no conversation id")}
+	}
+	userID, err := snowflake.Parse(m.ConversationID)
 	if err != nil {
-		return permanentSendError{Err: fmt.Errorf("discord send: invalid channel_id %q: %w", channelIDStr, err)}
+		return 0, permanentSendError{Err: fmt.Errorf("discord send: no channel_id and conversation id %q is not a valid user id: %w", m.ConversationID, err)}
 	}
-	if n := len(m.Text); n > maxMessageLen {
+	if v, ok := f.dmChannels.Load(userID); ok {
+		return v.(snowflake.ID), nil
+	}
+	dm, err := f.users.CreateDMChannel(userID, rest.WithCtx(ctx))
+	if err != nil {
+		// Transport/HTTP-status errors here get the same permanent-vs-
+		// retryable treatment as CreateMessage does below — reuse it by
+		// letting sendOnce's caller (Send) classify via errors.As, since
+		// this can be a plain *rest.Error too.
+		var restErr *rest.Error
+		if errors.As(err, &restErr) && restErr.Response != nil {
+			status := restErr.Response.StatusCode
+			if status/100 == 4 && status != http.StatusTooManyRequests {
+				return 0, permanentSendError{Err: fmt.Errorf("discord CreateDMChannel status %d: %s", status, restErr.Message)}
+			}
+		}
+		return 0, fmt.Errorf("discord: resolve DM channel for user %s: %w", userID, err)
+	}
+	f.dmChannels.Store(userID, dm.ID())
+	return dm.ID(), nil
+}
+
+func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
+	channelID, err := f.resolveChannel(ctx, m)
+	if err != nil {
+		return err
+	}
+	if n := utf8.RuneCountInString(m.Text); n > maxMessageLen {
 		return permanentSendError{Err: fmt.Errorf(
 			"message too long (%d chars, Discord's limit is %d) - split it into multiple replies", n, maxMessageLen)}
 	}
@@ -579,6 +728,9 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 func (f *Frontend) SendFailures() int64   { return f.sendFailures.Load() }
 func (f *Frontend) PermanentDrops() int64 { return f.permanentDrops.Load() }
 func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }
+
+// RecvDrops exposes the inbound-drop counter — see the recvDrops field doc.
+func (f *Frontend) RecvDrops() int64 { return f.recvDrops.Load() }
 
 // GatewayReconnects and LastGatewayEventAt expose the gateway connection
 // health signal — DESIGN.md §6's analogue of Telegram's

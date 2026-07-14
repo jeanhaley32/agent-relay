@@ -71,9 +71,31 @@ type DiscordConfig struct {
 	// Discord-specific (no Telegram concept of a guild). Default is the
 	// narrowest posture: DM-only, no guild intents requested at all — see
 	// internal/endpoint/discord DESIGN.md §2/§3.
-	AllowGuildMessages    bool     `json:"allow_guild_messages"`
-	AllowedGuildIDs       []string `json:"allowed_guild_ids"`
-	RequireMentionInGuild bool     `json:"require_mention_in_guild"`
+	AllowGuildMessages bool     `json:"allow_guild_messages"`
+	AllowedGuildIDs    []string `json:"allowed_guild_ids"`
+
+	// RequireMentionInGuildRaw is a pointer so applyDefaults can tell "field
+	// omitted from JSON" (nil) apart from "operator explicitly set false"
+	// (non-nil, false) — a plain bool's zero value is indistinguishable from
+	// an explicit false, which previously meant wiring
+	// WithRequireMentionInGuild(cfg.Discord.RequireMentionInGuild) silently
+	// flipped the guild policy fail-open (ambient/unmentioned guild chatter
+	// relayable) even though DESIGN.md §5 and config.example.json document
+	// the default as true. Use RequireMentionInGuild() to read the resolved
+	// value.
+	RequireMentionInGuildRaw *bool `json:"require_mention_in_guild"`
+}
+
+// RequireMentionInGuild resolves the effective value: the configured value
+// if the operator set one, else the documented default (true). Call after
+// Load (which runs applyDefaults), or directly — both are safe since this
+// resolves the default itself rather than depending on applyDefaults having
+// mutated anything.
+func (d DiscordConfig) RequireMentionInGuild() bool {
+	if d.RequireMentionInGuildRaw == nil {
+		return true
+	}
+	return *d.RequireMentionInGuildRaw
 }
 
 // AdminIDs parses Discord.Admins as snowflake ids, returning a clear error on

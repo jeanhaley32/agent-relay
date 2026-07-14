@@ -9,6 +9,7 @@ package relay
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -88,9 +89,20 @@ type Broker struct {
 	// emits, with its chat_id in Meta, AFTER the outbound gate passes and the
 	// reply is delivered to the frontend. The pending-event tracker uses it to
 	// infer that a fired trigger was handled (a reply promptly following the
-	// trigger on that chat auto-resolves it). A reply dropped by the gate is
-	// never reported. nil ⇒ no hook.
+	// trigger on that chat auto-resolves it). A reply dropped by the gate, or
+	// one Frontend.Send actually failed to deliver, is never reported - see
+	// AckBackendReply, which is what learns about a failed Send. nil ⇒ no hook.
 	OnBackendReply func(m Message)
+
+	// AckBackendReply, if set, is called after every Frontend.Send attempt
+	// (success or failure) for a backend reply, so the backend can report the
+	// real outcome back to whatever originated the reply (e.g. the reply
+	// tool call, via claude.Endpoint.ReplyRespond) instead of it always
+	// looking like "sent" regardless of what actually happened. Real
+	// incident 2026-07-11: Send() failures (Telegram's 4096-char limit, most
+	// often) were silently discarded here, so a dropped reply gave the model
+	// no signal to retry or shorten it. nil ⇒ no hook.
+	AckBackendReply func(m Message, sendErr error)
 
 	// Session gate: if Session and Approval are both set, inbound messages
 	// from any user_id (from_id) in SessionGatedUsers require an active,
@@ -127,7 +139,12 @@ func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	token, link := b.Approval.Create("relayd session re-authentication", ttl)
+	// Bind the token to this specific userID so an approved decision can
+	// only ever activate the session it was issued for, and Consume (not
+	// Status) so the same approval can't be replayed to re-activate the
+	// session again later within the TTL window.
+	actionHash := "session-reauth:" + userID
+	token, link := b.Approval.CreateBound("relayd session re-authentication", actionHash, ttl)
 	_ = b.Frontend.Send(ctx, AssistantMsg(conv,
 		"Session expired - re-authenticate over the tailnet, then resend your message: "+link))
 
@@ -137,7 +154,7 @@ func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
 		deadline := time.Now().Add(ttl)
 		for time.Now().Before(deadline) {
 			<-ticker.C
-			st, ok := b.Approval.Status(token)
+			st, ok := b.Approval.Consume(token, actionHash)
 			if !ok {
 				return
 			}
@@ -173,13 +190,20 @@ func (b *Broker) Run(ctx context.Context) error {
 			// Outbound gate: the model may target any chat via its reply tool;
 			// only deliver to allowed chats.
 			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
+				if b.AckBackendReply != nil {
+					b.AckBackendReply(m, fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"]))
+				}
 				continue // dropped (the gate func is responsible for logging)
 			}
-			_ = b.Frontend.Send(ctx, m)
+			sendErr := b.Frontend.Send(ctx, m)
+			if b.AckBackendReply != nil {
+				b.AckBackendReply(m, sendErr)
+			}
 			// Reply-inferred ack runs only AFTER the gate passes and the reply
-			// is actually delivered — a reply dropped by the gate never reached
-			// the user, so it is not evidence the trigger was handled.
-			if b.OnBackendReply != nil {
+			// is actually delivered — a reply dropped by the gate, or one that
+			// Frontend.Send failed to deliver, never reached the user, so it
+			// is not evidence the trigger was handled.
+			if sendErr == nil && b.OnBackendReply != nil {
 				b.OnBackendReply(m)
 			}
 		}
@@ -198,17 +222,22 @@ func (b *Broker) Run(ctx context.Context) error {
 			continue
 		}
 		// -2. Identity-pair invariant: chat_id must equal from_id whenever
-		// both are present. This holds by construction for every current
-		// frontend (a private 1:1 Telegram chat's id IS the sender's own
-		// id; the Telegram frontend also independently rejects any non-
-		// private chat before a message ever reaches here) - so this
-		// should never actually fire. That's exactly what makes it a good
-		// tripwire: a hit means some upstream assumption broke (a new
-		// frontend, a regression, group/channel traffic slipping through),
-		// and every downstream gate here (session, admin checks) silently
-		// depends on that assumption holding. Fail closed rather than
-		// silently mis-gating.
-		if fromID, chatID := m.Meta["from_id"], m.Meta["chat_id"]; fromID != "" && chatID != "" && fromID != chatID {
+		// both are present. This holds by construction for every private
+		// 1:1 conversation on every current frontend (a Telegram private
+		// chat's id IS the sender's own id; Discord DMs synthesize chat_id
+		// = from_id for the same reason - see discord.go's gate() convID
+		// comment) - so for those it should never actually fire, which is
+		// what makes it a good tripwire there: a hit means some upstream
+		// assumption broke.
+		//
+		// Discord guild (multi-party) channels are a real, deliberate
+		// exception (DESIGN.md §3 Option A): chat_id there is the shared
+		// channel id, necessarily distinct from whichever member's from_id
+		// sent a given message. gate() marks any such message with
+		// Meta["guild_id"] so the invariant is enforced only for messages
+		// that don't declare themselves multi-party - a frontend-aware
+		// exception keyed off the message itself, not a blanket carve-out.
+		if fromID, chatID := m.Meta["from_id"], m.Meta["chat_id"]; fromID != "" && chatID != "" && fromID != chatID && m.Meta["guild_id"] == "" {
 			log.Printf("relay: dropped message with mismatched from_id=%q chat_id=%q - identity-pair invariant violated", fromID, chatID)
 			continue
 		}

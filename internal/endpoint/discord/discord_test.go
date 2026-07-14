@@ -195,6 +195,143 @@ func TestSendRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSend403Permanent covers DESIGN.md §8's incident-class review: a 403
+// (missing SEND_MESSAGES permission, or any other non-429 4xx) must be
+// classified permanent so it's never retried — the failure is guaranteed to
+// repeat identically. Exercises sendOnce's *rest.Error branch for real
+// against an httptest server, not just Meta/length checks.
+func TestSend403Permanent(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"code":50013,"message":"Missing Permissions"}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	err = f.sendOnce(context.Background(), relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}})
+	if err == nil {
+		t.Fatal("expected an error for a 403 response")
+	}
+	var perm permanentSendError
+	if !errors.As(err, &perm) {
+		t.Fatalf("expected a permanent (non-retryable) error for 403, got %v (%T)", err, err)
+	}
+}
+
+// TestSend429Retryable covers the other half of the same review item: a 429
+// (rate limited) must NOT be classified permanent, even if one slips past
+// disgo's own rate limiter and surfaces here.
+func TestSend429Retryable(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"message":"You are being rate limited.","retry_after":0.01,"global":false}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	err = f.sendOnce(context.Background(), relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}})
+	if err == nil {
+		t.Fatal("expected an error for a 429 response (disgo's rate limiter is expected to retry internally and eventually give up here)")
+	}
+	var perm permanentSendError
+	if errors.As(err, &perm) {
+		t.Fatalf("429 must NOT be classified permanent, got %v (%T)", err, err)
+	}
+}
+
+// TestSendTooLongUsesRuneCount pins the byte-vs-codepoint fix: Discord's
+// 2000 limit is 2000 CHARACTERS (code points), not bytes. A message with
+// 1200 multibyte runes is well over 2000 bytes but must NOT be rejected.
+func TestSendTooLongUsesRuneCount(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1","channel_id":"123","content":"hi","author":{"id":"1","username":"bot"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	text := strings.Repeat("é", 1200) // 1200 runes, 2400 bytes (UTF-8 2 bytes/rune)
+	sendErr := f.sendOnce(context.Background(), relay.Message{
+		Text: text,
+		Meta: map[string]string{"channel_id": "123"},
+	})
+	var perm permanentSendError
+	if errors.As(sendErr, &perm) {
+		t.Fatalf("1200-rune message falsely classified too-long (byte count used instead of rune count): %v", sendErr)
+	}
+}
+
+// TestSendResolvesDMChannelFromConversationID covers the DM-routing gap
+// (DESIGN.md §3): a relayd-originated message (scheduler/admin/mcp reply)
+// carries only ConversationID, never Meta["channel_id"]. For a DM,
+// ConversationID is the recipient's user id (see gate()'s convID comment) —
+// sendOnce must resolve/create the DM channel via CreateDMChannel rather
+// than calling CreateMessage(<user id>) directly, which would 404.
+func TestSendResolvesDMChannelFromConversationID(t *testing.T) {
+	const userID = "111"
+	const dmChannelID = "999"
+	var gotDMPost, gotMessagePost bool
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users/@me/channels", func(w http.ResponseWriter, r *http.Request) {
+		gotDMPost = true
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["recipient_id"] != userID {
+			t.Fatalf("expected recipient_id %q, got %v", userID, body["recipient_id"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":%q,"type":1}`, dmChannelID)
+	})
+	mux.HandleFunc("/channels/"+dmChannelID+"/messages", func(w http.ResponseWriter, r *http.Request) {
+		gotMessagePost = true
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1","channel_id":"999","content":"hi","author":{"id":"1","username":"bot"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	// No Meta at all, and never previously seen inbound — exactly the shape
+	// of a scheduled reminder built by cmd/relayd/main.go.
+	if err := f.Send(context.Background(), relay.Message{ConversationID: userID, Text: "hi"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !gotDMPost {
+		t.Fatal("expected a POST /users/@me/channels to resolve the DM channel")
+	}
+	if !gotMessagePost {
+		t.Fatal("expected the message to be posted to the resolved DM channel")
+	}
+}
+
 // --- test helpers ------------------------------------------------------------
 
 type recordingAuth struct {
