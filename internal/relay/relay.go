@@ -210,6 +210,31 @@ func (b *Broker) conversationCapExceeded(chatID string) bool {
 	return w.tokens >= limit
 }
 
+// conversationCapRejectionNotice builds the message sent to a conversation
+// every time a message is rejected for being at/over its cap - Jean's
+// explicit request, 2026-07-14: every rejection (not just the one that first
+// crosses the cap) should explain why, the limit, current usage, and time
+// until the window resets, rather than the conversation just going silent.
+func (b *Broker) conversationCapRejectionNotice(chatID string) string {
+	limit := b.ConversationCaps[chatID]
+	b.conversationUsedMu.Lock()
+	w := b.conversationUsed[chatID]
+	var used int64
+	var resetIn time.Duration
+	if w != nil {
+		used = w.tokens
+		resetIn = b.capWindow() - b.now().Sub(w.windowStart)
+		if resetIn < 0 {
+			resetIn = 0
+		}
+	}
+	b.conversationUsedMu.Unlock()
+	return fmt.Sprintf(
+		"This conversation is over its token budget and this message wasn't processed. "+
+			"Limit: %d tokens per %s. Used: %d. Resets in: %s.",
+		limit, b.capWindow().Round(time.Minute), used, resetIn.Round(time.Minute))
+}
+
 // addConversationUsage adds tokens to chatID's running total for the
 // current window, a no-op if chatID has no configured cap (avoids growing
 // the map for every conversation when caps are rarely configured).
@@ -412,16 +437,18 @@ func (b *Broker) Run(ctx context.Context) error {
 		// 2.5. Per-conversation token cap: checked before the message ever
 		// reaches the backend, so a capped conversation stops consuming
 		// inference tokens entirely once it hits its limit - see
-		// ConversationCaps' doc comment.
+		// ConversationCaps' doc comment. A detailed notice (reason, limit,
+		// usage, time to reset) is sent on EVERY rejection, not just the
+		// first time the cap is crossed (Jean's explicit request,
+		// 2026-07-14: a conversation going silent forever with no
+		// explanation is worse than a repeated notice).
 		if b.conversationCapExceeded(m.Meta["chat_id"]) {
-			continue // silently dropped; the cap-hit notice was already sent once, see below
+			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, b.conversationCapRejectionNotice(m.Meta["chat_id"])))
+			continue
 		}
-		inboundEst := b.Estimate(m.Text)
-		wasUnderCap := !b.conversationCapExceeded(m.Meta["chat_id"])
-		b.addConversationUsage(m.Meta["chat_id"], inboundEst)
-		if wasUnderCap && b.conversationCapExceeded(m.Meta["chat_id"]) {
-			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID,
-				"This conversation has reached its token cap. Further messages won't be processed until the cap is raised."))
+		b.addConversationUsage(m.Meta["chat_id"], b.Estimate(m.Text))
+		if b.conversationCapExceeded(m.Meta["chat_id"]) {
+			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, b.conversationCapRejectionNotice(m.Meta["chat_id"])))
 			continue
 		}
 		// 3. Admitted: forward to the backend (which replies via its Recv).
