@@ -50,8 +50,15 @@ import (
 // maxMessageLen is a conservative cap chosen well under Matrix's practical
 // ~64KiB per-event JSON ceiling — see DESIGN.md §4 for the full reasoning
 // (the spec itself defines no fixed per-message character limit, unlike
-// Telegram's 4096 or Discord's 2000).
-const maxMessageLen = 16000
+// Telegram's 4096 or Discord's 2000). senderr.Split counts runes, not
+// bytes: a rune can take up to 4 bytes of UTF-8 (more once JSON-escaped,
+// e.g. a control character becomes a 6-byte "\u00XX" sequence), so the cap
+// must leave enough headroom that even an adversarial/binary-heavy body
+// can't cross the 64KiB ceiling. 8000 runes tops out at 32000 bytes of raw
+// UTF-8 (48000 worst-case JSON-escaped) — comfortably under the ceiling
+// with room for the rest of the event envelope, unlike the previous 16000
+// which could reach 64000-96000 bytes on its own.
+const maxMessageLen = 8000
 
 // permanentSendError is the shared retry-classification type — see
 // internal/endpoint/senderr.
@@ -116,12 +123,31 @@ type Frontend struct {
 	recvOnce sync.Once
 	ctx      context.Context
 	cancel   context.CancelFunc
+	// syncDone is closed by runSyncLoop's goroutine when it has returned
+	// (i.e. after f.ctx is cancelled and no further onMessageEvent/
+	// onMemberEvent callback can start) — Close() waits on it before closing
+	// f.recv, so a callback can never send on an already-closed channel. Left
+	// nil when Connect never wired a real sync loop (WithMatrixClient tests).
+	syncDone chan struct{}
 
 	// convRooms remembers, for every ConversationID gate() has seen inbound,
 	// which physical room id it maps to — mirrors discord.go's convChannels,
 	// so a relayd-originated reply (scheduled reminder, admin notice, mcp
 	// reply) that only carries ConversationID/chat_id can still be routed.
 	convRooms sync.Map // ConversationID (string) -> room id (string)
+
+	// roomMemberCount caches the joined-member count for a room id, looked up
+	// via JoinedMembers the first time a message arrives from a room this
+	// process hasn't seen yet — used by onMessageEvent to populate
+	// inboundMessage.memberCount so gate() can tell a DM apart from a
+	// multi-member room (DESIGN.md §3). Caching avoids a JoinedMembers round
+	// trip on every single message.
+	roomMemberCount sync.Map // room id (string) -> member count (int)
+
+	// encryptedNoticeSent tracks which rooms have already received the
+	// one-time "E2E is not enabled" notice (DESIGN.md §2), so a chatty
+	// encrypted room doesn't get spammed with it on every message.
+	encryptedNoticeSent sync.Map // room id (string) -> struct{}{}
 
 	retryQueue     chan retryItem
 	sendFailures   atomic.Int64
@@ -161,6 +187,7 @@ type MautrixAPI interface {
 	SendMessageEvent(ctx context.Context, roomID id.RoomID, eventType event.Type, content interface{}, extra ...mautrix.ReqSendEvent) (*mautrix.RespSendEvent, error)
 	JoinedMembers(ctx context.Context, roomID id.RoomID) (*mautrix.RespJoinedMembers, error)
 	JoinRoomByID(ctx context.Context, roomID id.RoomID) (*mautrix.RespJoinRoom, error)
+	Whoami(ctx context.Context) (*mautrix.RespWhoami, error)
 }
 
 // Option configures a Frontend.
@@ -274,6 +301,19 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		if f.selfID == "" {
 			f.selfID = f.userID
 		}
+		if f.selfID == "" {
+			// Token-auth with no configured user_id: without knowing our own
+			// user id, senderIsMe never matches (self-echo relay-loop risk)
+			// and onMemberEvent's admin-invite auto-join never fires (its
+			// StateKey match requires a non-empty f.selfID) — DESIGN.md §7.
+			// Ask the homeserver who we are rather than silently limping
+			// along with echo suppression permanently disabled.
+			resp, err := f.api.Whoami(ctx)
+			if err != nil {
+				return fmt.Errorf("matrix: token auth but no user_id configured and GET /whoami failed: %w — set matrix.user_id alongside access_token_env", err)
+			}
+			f.selfID = string(resp.UserID)
+		}
 	case f.userID != "" && f.password != "":
 		resp, err := f.api.Login(ctx, &mautrix.ReqLogin{
 			Type: mautrix.AuthTypePassword,
@@ -299,8 +339,32 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		if syncer, ok := f.client.Syncer.(mautrix.ExtensibleSyncer); ok {
 			syncer.OnEventType(event.EventMessage, f.onMessageEvent)
 			syncer.OnEventType(event.StateMember, f.onMemberEvent)
+			syncer.OnEventType(event.EventEncrypted, f.onEncryptedEvent)
+			// DESIGN.md §6 gap: mautrix.NewClient uses an in-memory
+			// SyncStore, so LoadNextBatch always returns "" on the very
+			// first /sync after every relayd restart, and a since=""
+			// request returns each joined room's recent timeline backlog.
+			// Without this guard, every restart re-publishes recent room
+			// history to the Broker as if it were freshly received,
+			// causing the agent to re-process (and potentially re-answer)
+			// messages it already handled. DontProcessOldEvents detects
+			// since=="" and marks every event in that first response
+			// suppressed before Dispatch fires the OnEventType callbacks.
+			syncer.OnSync(f.client.DontProcessOldEvents)
 		}
-		go f.runSyncLoop(ctx)
+		f.syncDone = make(chan struct{})
+		// Run on f.ctx (cancelled by Close), NOT the ctx passed to Connect —
+		// main.go passes context.Background() here, so if the sync loop ran
+		// on that ctx instead, Close() calling f.cancel() would never stop
+		// it: the loop (and the callbacks it drives, including
+		// onMessageEvent's `f.recv <- msg`) would keep running forever,
+		// including after Close() closes f.recv, panicking on a
+		// send-on-closed-channel. Close() waits on syncDone before closing
+		// f.recv so no callback can be mid-flight when the channel closes.
+		go func() {
+			f.runSyncLoop(f.ctx)
+			close(f.syncDone)
+		}()
 	}
 	return nil
 }
@@ -337,14 +401,19 @@ func (f *Frontend) runSyncLoop(ctx context.Context) {
 func (f *Frontend) Name() string               { return "matrix" }
 func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 
-// Close stops the frontend: closes f.recv (guarded against double-close)
-// then cancels the retry worker / sync loop context. Mirrors discord.go's
-// Close ordering rationale — see its doc comment — though Matrix's sync
-// loop, being a plain HTTP long-poll rather than a websocket dispatch loop,
-// has no equivalent "callback still in flight" race to guard against.
+// Close stops the frontend: cancels f.ctx (stopping the retry worker AND,
+// since Connect wires the sync loop onto f.ctx, the sync loop too), waits
+// for the sync loop goroutine to actually return via syncDone — so
+// onMessageEvent/onMemberEvent are guaranteed to have no callback still in
+// flight — and only then closes f.recv (guarded against double-close).
+// Mirrors discord.go's Close ordering rationale (stop the event source
+// first, close recv second) — see its doc comment.
 func (f *Frontend) Close() error {
-	f.recvOnce.Do(func() { close(f.recv) })
 	f.cancel()
+	if f.syncDone != nil {
+		<-f.syncDone
+	}
+	f.recvOnce.Do(func() { close(f.recv) })
 	return nil
 }
 
@@ -374,13 +443,17 @@ func (f *Frontend) onMessageEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
-	// Member count is used by gate() to distinguish a DM (2 members) from a
-	// multi-member room (DESIGN.md §3) — out of scope to implement fully in
-	// this pass (§8: DM-only MVP), so gate() treats memberCount==0 as "DM".
-	// A real member-count lookup would call f.api.JoinedMembers here; left
-	// as a follow-up (see DESIGN.md §8/§9) since group rooms are explicitly
-	// out of scope for this pass and the extra round trip is not needed to
-	// serve the MVP's DM-only contract.
+	// Member count distinguishes a DM (<=2 members) from a multi-member room
+	// (DESIGN.md §3). This MUST be a real lookup, not left at the
+	// zero-value "assume DM": onMemberEvent auto-joins any room an
+	// allowlisted admin invites the bot to, including multi-member rooms: if
+	// memberCount stayed 0 here, gate() would treat every group-room message
+	// as a DM (convID = sender id) and convRooms.Store would overwrite that
+	// sender's real DM room mapping with the group room, so a later
+	// relayd-originated reply addressed only by chat_id (a scheduled
+	// reminder, an mcp reply) could be delivered into the group room instead
+	// of the private DM.
+	in.memberCount = f.roomMemberCountFor(ctx, in.roomID)
 
 	msg, ok := f.gate(in)
 	if !ok {
@@ -391,6 +464,28 @@ func (f *Frontend) onMessageEvent(ctx context.Context, evt *event.Event) {
 	case <-time.After(5 * time.Second):
 		f.recvDrops.Add(1)
 		f.logger.Printf("matrix: recv channel full/blocked, dropped message from room %s", in.roomID)
+	}
+}
+
+// onEncryptedEvent handles m.room.encrypted events (DESIGN.md §2's MVP
+// scope: plaintext-room-only, E2E deliberately not implemented). Encrypted
+// events are a distinct event type from m.room.message — they never reach
+// onMessageEvent/OnEventType(event.EventMessage) at all — so without this
+// handler they were silently ignored with no log line, contradicting
+// DESIGN.md §2's explicit "log and drop, never silent" requirement and its
+// promised one-time "E2E not enabled" notice back to the sender.
+func (f *Frontend) onEncryptedEvent(ctx context.Context, evt *event.Event) {
+	f.lastSyncEventAt.Store(time.Now().Unix())
+	f.logger.Printf("matrix: dropped encrypted event id=%s room=%s sender=%s — E2E is not enabled (DESIGN.md §2)",
+		evt.ID, evt.RoomID, evt.Sender)
+
+	if _, alreadySent := f.encryptedNoticeSent.LoadOrStore(string(evt.RoomID), struct{}{}); alreadySent {
+		return
+	}
+	const notice = "This bot does not support end-to-end encrypted rooms yet. Please use an unencrypted room."
+	if _, err := f.api.SendMessageEvent(ctx, evt.RoomID, event.EventMessage,
+		event.MessageEventContent{MsgType: event.MsgText, Body: notice}); err != nil {
+		f.logger.Printf("matrix: failed to send E2E-not-enabled notice to room %s: %v", evt.RoomID, err)
 	}
 }
 
@@ -418,6 +513,26 @@ func (f *Frontend) onMemberEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 	f.logger.Printf("matrix: auto-joined room %s (invited by allowlisted admin/user %s)", evt.RoomID, sender)
+}
+
+// roomMemberCountFor returns the cached joined-member count for roomID,
+// looking it up via JoinedMembers on a cache miss. On lookup failure it
+// logs and returns 0 rather than caching an error — a subsequent message
+// from the same room will simply retry the lookup — but never guesses "2"
+// (DM), since an under-count here is what causes the DM/group routing
+// hijack described at the roomMemberCountFor call site in onMessageEvent.
+func (f *Frontend) roomMemberCountFor(ctx context.Context, roomID string) int {
+	if v, ok := f.roomMemberCount.Load(roomID); ok {
+		return v.(int)
+	}
+	resp, err := f.api.JoinedMembers(ctx, id.RoomID(roomID))
+	if err != nil {
+		f.logger.Printf("matrix: JoinedMembers lookup failed for room %s, treating as unknown: %v", roomID, err)
+		return 0
+	}
+	count := len(resp.Joined)
+	f.roomMemberCount.Store(roomID, count)
+	return count
 }
 
 // gate applies the sender policy from DESIGN.md §3 and, if the message
@@ -448,7 +563,8 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 	// because chat_id == room_id never happens for a DM (a `!`-room-id
 	// string can never equal an `@`-user-id string).
 	var convID string
-	if m.memberCount > 2 {
+	isGroup := m.memberCount > 2
+	if isGroup {
 		convID = m.roomID
 	} else {
 		convID = m.senderID
@@ -456,16 +572,28 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 
 	f.convRooms.Store(convID, m.roomID)
 
+	meta := map[string]string{
+		"chat_id":   convID,
+		"room_id":   m.roomID,
+		"from_id":   m.senderID,
+		"from_name": m.senderName,
+	}
+	if isGroup {
+		// The Broker's identity-pair invariant (relay.go) drops any message
+		// where from_id != chat_id unless Meta["guild_id"] is set — a
+		// multi-member room's chat_id (the room id) is never equal to
+		// from_id (the sender id) by construction (DESIGN.md §3), so this
+		// exemption marker is required for the message to survive the
+		// Broker, mirroring discord.go's guild_id exemption for guild
+		// channels.
+		meta["guild_id"] = m.roomID
+	}
+
 	msg := relay.Message{
 		ConversationID: convID,
 		Role:           relay.User,
 		Text:           m.content,
-		Meta: map[string]string{
-			"chat_id":   convID,
-			"room_id":   m.roomID,
-			"from_id":   m.senderID,
-			"from_name": m.senderName,
-		},
+		Meta:           meta,
 	}
 	return msg, true
 }

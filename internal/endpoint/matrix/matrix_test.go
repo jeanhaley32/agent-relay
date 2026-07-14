@@ -97,6 +97,13 @@ func TestGateMultiMemberRoomUsesRoomIDAsChatID(t *testing.T) {
 	if msg.Meta["from_id"] != "@jean:example.org" {
 		t.Fatalf("from_id should still be the sender id: %+v", msg)
 	}
+	// The Broker's identity-pair invariant (relay.go) drops from_id!=chat_id
+	// messages unless Meta["guild_id"] is set — a multi-member room's
+	// chat_id (room id) is never equal to from_id (sender id), so this
+	// message can only survive the Broker with the exemption marker set.
+	if msg.Meta["guild_id"] != "!group:example.org" {
+		t.Fatalf("expected guild_id exemption marker for a multi-member room, got %+v", msg)
+	}
 }
 
 // TestSendTooLong verifies maxMessageLen is enforced before any API call,
@@ -294,4 +301,7 @@ func (f *fakeAPI) JoinedMembers(context.Context, id.RoomID) (*mautrix.RespJoined
 }
 func (f *fakeAPI) JoinRoomByID(context.Context, id.RoomID) (*mautrix.RespJoinRoom, error) {
 	return &mautrix.RespJoinRoom{}, nil
+}
+func (f *fakeAPI) Whoami(context.Context) (*mautrix.RespWhoami, error) {
+	return &mautrix.RespWhoami{UserID: "@bot:example.org"}, nil
 }
