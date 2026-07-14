@@ -127,6 +127,50 @@ type Broker struct {
 	// senders get through. Admin-only to toggle (enforced by the /lockdown
 	// command itself being Admin: true), affects only non-admins.
 	Lockdown atomic.Bool
+
+	// ConversationCaps optionally bounds cumulative estimated tokens for a
+	// specific chat_id, independent of and tighter than the global Meter
+	// budget - for a specific contact (e.g. real 2026-07-14 incident: an
+	// allowlisted-but-non-admin Discord user testing how much inference the
+	// relay would spend on an open-ended request) rather than the whole
+	// relay. Both directions count against the cap: an inbound message's
+	// estimate is added before it's forwarded to the backend, and a reply's
+	// estimate is added when it comes back - see conversationCapExceeded and
+	// addConversationUsage. nil map ⇒ no caps configured.
+	ConversationCaps map[string]int64
+
+	conversationUsedMu sync.Mutex
+	conversationUsed   map[string]int64
+}
+
+// conversationCapExceeded reports whether chatID has a configured cap and
+// has already reached or passed it - checked BEFORE forwarding an inbound
+// message to the backend, so a capped conversation stops consuming
+// inference tokens entirely once it hits the limit, not just outbound
+// send tokens.
+func (b *Broker) conversationCapExceeded(chatID string) bool {
+	limit, ok := b.ConversationCaps[chatID]
+	if !ok {
+		return false
+	}
+	b.conversationUsedMu.Lock()
+	defer b.conversationUsedMu.Unlock()
+	return b.conversationUsed[chatID] >= limit
+}
+
+// addConversationUsage adds tokens to chatID's running total, a no-op if
+// chatID has no configured cap (avoids growing the map for every
+// conversation when caps are rarely configured).
+func (b *Broker) addConversationUsage(chatID string, tokens int) {
+	if _, ok := b.ConversationCaps[chatID]; !ok {
+		return
+	}
+	b.conversationUsedMu.Lock()
+	defer b.conversationUsedMu.Unlock()
+	if b.conversationUsed == nil {
+		b.conversationUsed = map[string]int64{}
+	}
+	b.conversationUsed[chatID] += int64(tokens)
 }
 
 // LockdownMessage is sent to any non-admin sender while lockdown is active.
@@ -187,6 +231,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		defer wg.Done()
 		for m := range b.Backend.Recv() {
 			b.Meter.Record(b.Estimate(m.Text))
+			b.addConversationUsage(m.Meta["chat_id"], b.Estimate(m.Text))
 			// Outbound gate: the model may target any chat via its reply tool;
 			// only deliver to allowed chats.
 			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
@@ -275,6 +320,21 @@ func (b *Broker) Run(ctx context.Context) error {
 		// 2. Budget / circuit gate.
 		if ok, why := b.Meter.Allow(b.Estimate(m.Text)); !ok {
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, why))
+			continue
+		}
+		// 2.5. Per-conversation token cap: checked before the message ever
+		// reaches the backend, so a capped conversation stops consuming
+		// inference tokens entirely once it hits its limit - see
+		// ConversationCaps' doc comment.
+		if b.conversationCapExceeded(m.Meta["chat_id"]) {
+			continue // silently dropped; the cap-hit notice was already sent once, see below
+		}
+		inboundEst := b.Estimate(m.Text)
+		wasUnderCap := !b.conversationCapExceeded(m.Meta["chat_id"])
+		b.addConversationUsage(m.Meta["chat_id"], inboundEst)
+		if wasUnderCap && b.conversationCapExceeded(m.Meta["chat_id"]) {
+			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID,
+				"This conversation has reached its token cap. Further messages won't be processed until the cap is raised."))
 			continue
 		}
 		// 3. Admitted: forward to the backend (which replies via its Recv).

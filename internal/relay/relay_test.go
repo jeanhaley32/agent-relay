@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,6 +26,19 @@ func (f *capFrontend) Name() string                            { return "front" 
 func (f *capFrontend) Recv() <-chan Message                    { return f.recv }
 func (f *capFrontend) Send(_ context.Context, m Message) error { f.sent <- m; return nil }
 func (f *capFrontend) Close() error                            { return nil }
+
+// failFrontend fails every Send with a fixed error - used to test that a
+// failed delivery is reported via AckBackendReply and does NOT fire
+// OnBackendReply (a failed send never reached the user).
+type failFrontend struct {
+	recv chan Message
+	err  error
+}
+
+func (f *failFrontend) Name() string                            { return "failfront" }
+func (f *failFrontend) Recv() <-chan Message                    { return f.recv }
+func (f *failFrontend) Send(_ context.Context, _ Message) error { return f.err }
+func (f *failFrontend) Close() error                            { return nil }
 
 // emitBackend emits replies the test pushes onto recv.
 type emitBackend struct{ recv chan Message }
@@ -118,6 +132,47 @@ func TestOutboundGate(t *testing.T) {
 		t.Fatalf("outbound gate leaked a reply to a stranger: %+v", m)
 	case <-time.After(300 * time.Millisecond):
 		// good — dropped
+	}
+}
+
+// TestAckBackendReplyReportsFailureAndSuppressesOnBackendReply: a Send
+// failure must be reported via AckBackendReply (so the reply tool call can
+// surface it to the model - real incident 2026-07-11, replies over
+// Telegram's 4096-char limit were silently dropped with no error anywhere),
+// and must NOT fire OnBackendReply, since the reply never actually reached
+// the user and is not evidence a trigger was handled.
+func TestAckBackendReplyReportsFailureAndSuppressesOnBackendReply(t *testing.T) {
+	sendErr := errors.New("telegram sendMessage status 400: message is too long")
+	front := &failFrontend{recv: make(chan Message), err: sendErr}
+	back := &emitBackend{recv: make(chan Message, 8)}
+	acked := make(chan error, 8)
+	onReplyFired := make(chan string, 8)
+	b := &Broker{
+		Frontend:        front,
+		Backend:         back,
+		Commands:        command.NewRegistry(),
+		Meter:           budget.New("pro", nil),
+		AckBackendReply: func(_ Message, err error) { acked <- err },
+		OnBackendReply:  func(m Message) { onReplyFired <- m.Meta["chat_id"] },
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	back.recv <- Message{Role: Assistant, Text: "too long", Meta: map[string]string{"chat_id": "111"}}
+
+	select {
+	case err := <-acked:
+		if err == nil || err.Error() != sendErr.Error() {
+			t.Fatalf("AckBackendReply err = %v, want %v", err, sendErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AckBackendReply never fired for a failed send")
+	}
+	select {
+	case id := <-onReplyFired:
+		t.Fatalf("OnBackendReply fired for a failed send (chat %q) - a failed send never reached the user", id)
+	case <-time.After(300 * time.Millisecond):
+		// good — suppressed
 	}
 }
 
@@ -323,5 +378,90 @@ func TestSessionGate(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("message after re-auth was not forwarded to the backend")
+	}
+}
+
+// TestConversationCap covers the real 2026-07-14 incident: an
+// allowlisted-but-non-admin contact testing how much inference the relay
+// would spend on an open-ended request. A per-conversation cap must stop
+// inbound messages from reaching the backend at all once the cap is hit -
+// not just gate the outbound reply - since the real cost is inference
+// tokens, spent the moment a message is forwarded to the model.
+func TestConversationCap(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	b := &Broker{
+		Frontend:         front,
+		Backend:          back,
+		Commands:         command.NewRegistry(),
+		Meter:            budget.New("pro", nil),
+		Estimate:         func(text string) int { return len(text) }, // 1 token/char for exact test math
+		ConversationCaps: map[string]int64{"999": 10},                // tiny cap, easy to exceed
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// First message (5 tokens) is well under the cap of 10 - forwarded.
+	front.recv <- Message{Role: User, Text: "hello", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("expected 'hello' forwarded to backend, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first message (under cap) was never forwarded to the backend")
+	}
+
+	// Second message (7 tokens) pushes cumulative usage (5+7=12) over the
+	// cap of 10 - this is the message that CROSSES the cap, so it must NOT
+	// itself reach the backend (a single oversized message could otherwise
+	// blow through an arbitrarily small cap); only the cap-hit notice goes
+	// out.
+	front.recv <- Message{Role: User, Text: "1234567", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("the message that crosses the cap must not reach the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good - the crossing message itself is not forwarded
+	}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "token cap") {
+			t.Fatalf("expected a cap-hit notice, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-hit notice to be sent to the conversation")
+	}
+
+	// Third message: now genuinely over cap - must be dropped BEFORE
+	// reaching the backend at all (no more inference spent on this
+	// conversation), and no further notice sent (only fires once).
+	front.recv <- Message{Role: User, Text: "should not reach backend", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("conversation cap did not stop a message from reaching the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good - dropped before the backend
+	}
+	select {
+	case m := <-front.sent:
+		t.Fatalf("expected no further notice after the cap was already hit once, got %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+
+	// A DIFFERENT, uncapped conversation must be entirely unaffected.
+	front.recv <- Message{Role: User, Text: "unrelated", ConversationID: "111",
+		Meta: map[string]string{"chat_id": "111", "from_id": "111"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "unrelated" {
+			t.Fatalf("expected the uncapped conversation's message forwarded, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an uncapped conversation must be unaffected by another conversation's cap")
 	}
 }
