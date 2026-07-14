@@ -465,3 +465,61 @@ func TestConversationCap(t *testing.T) {
 		t.Fatal("an uncapped conversation must be unaffected by another conversation's cap")
 	}
 }
+
+// TestConversationCapRollsOverOnWindow covers Jean's explicit request
+// (2026-07-14): the cap is a rate limit ("see the cap at every 3 hours"),
+// not a lifetime ban - usage must reset once the configured window elapses.
+func TestConversationCapRollsOverOnWindow(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	b := &Broker{
+		Frontend:              front,
+		Backend:               back,
+		Commands:              command.NewRegistry(),
+		Meter:                 budget.New("pro", nil),
+		Estimate:              func(text string) int { return len(text) },
+		ConversationCaps:      map[string]int64{"999": 10},
+		ConversationCapWindow: time.Hour,
+		clock:                 func() time.Time { return now },
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// Well under the cap of 10 - forwarded.
+	front.recv <- Message{Role: User, Text: "12345", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case <-back.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first message never reached the backend")
+	}
+
+	// Pushes cumulative usage (5+7=12) over the cap - dropped before the
+	// backend, one notice sent.
+	front.recv <- Message{Role: User, Text: "1234567", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expected drop while still within the window, got %+v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+	select {
+	case <-front.sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-hit notice")
+	}
+
+	// Advance past the 1-hour window - usage should roll over to zero.
+	now = now.Add(time.Hour + time.Minute)
+	front.recv <- Message{Role: User, Text: "y", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "y" {
+			t.Fatalf("unexpected message forwarded: %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("message after the window rolled over should have been forwarded - cap must reset, not stay a lifetime ban")
+	}
+}
