@@ -39,6 +39,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/config"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/matrix"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -92,7 +93,22 @@ func main() {
 	// Telegram and (if enabled) Discord access managers — each frontend's
 	// admin ids live in its own manager, so a Discord admin's id is only
 	// ever found in discordAcc, and would otherwise never satisfy IsAdmin.
+	// matrixAdmins holds cfg.Matrix.Admins as a set for cmds.IsAdmin/
+	// SessionGatedUsers below. Matrix user ids ("@user:server.tld") are
+	// strings, not numeric like Telegram/Discord, so they can't share
+	// access.Manager's int64-keyed IsAdmin path the way Discord's converted
+	// snowflakes do — see internal/endpoint/matrix/DESIGN.md §3 and this
+	// function's own doc comment for why Matrix intentionally stays a
+	// simpler static allowlist for this pass rather than a third
+	// access.Manager-shaped id space.
+	matrixAdmins := map[string]bool{}
+	for _, id := range cfg.Matrix.Admins {
+		matrixAdmins[id] = true
+	}
 	cmds.IsAdmin = func(senderID string) bool {
+		if matrixAdmins[senderID] {
+			return true
+		}
 		id, err := strconv.ParseInt(senderID, 10, 64)
 		if err != nil {
 			return false
@@ -173,6 +189,23 @@ func main() {
 	if cfg.Discord.Enabled {
 		discordFront, discordAcc = mustStartDiscord(cfg, logger)
 		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
+	}
+
+	// Matrix frontend (optional, internal/endpoint/matrix/DESIGN.md): wired
+	// the same way Discord is — its own New/Connect handshake, then fanned
+	// into the Broker's single Frontend slot via relay.MultiFrontend. Unlike
+	// Discord's access.Manager (int64-keyed), Matrix stays a simple static
+	// allowlist for this pass (see mustStartMatrix's doc comment) since a
+	// Matrix user id is a string, not numeric.
+	var matrixFront *matrix.Frontend
+	if cfg.Matrix.Enabled {
+		matrixFront = mustStartMatrix(cfg, logger)
+		switch {
+		case discordFront != nil:
+			frontendEndpoint = relay.NewMultiFrontend(front, discordFront, matrixFront)
+		default:
+			frontendEndpoint = relay.NewMultiFrontend(front, matrixFront)
+		}
 	}
 
 	// Permission relay: admins approve tool-use prompts via /allow and /deny.
@@ -315,7 +348,7 @@ func main() {
 	// this same host, no need to expose it beyond localhost. Also hosts
 	// /webhook/reply-drift and /webhook/token-usage, hence needing b now
 	// that it exists.
-	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, *cfgPath)
+	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, matrixFront, tracker, logger, b, *cfgPath)
 
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
@@ -370,6 +403,9 @@ func main() {
 		if discordFront != nil && discordFront.KnownConversation(chatID) {
 			return true
 		}
+		if matrixFront != nil && matrixFront.KnownConversation(chatID) {
+			return true
+		}
 		logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
 		return false
 	}
@@ -408,8 +444,8 @@ func main() {
 	// admin account on EITHER frontend, so both id spaces must feed it or a
 	// Discord admin could run /handshake approve, /allow, /lockdown etc
 	// indefinitely with zero tailnet proof.
-	if len(cfg.Telegram.Admins) > 0 || len(cfg.Discord.Admins) > 0 {
-		gated := make(map[string]bool, len(cfg.Telegram.Admins)+len(cfg.Discord.Admins))
+	if len(cfg.Telegram.Admins) > 0 || len(cfg.Discord.Admins) > 0 || len(cfg.Matrix.Admins) > 0 {
+		gated := make(map[string]bool, len(cfg.Telegram.Admins)+len(cfg.Discord.Admins)+len(cfg.Matrix.Admins))
 		for _, admin := range cfg.Telegram.Admins {
 			gated[strconv.FormatInt(admin, 10)] = true
 		}
@@ -417,6 +453,9 @@ func main() {
 			for _, admin := range discordAdminIDs {
 				gated[admin.String()] = true
 			}
+		}
+		for _, admin := range cfg.Matrix.Admins {
+			gated[admin] = true
 		}
 		b.Session = session.NewManager(30 * time.Minute)
 		b.Approval = appr
@@ -515,6 +554,63 @@ func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend
 	return front, discordAcc
 }
 
+// mustStartMatrix builds the Matrix frontend from cfg.Matrix, connects it
+// (login/token handshake + sync loop), and returns it. Fatal on error,
+// mirroring mustStartDiscord's posture: an operator who set
+// matrix.enabled=true with a bad token/config wants a clear startup
+// failure, not a frontend that silently never came up.
+//
+// Unlike Discord, Matrix does not get its own access.Manager instance: a
+// Matrix user id ("@user:server.tld") is a string, not a numeric snowflake,
+// so it can't reuse access.Manager's int64-keyed persistence/pending-queue
+// machinery the way Discord's snowflake-to-int64 conversion does (see
+// internal/endpoint/matrix/DESIGN.md §3, which flags this as an open
+// question — genericizing access.Manager vs. a separate string-keyed
+// authorizer). For this pass we take the simpler of DESIGN.md §3's two
+// options: a static allowlist assembled directly from config
+// (admins ∪ allowlist) via matrix.WithAllowlist. This means Matrix does NOT
+// get a live /handshake approve/deny workflow for unrecognized senders in
+// this pass — matrix.Frontend.gate() still records/logs an unauthorized
+// sender attempt, but there is no admin command to approve it short of
+// editing config.Matrix.Allowlist and restarting relayd. A proper
+// string-keyed pending-request manager (mirroring access.Manager, or a
+// generic access.Manager[T]) is real follow-up work, not done here for lack
+// of time — see DESIGN.md §9 open question 1.
+func mustStartMatrix(cfg *config.Config, logger *log.Logger) *matrix.Frontend {
+	allowed := make([]string, 0, len(cfg.Matrix.Admins)+len(cfg.Matrix.Allowlist))
+	allowed = append(allowed, cfg.Matrix.Admins...)
+	allowed = append(allowed, cfg.Matrix.Allowlist...)
+
+	opts := []matrix.Option{
+		matrix.WithAllowlist(allowed...),
+		matrix.WithLogger(logger),
+	}
+	if cfg.Matrix.AccessTokenEnv != "" {
+		token, err := cfg.MatrixAccessToken()
+		if err != nil {
+			logger.Fatalf("matrix: %v", err)
+		}
+		opts = append(opts, matrix.WithAccessToken(token, cfg.Matrix.DeviceID))
+	} else {
+		password, err := cfg.MatrixPassword()
+		if err != nil {
+			logger.Fatalf("matrix: %v", err)
+		}
+		opts = append(opts, matrix.WithPasswordLogin(cfg.Matrix.UserID, password))
+	}
+
+	front, err := matrix.New(cfg.Matrix.HomeserverURL, opts...)
+	if err != nil {
+		logger.Fatalf("matrix: %v", err)
+	}
+	if err := front.Connect(context.Background()); err != nil {
+		logger.Fatalf("matrix: connect: %v", err)
+	}
+	logger.Printf("connected to Matrix (homeserver=%s, admins=%d, allowlist=%d)",
+		cfg.Matrix.HomeserverURL, len(cfg.Matrix.Admins), len(cfg.Matrix.Allowlist))
+	return front
+}
+
 // listenWithRetry binds addr, retrying with a fixed 1s backoff until
 // deadline elapses. Used for listeners bound to an interface address (like
 // the Tailscale IP) that may not exist yet this early at boot.
@@ -552,7 +648,7 @@ type grafanaWebhookPayload struct {
 // path the scheduler uses (back.Send), rather than notifying Telegram
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
-func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) {
+func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, matrixFront *matrix.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) {
 	if adminChatID == "" {
 		logger.Printf("grafana webhook: no admin chat configured, not starting listener")
 		return
@@ -589,6 +685,19 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 			discordRecvDrops = discordFront.RecvDrops()
 			discordGatewayReconnects = discordFront.GatewayReconnects()
 			discordLastGatewayEventAt = discordFront.LastGatewayEventAt()
+		}
+		// Matrix frontend is optional (cfg.Matrix.Enabled) - report zeros
+		// rather than omitting the series when it's off, same rationale as
+		// the Discord block above.
+		var matrixSendFailures, matrixPermanentDrops, matrixQueueDepth int64
+		var matrixRecvDrops, matrixSyncFailures, matrixLastSyncEventAt int64
+		if matrixFront != nil {
+			matrixSendFailures = matrixFront.SendFailures()
+			matrixPermanentDrops = matrixFront.PermanentDrops()
+			matrixQueueDepth = matrixFront.QueueDepth()
+			matrixRecvDrops = matrixFront.RecvDrops()
+			matrixSyncFailures = matrixFront.SyncFailures()
+			matrixLastSyncEventAt = matrixFront.LastSyncEventAt()
 		}
 		body := fmt.Sprintf(
 			"# HELP relayd_unrecognized_access_attempts_total Distinct non-allowlisted Telegram senders who have messaged the bot since relayd started.\n"+
@@ -657,6 +766,24 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 				"# HELP relayd_discord_last_gateway_event_seconds Unix timestamp of the last event received from the Discord gateway (0 if the Discord frontend is disabled or has seen no events yet).\n"+
 				"# TYPE relayd_discord_last_gateway_event_seconds gauge\n"+
 				"relayd_discord_last_gateway_event_seconds %d\n"+
+				"# HELP relayd_matrix_send_failures_total Failed Matrix message-send attempts since relayd started (includes retries). 0 if the Matrix frontend is disabled.\n"+
+				"# TYPE relayd_matrix_send_failures_total counter\n"+
+				"relayd_matrix_send_failures_total %d\n"+
+				"# HELP relayd_matrix_permanent_drops_total Matrix messages that exhausted all retry attempts and were permanently dropped.\n"+
+				"# TYPE relayd_matrix_permanent_drops_total counter\n"+
+				"relayd_matrix_permanent_drops_total %d\n"+
+				"# HELP relayd_matrix_retry_queue_depth Matrix messages currently queued for background retry.\n"+
+				"# TYPE relayd_matrix_retry_queue_depth gauge\n"+
+				"relayd_matrix_retry_queue_depth %d\n"+
+				"# HELP relayd_matrix_recv_drops_total Inbound Matrix sync events dropped without being relayed since relayd started - the Matrix analogue of a getUpdates outage.\n"+
+				"# TYPE relayd_matrix_recv_drops_total counter\n"+
+				"relayd_matrix_recv_drops_total %d\n"+
+				"# HELP relayd_matrix_sync_failures_total Failed Matrix /sync long-poll attempts since relayd started - the real signal of a Matrix-side outage.\n"+
+				"# TYPE relayd_matrix_sync_failures_total counter\n"+
+				"relayd_matrix_sync_failures_total %d\n"+
+				"# HELP relayd_matrix_last_sync_event_seconds Unix timestamp of the last event received from the Matrix sync loop (0 if the Matrix frontend is disabled or has seen no events yet).\n"+
+				"# TYPE relayd_matrix_last_sync_event_seconds gauge\n"+
+				"relayd_matrix_last_sync_event_seconds %d\n"+
 				"# HELP relayd_reply_drift_total Turns where the model answered a relay event in plain terminal text without calling the reply tool, so nothing was ever sent - detected by a Stop hook scanning the transcript, see scripts/detect-reply-drift.py.\n"+
 				"# TYPE relayd_reply_drift_total counter\n"+
 				"relayd_reply_drift_total %d\n",
@@ -668,6 +795,8 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 			tracker.OpenCount(), tracker.OldestOpenAge().Seconds(),
 			discordSendFailures, discordPermanentDrops, discordQueueDepth,
 			discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt,
+			matrixSendFailures, matrixPermanentDrops, matrixQueueDepth,
+			matrixRecvDrops, matrixSyncFailures, matrixLastSyncEventAt,
 			replyDriftTotal.Load(),
 		)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")

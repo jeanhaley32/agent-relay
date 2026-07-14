@@ -16,6 +16,16 @@
     "allowed_guild_ids": [],
     "require_mention_in_guild": true
   },
+  "matrix": {
+    "enabled": false,
+    "homeserver_url": "https://matrix.example.org",
+    "access_token_env": "MATRIX_ACCESS_TOKEN",
+    "device_id": "",
+    "admins": ["@jean:example.org"],
+    "allowlist": [],
+    "allowlist_file": "matrix_allowlist.json",
+    "e2e_enabled": false
+  },
   "claude": {
     "socket": "/tmp/agent-relay.sock"
   },

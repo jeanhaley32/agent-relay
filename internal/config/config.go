@@ -18,6 +18,7 @@ import (
 type Config struct {
 	Telegram  TelegramConfig  `json:"telegram"`
 	Discord   DiscordConfig   `json:"discord"`
+	Matrix    MatrixConfig    `json:"matrix"`
 	Claude    ClaudeConfig    `json:"claude"`
 	Budget    BudgetConfig    `json:"budget"`
 	Scheduler SchedulerConfig `json:"scheduler"`
@@ -126,6 +127,71 @@ func parseSnowflakes(field string, raw []string) ([]snowflake.ID, error) {
 	return ids, nil
 }
 
+// MatrixConfig configures the Matrix frontend. Matrix is fully optional — a
+// config with only "telegram" (or "telegram" + "discord") blocks keeps
+// working unchanged. See internal/endpoint/matrix/DESIGN.md.
+type MatrixConfig struct {
+	// Enabled gates whether relayd starts the Matrix frontend at all — same
+	// rationale as DiscordConfig.Enabled: an all-zero-value MatrixConfig{}
+	// must not be mistaken for "frontend wants to start with an empty
+	// allowlist." Fail-closed default: false.
+	Enabled bool `json:"enabled"`
+
+	// HomeserverURL is REQUIRED whenever Enabled — this frontend is
+	// deliberately homeserver-agnostic (DESIGN.md §1): self-hosted
+	// Conduit/Synapse/Dendrite or a public server all work identically, as
+	// long as this points at that server's standard Client-Server API
+	// base, e.g. "https://matrix.example.org" or "https://matrix.org".
+	HomeserverURL string `json:"homeserver_url"`
+
+	// --- Auth: exactly one of the two shapes below must be configured. ---
+
+	// AccessTokenEnv, if set, is the env var holding a pre-minted access
+	// token (mirrors TelegramConfig.TokenEnv/DiscordConfig.TokenEnv's
+	// convention: the secret's NAME lives in the file, never the secret
+	// itself). DeviceID should accompany it if known.
+	AccessTokenEnv string `json:"access_token_env"`
+	DeviceID       string `json:"device_id"`
+
+	// UserID/PasswordEnv, if set instead, make this frontend perform the
+	// standard POST /_matrix/client/v3/login flow itself at startup and
+	// obtain its own access_token + device_id (DESIGN.md §1). PasswordEnv
+	// follows the same "name of the env var, never the secret" convention.
+	UserID      string `json:"user_id"`
+	PasswordEnv string `json:"password_env"`
+
+	// Admins/Allowlist hold Matrix user ids as strings ("@user:server.tld")
+	// — never numeric, unlike Discord's snowflakes.
+	Admins        []string `json:"admins"`
+	Allowlist     []string `json:"allowlist"`
+	AllowlistFile string   `json:"allowlist_file"`
+
+	// E2EEnabled stages end-to-end encryption support as an explicit,
+	// separately-designed follow-up (DESIGN.md §2) — default false. NOT
+	// implemented by this design pass; validate() rejects true so an
+	// operator can never believe encryption is active when it isn't.
+	E2EEnabled bool `json:"e2e_enabled"`
+}
+
+// AccessToken resolves the Matrix access token from the configured env var.
+func (c *Config) MatrixAccessToken() (string, error) {
+	v := os.Getenv(c.Matrix.AccessTokenEnv)
+	if v == "" {
+		return "", fmt.Errorf("matrix access token env %s is not set", c.Matrix.AccessTokenEnv)
+	}
+	return v, nil
+}
+
+// MatrixPassword resolves the Matrix account password from the configured
+// env var, for the password-login auth shape (DESIGN.md §1).
+func (c *Config) MatrixPassword() (string, error) {
+	v := os.Getenv(c.Matrix.PasswordEnv)
+	if v == "" {
+		return "", fmt.Errorf("matrix password env %s is not set", c.Matrix.PasswordEnv)
+	}
+	return v, nil
+}
+
 // ClaudeConfig configures the Claude backend.
 type ClaudeConfig struct {
 	Socket string `json:"socket"` // unix socket the shim connects to
@@ -232,6 +298,22 @@ func (c *Config) validate() error {
 		// fail-closed means every guild is denied until at least one is
 		// listed, not that the combination itself is invalid. See
 		// DESIGN.md §5.
+	}
+	if c.Matrix.Enabled {
+		if c.Matrix.HomeserverURL == "" {
+			return fmt.Errorf("matrix: enabled but homeserver_url is empty — see internal/endpoint/matrix/DESIGN.md §1")
+		}
+		hasToken := c.Matrix.AccessTokenEnv != ""
+		hasLogin := c.Matrix.UserID != "" && c.Matrix.PasswordEnv != ""
+		if hasToken == hasLogin { // both set or neither set
+			return fmt.Errorf("matrix: exactly one of access_token_env or (user_id + password_env) must be set")
+		}
+		if len(c.Matrix.Admins) == 0 && len(c.Matrix.Allowlist) == 0 {
+			return fmt.Errorf("matrix: enabled but no admins or allowlist — the bot would serve nobody; add your Matrix user id to \"admins\"")
+		}
+		if c.Matrix.E2EEnabled {
+			return fmt.Errorf("matrix: e2e_enabled is not yet implemented — see internal/endpoint/matrix/DESIGN.md §2")
+		}
 	}
 	return nil
 }
