@@ -428,8 +428,8 @@ func TestConversationCap(t *testing.T) {
 	}
 	select {
 	case m := <-front.sent:
-		if !strings.Contains(m.Text, "token cap") {
-			t.Fatalf("expected a cap-hit notice, got %+v", m)
+		if !strings.Contains(m.Text, "token budget") || !strings.Contains(m.Text, "Limit:") || !strings.Contains(m.Text, "Used:") || !strings.Contains(m.Text, "Resets in:") {
+			t.Fatalf("expected a detailed cap-rejection notice (limit/used/reset), got %+v", m)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected a cap-hit notice to be sent to the conversation")
@@ -437,7 +437,9 @@ func TestConversationCap(t *testing.T) {
 
 	// Third message: now genuinely over cap - must be dropped BEFORE
 	// reaching the backend at all (no more inference spent on this
-	// conversation), and no further notice sent (only fires once).
+	// conversation), and a detailed notice sent AGAIN (Jean's explicit
+	// request, 2026-07-14: every rejection gets a notice, not just the
+	// first one - a conversation shouldn't go permanently silent).
 	front.recv <- Message{Role: User, Text: "should not reach backend", ConversationID: "999",
 		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
 	select {
@@ -448,9 +450,11 @@ func TestConversationCap(t *testing.T) {
 	}
 	select {
 	case m := <-front.sent:
-		t.Fatalf("expected no further notice after the cap was already hit once, got %+v", m)
-	case <-time.After(300 * time.Millisecond):
-		// good
+		if !strings.Contains(m.Text, "token budget") {
+			t.Fatalf("expected another detailed cap-rejection notice, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a notice on every rejection, not just the first")
 	}
 
 	// A DIFFERENT, uncapped conversation must be entirely unaffected.
