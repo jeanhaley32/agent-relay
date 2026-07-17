@@ -21,9 +21,9 @@ func (e Permanent) Unwrap() error { return e.Err }
 
 // Split breaks text into chunks no longer than limit runes, so a frontend
 // can deliver an oversized reply as multiple messages instead of permanently
-// dropping it — see the 2026-07-14 incident where a long reply silently
-// failed against Discord's 2000-char limit and the sender got no error and
-// no message. Returns a single-element slice unchanged if text already fits.
+// dropping it — a long reply silently failing against a platform's
+// per-message length limit leaves the sender with no error and no message.
+// Returns a single-element slice unchanged if text already fits.
 //
 // Prefers breaking on paragraph boundaries ("\n\n"), then single newlines,
 // then spaces, so chunks read naturally rather than splitting mid-word; only
