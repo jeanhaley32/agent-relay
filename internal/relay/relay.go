@@ -71,11 +71,15 @@ func DefaultEstimator(text string) int {
 }
 
 // FrontendSendTimeout bounds a single synchronous Frontend.Send call from the
-// backend-reply pump. Must stay equal to cmd/relay-shim's replyAckTimeout so
-// an outstanding send is deterministically classified as failed rather than
-// landing late and causing a duplicate reply; enforced by
+// backend-reply pump. Kept strictly shorter than cmd/relay-shim's
+// replyAckTimeout, not equal to it: the shim's clock starts when it emits the
+// reply frame, but this one only starts once the sequential backend-Recv
+// pump actually reaches this message, so an equal deadline would let the
+// broker cancel later than the shim already gave up - the send can then land
+// in that gap and deliver after the model was told it failed. A shorter
+// deadline here narrows but does not eliminate that window; enforced by
 // TestReplyAckTimeoutMatchesFrontendSendTimeout in cmd/relay-shim.
-const FrontendSendTimeout = 15 * time.Second
+const FrontendSendTimeout = 12 * time.Second
 
 // Broker connects a Frontend to a Backend, intercepting slash commands and
 // gating model turns through a budget Meter. It is the deterministic,
@@ -168,6 +172,12 @@ type Broker struct {
 
 	conversationUsedMu sync.Mutex
 	conversationUsed   map[string]*conversationWindow
+
+	// challengeMu guards challengeInFlight, which dedupes challengeSession
+	// per userID: a gated user who sends several messages before re-auth
+	// would otherwise get a fresh link and poller per message.
+	challengeMu       sync.Mutex
+	challengeInFlight map[string]bool
 }
 
 // SetCaps atomically replaces both ConversationCaps and
@@ -336,8 +346,27 @@ func (b *Broker) SetConversationUsage(chatID string, tokens int64) {
 const LockdownMessage = "This assistant is currently in lockdown - only admins can send messages right now. Try again later."
 
 // challengeSession sends a fresh tailnet re-auth link to the conversation
-// and, in the background, activates userID's session once approved.
+// and, in the background, activates userID's session once approved. A no-op
+// if a challenge for userID is already in flight, so a gated user sending
+// several messages before re-authing gets one link and one poller, not N.
 func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
+	b.challengeMu.Lock()
+	if b.challengeInFlight == nil {
+		b.challengeInFlight = map[string]bool{}
+	}
+	if b.challengeInFlight[userID] {
+		b.challengeMu.Unlock()
+		return
+	}
+	b.challengeInFlight[userID] = true
+	b.challengeMu.Unlock()
+
+	clearInFlight := func() {
+		b.challengeMu.Lock()
+		delete(b.challengeInFlight, userID)
+		b.challengeMu.Unlock()
+	}
+
 	ttl := b.SessionTTL
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
@@ -352,6 +381,7 @@ func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
 		"Session expired - re-authenticate over the tailnet, then resend your message: "+link))
 
 	go func() {
+		defer clearInFlight()
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		deadline := time.Now().Add(ttl)
@@ -400,15 +430,14 @@ func (b *Broker) Run(ctx context.Context) error {
 				}
 				continue // dropped (the gate func is responsible for logging)
 			}
-			// Bound the synchronous send to FrontendSendTimeout so it can never
-			// straddle the shim's reply-tool wait (replyAckTimeout in
-			// cmd/relay-shim/main.go, kept equal to this): without a matching
-			// deadline here, a slow-but-successful send (e.g. Discord's REST
-			// client's own ~20s default) can complete AFTER the shim has already
-			// given up and told the model to retry, causing a duplicate reply.
-			// Cancelling here at the same instant the shim times out means a
-			// send that hasn't landed by then is deterministically treated as
-			// failed and handed to the background retry queue instead.
+			// Bound the synchronous send to FrontendSendTimeout, kept strictly
+			// shorter than the shim's reply-tool wait (replyAckTimeout in
+			// cmd/relay-shim/main.go): without a deadline here, a slow-but-
+			// successful send (e.g. Discord's REST client's own ~20s default)
+			// can complete AFTER the shim has already given up and told the
+			// model to retry, causing a duplicate reply. Cancelling here before
+			// the shim's own deadline narrows that window, but doesn't close it
+			// entirely - see FrontendSendTimeout's doc.
 			sendCtx, cancel := context.WithTimeout(ctx, FrontendSendTimeout)
 			sendErr := b.Frontend.Send(sendCtx, m)
 			cancel()

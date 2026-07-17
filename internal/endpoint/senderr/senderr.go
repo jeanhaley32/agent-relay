@@ -4,11 +4,8 @@
 // retrying is guaranteed to reproduce the same failure (a missing
 // destination id, a 4xx that isn't a rate limit) as opposed to a transient
 // one (network blip, provider outage) that background retry can legitimately
-// fix.
-//
-// This was extracted out of internal/endpoint/telegram once a second
-// frontend (Discord) needed the identical type, to avoid two copies of the
-// same retry-classification logic silently drifting apart over time.
+// fix. Shared here so the frontends' retry classification can't silently
+// drift apart from each other.
 package senderr
 
 import "unicode/utf8"
