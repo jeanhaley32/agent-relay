@@ -176,8 +176,8 @@ type Broker struct {
 // SetCaps atomically replaces both ConversationCaps and
 // DefaultConversationCap - the only way either is mutated after Run starts.
 // Existing per-conversation usage/window state is left untouched, so a live
-// cap change (e.g. via cmd/relayd's /webhook/reload-caps) takes effect on
-// the very next message without resetting anyone's accumulated usage.
+// cap change takes effect on the very next message without resetting
+// anyone's accumulated usage.
 func (b *Broker) SetCaps(caps map[string]int64, defaultCap int64) {
 	b.capsMu.Lock()
 	defer b.capsMu.Unlock()
@@ -308,8 +308,8 @@ func (b *Broker) addConversationUsage(chatID string, tokens int) {
 
 // SetConversationUsage overwrites (does not add to) chatID's usage for the
 // current window with an authoritative real number - used by the token
-// attribution hook (scripts/token-usage-hook.py via cmd/relayd's
-// /webhook/token-usage) to replace the interim chars/4 text-length estimate
+// attribution hook (scripts/token-usage-hook.py) to replace the interim
+// chars/4 text-length estimate
 // with real per-conversation token usage pulled from the Claude API's own
 // usage data in the session transcript (the interim estimate undercounted
 // real usage by roughly 2-3x since it only sees reply text, not
@@ -433,10 +433,9 @@ func (b *Broker) Run(ctx context.Context) error {
 		// both are present. This holds by construction for every private
 		// 1:1 conversation on every current frontend (a Telegram private
 		// chat's id IS the sender's own id; Discord DMs synthesize chat_id
-		// = from_id for the same reason - see discord.go's gate() convID
-		// comment) - so for those it should never actually fire, which is
-		// what makes it a good tripwire there: a hit means some upstream
-		// assumption broke.
+		// = from_id for the same reason) - so for those it should never
+		// actually fire, which is what makes it a good tripwire there: a hit
+		// means some upstream assumption broke.
 		//
 		// Discord guild (multi-party) channels are a real, deliberate
 		// exception: chat_id there is the shared
