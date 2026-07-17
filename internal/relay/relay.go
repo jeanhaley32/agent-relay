@@ -140,14 +140,13 @@ type Broker struct {
 	// Set at construction only; mutated at runtime exclusively through
 	// SetCaps (capsMu-guarded), which cmd/relayd's /webhook/reload-caps
 	// calls to pick up config.json changes without a process restart
-	// (Jean's explicit request, 2026-07-14). nil map ⇒ no explicit caps.
+	// so caps can be tuned without a process restart. nil map ⇒ no explicit caps.
 	ConversationCaps map[string]int64
 
 	// DefaultConversationCap, if > 0, applies to any chat_id NOT explicitly
 	// listed in ConversationCaps and not exempted by ConversationCapExempt -
-	// a blanket per-individual cap (Jean's explicit request, 2026-07-14:
-	// "set our default cap to 300k per every three hours") rather than
-	// requiring every contact to be added by hand. Same construction/
+	// a blanket per-individual cap rather than requiring every contact to
+	// be added by hand. Same construction/
 	// SetCaps mutation rule as ConversationCaps.
 	DefaultConversationCap int64
 
@@ -160,9 +159,8 @@ type Broker struct {
 	ConversationCapExempt func(chatID string) bool
 
 	// ConversationCapWindow is how long a conversation's usage counts
-	// against its cap before rolling over to a fresh window (Jean's
-	// explicit request, 2026-07-14: "see the cap at every 3 hours" - a
-	// rate limit, not a lifetime ban). Zero ⇒ defaultConversationCapWindow.
+	// against its cap before rolling over to a fresh window - a rate limit,
+	// not a lifetime ban. Zero ⇒ defaultConversationCapWindow.
 	ConversationCapWindow time.Duration
 
 	// clock is overridden in tests; nil ⇒ time.Now.
@@ -262,10 +260,10 @@ func (b *Broker) conversationCapExceeded(chatID string) bool {
 }
 
 // conversationCapRejectionNotice builds the message sent to a conversation
-// every time a message is rejected for being at/over its cap - Jean's
-// explicit request, 2026-07-14: every rejection (not just the one that first
-// crosses the cap) should explain why, the limit, current usage, and time
-// until the window resets, rather than the conversation just going silent.
+// every time a message is rejected for being at/over its cap. Every
+// rejection (not just the one that first crosses the cap) explains why, the
+// limit, current usage, and time until the window resets, rather than the
+// conversation just going silent.
 func (b *Broker) conversationCapRejectionNotice(chatID string) string {
 	limit, _ := b.capLimit(chatID)
 	b.conversationUsedMu.Lock()
@@ -393,8 +391,9 @@ func (b *Broker) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		for m := range b.Backend.Recv() {
-			b.Meter.Record(b.Estimate(m.Text))
-			b.addConversationUsage(m.Meta["chat_id"], b.Estimate(m.Text))
+			estimate := b.Estimate(m.Text)
+			b.Meter.Record(estimate)
+			b.addConversationUsage(m.Meta["chat_id"], estimate)
 			// Outbound gate: the model may target any chat via its reply tool;
 			// only deliver to allowed chats.
 			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
@@ -490,9 +489,8 @@ func (b *Broker) Run(ctx context.Context) error {
 		// inference tokens entirely once it hits its limit - see
 		// ConversationCaps' doc comment. A detailed notice (reason, limit,
 		// usage, time to reset) is sent on EVERY rejection, not just the
-		// first time the cap is crossed (Jean's explicit request,
-		// 2026-07-14: a conversation going silent forever with no
-		// explanation is worse than a repeated notice).
+		// first time the cap is crossed: a conversation going silent forever
+		// with no explanation is worse than a repeated notice.
 		if b.conversationCapExceeded(m.Meta["chat_id"]) {
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, b.conversationCapRejectionNotice(m.Meta["chat_id"])))
 			continue

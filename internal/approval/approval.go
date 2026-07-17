@@ -4,8 +4,7 @@
 // approve page is bound to the tailnet interface, being able to load it is
 // itself proof the caller is on the tailnet - a stronger identity signal
 // than a Telegram chat_id alone, which is spoofable if that account is ever
-// compromised. See 2026-07-10 relay conversation with Jean for the design
-// rationale.
+// compromised.
 package approval
 
 import (
