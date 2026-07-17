@@ -127,8 +127,7 @@ func (e *Endpoint) SchedRespond(reqID, result, errText string) error {
 // ReplyRespond answers a pending reply frame by its correlation id, so the
 // reply tool call can surface a real delivery failure (e.g. Telegram's 4096-
 // char limit) back to the model instead of the fire-and-forget behavior that
-// let failed sends look successful. errText is
-// empty on success.
+// let failed sends look successful.
 func (e *Endpoint) ReplyRespond(reqID, errText string) error {
 	if reqID == "" {
 		return nil // caller (an older shim, or a reply with no correlation id) isn't waiting

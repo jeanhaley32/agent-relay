@@ -70,6 +70,12 @@ func DefaultEstimator(text string) int {
 	return n
 }
 
+// frontendSendTimeout bounds a single synchronous Frontend.Send call from the
+// backend-reply pump. Kept equal to replyAckTimeout in cmd/relay-shim/main.go
+// (the reply tool's own wait) so the two time out together — see the comment
+// at the call site.
+const frontendSendTimeout = 15 * time.Second
+
 // Broker connects a Frontend to a Backend, intercepting slash commands and
 // gating model turns through a budget Meter. It is the deterministic,
 // zero-token machinery that decides whether (and where) a message reaches a
@@ -403,7 +409,18 @@ func (b *Broker) Run(ctx context.Context) error {
 				}
 				continue // dropped (the gate func is responsible for logging)
 			}
-			sendErr := b.Frontend.Send(ctx, m)
+			// Bound the synchronous send to frontendSendTimeout so it can never
+			// straddle the shim's reply-tool wait (replyAckTimeout in
+			// cmd/relay-shim/main.go, kept equal to this): without a matching
+			// deadline here, a slow-but-successful send (e.g. Discord's REST
+			// client's own ~20s default) can complete AFTER the shim has already
+			// given up and told the model to retry, causing a duplicate reply.
+			// Cancelling here at the same instant the shim times out means a
+			// send that hasn't landed by then is deterministically treated as
+			// failed and handed to the background retry queue instead.
+			sendCtx, cancel := context.WithTimeout(ctx, frontendSendTimeout)
+			sendErr := b.Frontend.Send(sendCtx, m)
+			cancel()
 			if b.AckBackendReply != nil {
 				b.AckBackendReply(m, sendErr)
 			}

@@ -141,10 +141,12 @@ func replyReminder(chatID string) string {
 const schedTimeout = 10 * time.Second
 
 // replyAckTimeout bounds how long the reply tool call waits for the daemon
-// to confirm delivery. Generous relative to a normal Telegram round trip
-// (the daemon's own retry queue handles transient failures in the background
-// well past this window) - this just needs to catch fast, deterministic
-// failures like an oversized message, not ride out a real outage.
+// to confirm delivery. Generous relative to a normal Telegram/Discord round
+// trip, and kept equal to frontendSendTimeout in internal/relay/relay.go,
+// which bounds the daemon's own synchronous send with the same deadline -
+// that pairing is what lets a send that's still outstanding at this point be
+// deterministically classified as failed (and handed to the background retry
+// queue) rather than landing late and causing a duplicate reply.
 const replyAckTimeout = 15 * time.Second
 
 // registerScheduleTools adds the schedule_message/list_schedules/cancel_schedule
