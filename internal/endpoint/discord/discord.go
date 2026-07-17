@@ -48,11 +48,9 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
-// maxMessageLen is Discord's hard per-message character cap for a bot's
-// plain-text message (not 4096 like Telegram). Checked
-// before ever making the REST call; the resulting error is marked permanent
-// (senderr.Permanent) so it is never queued for retry: retrying an
-// oversized message just repeats the identical, guaranteed failure.
+// maxMessageLen is Discord's hard per-message character cap (not 4096 like
+// Telegram). Marked senderr.Permanent since retrying an oversized message
+// just repeats the same guaranteed failure.
 const maxMessageLen = 2000
 
 type permanentSendError = senderr.Permanent

@@ -25,13 +25,13 @@ func TestReplyReminder(t *testing.T) {
 }
 
 // TestReplyAckTimeoutMatchesFrontendSendTimeout enforces the cross-package
-// invariant asserted in both constants' comments: replyAckTimeout here and
-// relay.FrontendSendTimeout must stay equal, or a send still outstanding at
-// the shim's deadline stops being deterministically classifiable as failed,
-// risking a duplicate reply once the daemon's own send eventually lands.
+// invariant asserted in both constants' comments: relay.FrontendSendTimeout
+// must stay strictly less than replyAckTimeout here, so the broker gives up
+// on a send and hands it to background retry before the shim's own wait
+// expires.
 func TestReplyAckTimeoutMatchesFrontendSendTimeout(t *testing.T) {
-	if replyAckTimeout != relay.FrontendSendTimeout {
-		t.Fatalf("replyAckTimeout (%s) != relay.FrontendSendTimeout (%s) - these must be kept equal",
-			replyAckTimeout, relay.FrontendSendTimeout)
+	if relay.FrontendSendTimeout >= replyAckTimeout {
+		t.Fatalf("relay.FrontendSendTimeout (%s) must be strictly less than replyAckTimeout (%s)",
+			relay.FrontendSendTimeout, replyAckTimeout)
 	}
 }

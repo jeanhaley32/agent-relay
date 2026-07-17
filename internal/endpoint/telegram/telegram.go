@@ -29,12 +29,9 @@ import (
 const defaultBaseURL = "https://api.telegram.org"
 
 // maxMessageLen is Telegram's hard per-message character cap (sendMessage
-// rejects anything longer with HTTP 400 "message is too long"). Checked
-// before ever making the HTTP call, and the resulting error is marked
-// permanent (see permanentSendError) so it is never queued for retry -
-// retrying an oversized message just repeats the identical, guaranteed
-// failure, silently burning retry attempts before dropping the reply with
-// no error surfaced to the model that sent it.
+// rejects anything longer with HTTP 400 "message is too long"). Marked
+// permanent (see permanentSendError) since retrying an oversized message
+// just repeats the same guaranteed failure.
 const maxMessageLen = 4096
 
 // permanentSendError marks a Send failure as non-retryable: the same input

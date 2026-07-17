@@ -141,9 +141,10 @@ func replyReminder(chatID string) string {
 const schedTimeout = 10 * time.Second
 
 // replyAckTimeout bounds how long the reply tool call waits for the daemon
-// to confirm delivery. Must stay equal to relay.FrontendSendTimeout so a send
-// still outstanding at this point is deterministically classified as failed
-// rather than landing late and causing a duplicate reply; enforced by
+// to confirm delivery. Must stay strictly greater than relay.FrontendSendTimeout
+// so the broker's own send deadline expires first, narrowing (though not
+// eliminating - see relay.FrontendSendTimeout's doc) the window in which a
+// send lands after this call has already given up; enforced by
 // TestReplyAckTimeoutMatchesFrontendSendTimeout.
 const replyAckTimeout = 15 * time.Second
 
