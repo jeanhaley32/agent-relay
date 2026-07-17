@@ -330,15 +330,12 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
 // to m.ConversationID) via sendMessage. A message over Telegram's real limit
-// is split into multiple messages and sent in order (see senderr.Split)
-// rather than permanently dropped - the old behavior silently lost the whole
-// reply on anything over 4096 chars with no error surfaced to the sender.
-// Every chunk is attempted regardless of an earlier chunk's outcome - a
-// permanent failure on one chunk (e.g. a chat_id rejection uncovered mid-send)
-// must not abandon the remaining chunks, and a transient failure is already
-// queued for background retry by sendChunk, so skipping the rest would just
-// strand them. Only a permanent failure is returned to the caller (the first
-// one seen); transient failures are reported via the retry queue, not here.
+// is split into multiple messages (see senderr.Split) rather than permanently
+// dropped - the old behavior silently lost the whole reply on anything over
+// 4096 chars with no error surfaced to the sender. Every chunk is attempted
+// regardless of an earlier chunk's outcome, since a transient failure is
+// already queued by sendChunk and skipping the rest would just strand them;
+// only the first permanent failure is returned to the caller.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
@@ -531,8 +528,6 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 	}
 }
 
-// SendFailures, PermanentDrops, and QueueDepth expose retry-path counters
-// for the Prometheus /metrics endpoint.
 func (f *Frontend) SendFailures() int64   { return f.sendFailures.Load() }
 func (f *Frontend) PermanentDrops() int64 { return f.permanentDrops.Load() }
 func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }

@@ -637,17 +637,12 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 // Send delivers a message to the channel named by m.Meta["channel_id"]
 // (falling back to m.ConversationID) via the REST CreateMessage endpoint. A
 // message over Discord's real 2000-char limit is split into multiple
-// messages and sent in order (see senderr.Split) rather than permanently
-// dropped — the old behavior silently lost the whole reply with no error
-// surfaced to the sender. A missing channel_id or non-429 4xx is still
-// returned as-is and NOT queued for retry — see senderr.Permanent. Anything
-// else is assumed transient and gets queued for background retry, mirroring
-// telegram.Frontend.Send. Every chunk is attempted regardless of an earlier
-// chunk's outcome - a permanent failure on one chunk must not abandon the
-// remaining chunks, and a transient failure is already queued by sendChunk,
-// so skipping the rest would just strand them. Only a permanent failure is
-// returned to the caller (the first one seen); transient failures are
-// reported via the retry queue, not here.
+// messages (see senderr.Split) rather than permanently dropped — the old
+// behavior silently lost the whole reply with no error surfaced to the
+// sender. Every chunk is attempted regardless of an earlier chunk's outcome,
+// since a transient failure is already queued by sendChunk and skipping the
+// rest would just strand them; only the first permanent failure is returned
+// to the caller, mirroring telegram.Frontend.Send.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
@@ -893,8 +888,6 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 	}
 }
 
-// SendFailures, PermanentDrops, and QueueDepth expose retry-path counters for
-// the Prometheus /metrics endpoint.
 func (f *Frontend) SendFailures() int64   { return f.sendFailures.Load() }
 func (f *Frontend) PermanentDrops() int64 { return f.permanentDrops.Load() }
 func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }
