@@ -55,8 +55,6 @@ import (
 // oversized message just repeats the identical, guaranteed failure.
 const maxMessageLen = 2000
 
-// permanentSendError is the shared retry-classification type — see
-// internal/endpoint/senderr. Aliased locally so call sites read naturally.
 type permanentSendError = senderr.Permanent
 
 // Authorizer decides whether a sender may use the relay and records requests

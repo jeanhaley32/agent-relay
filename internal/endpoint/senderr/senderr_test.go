@@ -55,7 +55,9 @@ func TestSplitNoDataLoss(t *testing.T) {
 	}
 	rejoined := strings.Join(got, "")
 	// Splitting drops at most one separator rune (space/newline) between
-	// chunks, so allow for that when comparing lengths.
+	// chunks, so allow for that when comparing lengths. This is a
+	// deliberate whitespace normalization at boundaries, not a coverage
+	// gap: this test only asserts non-whitespace content is preserved.
 	if utf8.RuneCountInString(rejoined) < utf8.RuneCountInString(text)-len(got) {
 		t.Errorf("rejoined length %d too short vs original %d (%d chunks) - real content was lost",
 			utf8.RuneCountInString(rejoined), utf8.RuneCountInString(text), len(got))

@@ -20,9 +20,7 @@ type Claimer interface {
 // MultiFrontend fans multiple frontend Endpoints (e.g. Telegram + Discord)
 // into the single Frontend slot the Broker knows how to drive. The Broker
 // itself stays platform-agnostic; MultiFrontend is just wiring glue so
-// cmd/relayd can actually start more than one frontend at once — see
-// internal/endpoint/discord/DESIGN.md §9, "wiring is where the real
-// integration happens, not a follow-up."
+// cmd/relayd can actually start more than one frontend at once.
 //
 // Routing outbound Send calls back to the right underlying frontend is the
 // hard part: a relayd-originated message (scheduler reminder, admin notice,
@@ -39,7 +37,11 @@ type Claimer interface {
 type MultiFrontend struct {
 	frontends []Endpoint
 
-	mu    sync.RWMutex
+	mu sync.RWMutex
+	// owner grows one entry per distinct ConversationID ever seen inbound
+	// and is never purged, mirroring the Telegram/Discord convChannels
+	// pattern; bounded by the number of distinct conversations, so not a
+	// practical leak.
 	owner map[string]Endpoint
 
 	recv chan Message
