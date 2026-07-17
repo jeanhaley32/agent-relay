@@ -524,6 +524,14 @@ func (b *Broker) Run(ctx context.Context) error {
 		// usage, time to reset) is sent on EVERY rejection, not just the
 		// first time the cap is crossed: a conversation going silent forever
 		// with no explanation is worse than a repeated notice.
+		//
+		// The message that crosses the cap is charged via addConversationUsage
+		// below and then rejected by the re-check that follows it: it is never
+		// forwarded to the backend, but its estimate still counts against the
+		// conversation's usage. This is deliberate fail-safe behavior against a
+		// single huge message straddling the cap (reordering to check-only
+		// would let an unbounded message through once, since nothing would
+		// have charged it yet to trip the cap).
 		if b.conversationCapExceeded(m.Meta["chat_id"]) {
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, b.conversationCapRejectionNotice(m.Meta["chat_id"])))
 			continue
