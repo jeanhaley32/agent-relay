@@ -72,12 +72,8 @@ func DefaultEstimator(text string) int {
 
 // FrontendSendTimeout bounds a single synchronous Frontend.Send call from the
 // backend-reply pump. Kept strictly shorter than cmd/relay-shim's
-// replyAckTimeout, not equal to it: the shim's clock starts when it emits the
-// reply frame, but this one only starts once the sequential backend-Recv
-// pump actually reaches this message, so an equal deadline would let the
-// broker cancel later than the shim already gave up - the send can then land
-// in that gap and deliver after the model was told it failed. A shorter
-// deadline here narrows but does not eliminate that window.
+// replyAckTimeout so the broker can't cancel later than the shim already
+// gave up, which would let a send land after the model was told it failed.
 const FrontendSendTimeout = 12 * time.Second
 
 // Broker connects a Frontend to a Backend, intercepting slash commands and
@@ -112,14 +108,11 @@ type Broker struct {
 
 	// Session gate: if Session and Approval are both set, inbound messages
 	// from any user_id (from_id) in SessionGatedUsers require an active,
-	// non-idle-expired session before being processed - independently
-	// tracked per user, so one admin's idle timeout doesn't affect
-	// another's. Keyed on the sender's permanent account id, not chat_id,
-	// since chat_id only equals from_id by convention and that equivalence
-	// shouldn't be load-bearing here. An expired/missing session triggers a
+	// non-idle-expired session before being processed, keyed on the
+	// sender's permanent account id (not chat_id, which only equals
+	// from_id by convention). An expired/missing session triggers a
 	// tailnet re-auth challenge (via Approval) instead of processing the
-	// message; the sender must click the approval link, then resend. nil
-	// Session ⇒ no gating (all other senders are unaffected regardless).
+	// message. nil Session ⇒ no gating.
 	Session           *session.Manager
 	Approval          *approval.Manager
 	SessionGatedUsers map[string]bool
@@ -133,14 +126,9 @@ type Broker struct {
 
 	// ConversationCaps optionally bounds cumulative estimated tokens for a
 	// specific chat_id within a rolling ConversationCapWindow, independent
-	// of and tighter than the global Meter budget - for a specific contact
-	// (e.g. an allowlisted-but-non-admin user testing how much inference the
-	// relay would spend on an open-ended request) rather than the whole
-	// relay. Both directions count against the cap: an inbound message's
-	// estimate is added before it's forwarded to the backend, and a reply's
-	// estimate is added when it comes back. Set at construction only;
-	// mutated at runtime exclusively through SetCaps (capsMu-guarded), to
-	// pick up config changes without a process restart. nil map ⇒ no
+	// of and tighter than the global Meter budget - per-contact spend
+	// limiting rather than relay-wide. Mutate only via SetCaps (capsMu
+	// guarded) so config changes apply without a restart. nil map ⇒ no
 	// explicit caps.
 	ConversationCaps map[string]int64
 

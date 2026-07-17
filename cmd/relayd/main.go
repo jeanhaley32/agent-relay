@@ -450,13 +450,6 @@ func main() {
 	logger.Printf("stopped")
 }
 
-// mustStartDiscord builds the Discord frontend from cfg.Discord, connects
-// its gateway, and returns it along with the access.Manager backing its
-// allowlist (so the caller can also consult it for outbound gating).
-// Fatal on error, mirroring the Telegram handshake's posture: an operator
-// who set discord.enabled=true with a bad token/config wants a clear
-// startup failure, not a frontend that silently never came up (the exact
-// gap this function exists to close - see DESIGN.md's wiring/startup design).
 // ackErrText classifies a Send outcome for AckBackendReply: only a permanent
 // failure (senderr.Permanent) is surfaced as an error string - Frontend.Send
 // also returns an error for transient failures that it has already queued
@@ -471,6 +464,13 @@ func ackErrText(sendErr error) string {
 	return ""
 }
 
+// mustStartDiscord builds the Discord frontend from cfg.Discord, connects
+// its gateway, and returns it along with the access.Manager backing its
+// allowlist (so the caller can also consult it for outbound gating).
+// Fatal on error, mirroring the Telegram handshake's posture: an operator
+// who set discord.enabled=true with a bad token/config wants a clear
+// startup failure, not a frontend that silently never came up (the exact
+// gap this function exists to close - see DESIGN.md's wiring/startup design).
 func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend, *access.Manager) {
 	token, err := cfg.DiscordToken()
 	if err != nil {
