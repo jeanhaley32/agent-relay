@@ -58,7 +58,20 @@ func main() {
 			`handled a fired trigger, call ack_event with its id and a short note of what you did, `+
 			`or it will keep escalating; list_pending_events shows what is still open.`,
 		func(_ context.Context, chatID, text string) error {
-			return cl.send(ipc.Frame{Kind: ipc.KindReply, ChatID: chatID, Text: text})
+			// Request/response (not fire-and-forget send): the daemon answers
+			// with a reply_ack frame carrying the real delivery outcome (e.g.
+			// Telegram's 4096-char limit), so a failed send surfaces as a
+			// genuine tool error the model can react to - split the message,
+			// retry, etc. - instead of always looking like "sent" (real
+			// incident 2026-07-11).
+			resp, err := cl.request(ipc.Frame{Kind: ipc.KindReply, ChatID: chatID, Text: text}, replyAckTimeout)
+			if err != nil {
+				return err
+			}
+			if resp.Err != "" {
+				return errors.New(resp.Err)
+			}
+			return nil
 		})
 	srv.EnablePermissionRelay(func(req channel.PermissionRequest) {
 		detail := req.Description
@@ -96,7 +109,7 @@ func main() {
 			if err := srv.SendVerdict(f.RequestID, f.Allow); err != nil {
 				logger.Printf("send verdict error: %v", err)
 			}
-		case ipc.KindSchedResp:
+		case ipc.KindSchedResp, ipc.KindReplyAck:
 			cl.resolve(f)
 		}
 	}
@@ -127,6 +140,13 @@ func replyReminder(chatID string) string {
 
 // schedTimeout bounds how long a schedule tool waits for the daemon to answer.
 const schedTimeout = 10 * time.Second
+
+// replyAckTimeout bounds how long the reply tool call waits for the daemon
+// to confirm delivery. Generous relative to a normal Telegram round trip
+// (the daemon's own retry queue handles transient failures in the background
+// well past this window) - this just needs to catch fast, deterministic
+// failures like an oversized message, not ride out a real outage.
+const replyAckTimeout = 15 * time.Second
 
 // registerScheduleTools adds the schedule_message/list_schedules/cancel_schedule
 // tools. Each turns a call into a sched_req frame, waits for the daemon's
