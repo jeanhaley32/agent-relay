@@ -49,7 +49,8 @@ import (
 )
 
 // maxMessageLen is Discord's hard per-message character cap for a bot's
-// plain-text message (not 4096 like Telegram — see DESIGN.md §4). Checked
+// plain-text message (not 4096 like Telegram — see DESIGN.md's message-length
+// handling design). Checked
 // before ever making the REST call; the resulting error is marked permanent
 // (senderr.Permanent) so it is never queued for retry: retrying an
 // oversized message just repeats the identical, guaranteed failure.
@@ -177,7 +178,7 @@ type Frontend struct {
 	queueDepth     atomic.Int64
 
 	// gatewayReconnects / lastGatewayEventAt are Discord's analogues of
-	// Telegram's getUpdatesFailures/lastPollSuccess (DESIGN.md §6): the
+	// Telegram's getUpdatesFailures/lastPollSuccess (DESIGN.md's gateway health-signal design): the
 	// signal that detects a Discord-side outage independent of whether any
 	// outbound Send happened to occur during it. gatewayReconnects counts
 	// only non-resumable reconnects (fresh IDENTIFY, not RESUME) since those
@@ -367,7 +368,7 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		// Ready fires on every fresh IDENTIFY (non-resumed reconnect,
 		// including the very first connect); Resumed fires on a successful
 		// RESUME. Both are "the gateway is alive" signals for
-		// lastGatewayEventAt (DESIGN.md §6 says "any gateway event", not just
+		// lastGatewayEventAt (DESIGN.md's gateway health-signal design says "any gateway event", not just
 		// inbound messages — a quiet channel with a healthy gateway shouldn't
 		// look wedged). Only Ready increments gatewayReconnects: a RESUME
 		// doesn't risk a message gap or burn IDENTIFY budget the way a fresh
@@ -575,13 +576,16 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 // discordSnowflakeFloor is a lower bound on any snowflake id minted by the
 // real Discord network today. Discord's snowflake epoch is 2015-01-01; the
 // timestamp component occupies the high 42 bits (shifted left 22), so any id
-// generated since roughly 2020 already exceeds 1e17. Telegram chat/user ids
-// (int64, but in practice at most a handful of digits, or negative for
-// groups/supergroups) never reach this magnitude. Used by
+// generated since roughly 2020 already exceeds 1e17. Telegram document ids as
+// int64, which can in principle occupy up to 52 bits (~4.5e15) - above this
+// floor - so this heuristic is not a proof, only a practical disambiguator:
+// real Telegram chat/user ids in use here are far smaller (a handful of
+// digits, or negative for groups/supergroups), so a collision would require a
+// Telegram id in a range Telegram doesn't currently hand out. Used by
 // OwnsConversationID to disambiguate a bare numeric ConversationID between
 // frontends when relay.MultiFrontend has never seen it delivered inbound —
 // see relay.Claimer's doc comment.
-const discordSnowflakeFloor = 1_000_000_000_000_000 // 1e15, well below current real ids, well above any Telegram id
+const discordSnowflakeFloor = 1_000_000_000_000_000 // 1e15, well below current real Discord ids, well above real-world Telegram ids
 
 // OwnsConversationID implements relay.Claimer: it reports whether id is
 // plausibly a Discord conversation id (DM user id or guild channel id) based
@@ -634,21 +638,30 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 // message over Discord's real 2000-char limit is split into multiple
 // messages and sent in order (see senderr.Split) rather than permanently
 // dropped — the old behavior silently lost the whole reply with no error
-// surfaced to the sender. A missing channel_id or
-// non-429 4xx is still returned as-is and NOT queued for retry — see
-// senderr.Permanent. Anything else is assumed transient and gets queued for
-// background retry, mirroring telegram.Frontend.Send.
+// surfaced to the sender. A missing channel_id or non-429 4xx is still
+// returned as-is and NOT queued for retry — see senderr.Permanent. Anything
+// else is assumed transient and gets queued for background retry, mirroring
+// telegram.Frontend.Send. Every chunk is attempted regardless of an earlier
+// chunk's outcome - a permanent failure on one chunk must not abandon the
+// remaining chunks, and a transient failure is already queued by sendChunk,
+// so skipping the rest would just strand them. Only a permanent failure is
+// returned to the caller (the first one seen); transient failures are
+// reported via the retry queue, not here.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
+		var permErr error
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
 			if err := f.sendChunk(ctx, cm); err != nil {
-				return err
+				var perm permanentSendError
+				if errors.As(err, &perm) && permErr == nil {
+					permErr = err
+				}
 			}
 		}
-		return nil
+		return permErr
 	}
 	return f.sendChunk(ctx, m)
 }
@@ -741,7 +754,7 @@ func (f *Frontend) resolveChannel(ctx context.Context, m relay.Message) (snowfla
 
 // sendOnce is the actual single REST attempt — both Send() and the retry
 // worker call this, so there's exactly one code path that talks to Discord.
-// Per DESIGN.md §4, rate-limit (429) handling is intentionally NOT
+// Per DESIGN.md's message-length handling design, rate-limit (429) handling is intentionally NOT
 // duplicated here: disgo's REST client already parses Discord's
 // X-RateLimit-* headers and per-route buckets, which is the whole reason
 // disgo was chosen over discordgo. This only classifies the resulting error
@@ -890,7 +903,7 @@ func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }
 func (f *Frontend) RecvDrops() int64 { return f.recvDrops.Load() }
 
 // GatewayReconnects and LastGatewayEventAt expose the gateway connection
-// health signal — DESIGN.md §6's analogue of Telegram's
+// health signal — the gateway-health-signal design's analogue of Telegram's
 // GetUpdatesFailures/LastPollSuccess.
 func (f *Frontend) GatewayReconnects() int64  { return f.gatewayReconnects.Load() }
 func (f *Frontend) LastGatewayEventAt() int64 { return f.lastGatewayEventAt.Load() }

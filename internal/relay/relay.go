@@ -438,7 +438,8 @@ func (b *Broker) Run(ctx context.Context) error {
 		// assumption broke.
 		//
 		// Discord guild (multi-party) channels are a real, deliberate
-		// exception (DESIGN.md §3 Option A): chat_id there is the shared
+		// exception (DESIGN.md's guild chat_id/from_id divergence design):
+		// chat_id there is the shared
 		// channel id, necessarily distinct from whichever member's from_id
 		// sent a given message. gate() marks any such message with
 		// Meta["guild_id"] so the invariant is enforced only for messages

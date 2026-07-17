@@ -335,19 +335,27 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 // is split into multiple messages and sent in order (see senderr.Split)
 // rather than permanently dropped - the old behavior silently lost the whole
 // reply on anything over 4096 chars with no error surfaced to the sender.
-// Sending stops at the first chunk that fails, so a partial reply can still
-// land instead of nothing.
+// Every chunk is attempted regardless of an earlier chunk's outcome - a
+// permanent failure on one chunk (e.g. a chat_id rejection uncovered mid-send)
+// must not abandon the remaining chunks, and a transient failure is already
+// queued for background retry by sendChunk, so skipping the rest would just
+// strand them. Only a permanent failure is returned to the caller (the first
+// one seen); transient failures are reported via the retry queue, not here.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
+		var permErr error
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
 			if err := f.sendChunk(ctx, cm); err != nil {
-				return err
+				var perm permanentSendError
+				if errors.As(err, &perm) && permErr == nil {
+					permErr = err
+				}
 			}
 		}
-		return nil
+		return permErr
 	}
 	return f.sendChunk(ctx, m)
 }
