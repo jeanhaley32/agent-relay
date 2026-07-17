@@ -333,7 +333,7 @@ func main() {
 	// Surface the real Send outcome back to the reply tool call that
 	// originated it (by RequestID, carried in Meta["reply_id"]), instead of
 	// the tool call always returning "sent" regardless of what actually
-	// happened - real incident 2026-07-11, see AckBackendReply's doc comment.
+	// happened; see AckBackendReply's doc comment.
 	// Only a permanent failure (senderr.Permanent) is surfaced as a failure
 	// here - Frontend.Send also returns an error for transient failures that
 	// it has already queued for background retry, and telling the model those
