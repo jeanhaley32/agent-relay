@@ -133,7 +133,6 @@ func (m *Manager) Consume(token, actionHash string) (status, bool) {
 	return StatusApproved, true
 }
 
-// create makes a new pending request and returns its token and approval link.
 func (m *Manager) create(desc, actionHash string, ttl time.Duration) (token, link string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
