@@ -34,3 +34,4 @@ schedules.json.events
 # runtime session-id capture for ops/reboot-relay-safe.sh (per-boot artifact, not source)
 .relay_session_id
 __pycache__/
+/relay-shim
