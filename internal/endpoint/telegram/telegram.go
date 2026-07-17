@@ -81,8 +81,7 @@ type Frontend struct {
 	permanentDrops atomic.Int64 // gave up after maxRetryAttempts
 	queueDepth     atomic.Int64
 
-	// getUpdatesFailures/lastPollSuccess are the real signal that would have
-	// caught the ~1h outage this whole retry-queue feature was built for:
+	// getUpdatesFailures/lastPollSuccess are the real signal for an outage:
 	// polling is how relayd actually finds out whether Telegram is reachable
 	// at all, independent of whether anything happened to be sent during
 	// the outage.
@@ -447,6 +446,7 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 		select {
 		case <-f.retryQueue:
 			f.queueDepth.Add(-1)
+			f.permanentDrops.Add(1)
 		default:
 		}
 		select {
@@ -457,9 +457,9 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 	}
 }
 
-// retryBackoff is exponential with a cap, so a sustained outage (like the
-// real ~1h one that motivated this) doesn't hammer Telegram's API uselessly,
-// but a brief blip still retries fast enough to matter.
+// retryBackoff is exponential with a cap, so a sustained outage doesn't
+// hammer Telegram's API uselessly, but a brief blip still retries fast
+// enough to matter.
 func retryBackoff(attempts int) time.Duration {
 	d := time.Duration(1<<uint(attempts)) * time.Second
 	if d > 5*time.Minute {
