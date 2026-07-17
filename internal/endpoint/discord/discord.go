@@ -144,8 +144,8 @@ type Frontend struct {
 	// convChannels remembers, for every ConversationID gate() has ever seen
 	// inbound, which physical channel id it maps to. sendOnce falls back to
 	// this when a caller-constructed relay.Message (scheduled reminder, admin
-	// notice, mcp reply — see cmd/relayd/main.go) carries only ConversationID/
-	// chat_id and no Meta["channel_id"] at all.
+	// notice, mcp reply) carries only ConversationID/chat_id and no
+	// Meta["channel_id"] at all.
 	convChannels sync.Map // ConversationID (string) -> snowflake.ID
 
 	// dmConvs marks which convChannels entries are DMs (chatID == sender user
@@ -181,6 +181,7 @@ type Frontend struct {
 	// only non-resumable reconnects (fresh IDENTIFY, not RESUME) since those
 	// are the ones that risk a message gap and burn IDENTIFY budget.
 	gatewayReconnects  atomic.Int64
+	sawReady           atomic.Bool  // gates the first Ready (initial connect, not a reconnect) out of gatewayReconnects
 	lastGatewayEventAt atomic.Int64 // unix seconds
 
 	// recvDrops counts inbound messages dropped because f.recv was still full
@@ -367,12 +368,17 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		// RESUME. Both are "the gateway is alive" signals for
 		// lastGatewayEventAt: any gateway event counts, not just
 		// inbound messages — a quiet channel with a healthy gateway shouldn't
-		// look wedged). Only Ready increments gatewayReconnects: a RESUME
-		// doesn't risk a message gap or burn IDENTIFY budget the way a fresh
-		// session does, so it's deliberately not counted (see field doc).
+		// look wedged). Only Ready increments gatewayReconnects, and only
+		// from the second one onward: the first Ready is the initial connect,
+		// not a reconnect, so counting it would make the metric read 1 after
+		// every clean startup with zero actual reconnects. A RESUME doesn't
+		// risk a message gap or burn IDENTIFY budget the way a fresh session
+		// does, so it's deliberately not counted either (see field doc).
 		bot.WithEventListenerFunc(func(e *events.Ready) {
 			f.lastGatewayEventAt.Store(time.Now().Unix())
-			f.gatewayReconnects.Add(1)
+			if f.sawReady.Swap(true) {
+				f.gatewayReconnects.Add(1)
+			}
 		}),
 		bot.WithEventListenerFunc(func(e *events.Resumed) {
 			f.lastGatewayEventAt.Store(time.Now().Unix())

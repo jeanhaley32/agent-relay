@@ -43,10 +43,10 @@ func Split(text string, limit int) []string {
 		cut := bestBreak(remaining, limit)
 		chunks = append(chunks, remaining[:cut])
 		remaining = remaining[cut:]
-		// bestBreak already cuts past the separator it broke on, so this only
-		// fires when that separator repeats (e.g. "\n\n\n" or two spaces) and
-		// leaves one more of the same rune dangling at the new start; drop it
-		// so chunks don't accumulate leading whitespace.
+		// bestBreak cuts past the separator it broke on, but a repeated
+		// separator (e.g. "\n\n\n") or a hard rune-count fallback landing
+		// right before one can still leave a lone separator dangling at the
+		// new start; drop it so chunks don't accumulate leading whitespace.
 		remaining = trimOneLeadingSeparator(remaining)
 	}
 	if remaining != "" {
