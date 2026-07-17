@@ -43,10 +43,10 @@ func Split(text string, limit int) []string {
 		cut := bestBreak(remaining, limit)
 		chunks = append(chunks, remaining[:cut])
 		remaining = remaining[cut:]
-		// Drop exactly one leading separator rune left dangling by the break
-		// (the newline/space we split on), so chunks don't accumulate
-		// leading whitespace - but only if there's actually a separator
-		// there, since a hard mid-word cut leaves none to drop.
+		// bestBreak already cuts past the separator it broke on, so this only
+		// fires when that separator repeats (e.g. "\n\n\n" or two spaces) and
+		// leaves one more of the same rune dangling at the new start; drop it
+		// so chunks don't accumulate leading whitespace.
 		remaining = trimOneLeadingSeparator(remaining)
 	}
 	if remaining != "" {
