@@ -332,12 +332,11 @@ func New(token string, opts ...Option) (*Frontend, error) {
 // without ever dialing Discord, keeping this endpoint unit-testable without
 // a real bot token.
 //
-// recv is closed from Close() (the same goroutine group as f.cancel, which
-// disgo's callbacks are NOT running under), not from a goroutine racing
-// ctx.Done() against onMessageCreate's own `f.recv <- msg` sends — the
-// previous version closed recv from a separate goroutine watching ctx.Done,
-// which could fire while disgo was still mid-delivery of a callback,
-// panicking on a send-to-closed-channel.
+// recv must not be closed until the gateway's dispatch loop has stopped,
+// or onMessageCreate can send-to-closed-channel; recv is therefore closed
+// from Close() only, after client.Close() has blocked until disgo's
+// callbacks have all returned — never from a goroutine racing ctx.Done()
+// against onMessageCreate's own `f.recv <- msg` sends.
 //
 // IMPORTANT — Close() does NOT cancel the ctx given here. The ctx passed to
 // Connect is only used for the initial client.OpenGateway(ctx) dial; f.cancel
@@ -435,11 +434,10 @@ func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 // Close stops the frontend: closes the gateway with a clean close frame
 // (which blocks until disgo's event-dispatch loop has stopped, so no
 // onMessageCreate callback can still be in flight afterward), THEN closes
-// f.recv, THEN cancels the retry worker's context. Ordering matters: closing
-// recv before the gateway is guaranteed stopped is what caused the
-// send-on-closed-channel panic this replaces (a separate goroutine raced
-// ctx.Done() against onMessageCreate's own `f.recv <- msg`). recvOnce also
-// guards against a double-close if Close is ever called twice.
+// f.recv, THEN cancels the retry worker's context. Ordering matters: recv
+// must not be closed until the gateway's dispatch loop is guaranteed
+// stopped, or onMessageCreate can still send-to-closed-channel. recvOnce
+// also guards against a double-close if Close is ever called twice.
 func (f *Frontend) Close() error {
 	if f.client != nil {
 		f.client.Close(context.Background())
@@ -798,7 +796,8 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 // Non-blocking: if the queue is full (a genuinely extreme backlog), the
 // oldest-in-flight item is dropped rather than blocking the caller, which
 // would stall the whole relay - a bounded, honest failure mode instead of
-// unbounded memory growth or a hung sender.
+// unbounded memory growth or a hung sender. The evicted item is counted in
+// permanentDrops so it's visible on /metrics rather than a silent drop.
 func (f *Frontend) enqueueRetry(m relay.Message) {
 	item := retryItem{msg: m, attempts: 0, nextAt: time.Now().Add(retryBackoff(0))}
 	select {
@@ -809,6 +808,7 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 		select {
 		case <-f.retryQueue:
 			f.queueDepth.Add(-1)
+			f.permanentDrops.Add(1)
 		default:
 		}
 		select {
