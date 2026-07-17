@@ -665,9 +665,9 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	return f.sendChunk(ctx, m)
 }
 
-// sendChunk is Send's single-message path — the pre-split body of what used
-// to be Send, still doing the retry/permanent-failure classification for one
-// already-within-limit message.
+// sendChunk sends one already-within-limit message, classifying the result
+// as permanent failure (returned as-is) or transient (queued for background
+// retry).
 func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	err := f.sendOnce(ctx, m)
 	if err == nil {
@@ -822,8 +822,7 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 	}
 }
 
-// retryBackoff is exponential with a cap — identical policy to telegram.go's
-// retryBackoff.
+// retryBackoff is exponential with a cap.
 func retryBackoff(attempts int) time.Duration {
 	d := time.Duration(1<<uint(attempts)) * time.Second
 	if d > 5*time.Minute {
@@ -833,8 +832,7 @@ func retryBackoff(attempts int) time.Duration {
 }
 
 // startRetryWorker runs until ctx is cancelled, periodically attempting to
-// redeliver queued messages. Call once per Frontend. Structurally identical
-// to telegram.go's startRetryWorker.
+// redeliver queued messages. Call once per Frontend.
 func (f *Frontend) startRetryWorker(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -894,7 +892,7 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 }
 
 // SendFailures, PermanentDrops, and QueueDepth expose retry-path counters for
-// the Prometheus /metrics endpoint — same semantics as telegram.go.
+// the Prometheus /metrics endpoint.
 func (f *Frontend) SendFailures() int64   { return f.sendFailures.Load() }
 func (f *Frontend) PermanentDrops() int64 { return f.permanentDrops.Load() }
 func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }

@@ -384,7 +384,6 @@ func (t *Tracker) Reconcile(now time.Time) {
 	changed := false
 	for id, ev := range t.events {
 		if ev.Status != StatusPending {
-			// Prune acknowledged events past the retention window.
 			if !ev.AckedAt.IsZero() && now.Sub(ev.AckedAt) > t.cfg.Retention {
 				delete(t.events, id)
 				changed = true

@@ -62,8 +62,7 @@ func main() {
 			// with a reply_ack frame carrying the real delivery outcome (e.g.
 			// Telegram's 4096-char limit), so a failed send surfaces as a
 			// genuine tool error the model can react to - split the message,
-			// retry, etc. - instead of always looking like "sent" (real
-			// incident 2026-07-11).
+			// retry, etc. - instead of always looking like "sent".
 			resp, err := cl.request(ipc.Frame{Kind: ipc.KindReply, ChatID: chatID, Text: text}, replyAckTimeout)
 			if err != nil {
 				return err
