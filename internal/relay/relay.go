@@ -77,8 +77,7 @@ func DefaultEstimator(text string) int {
 // pump actually reaches this message, so an equal deadline would let the
 // broker cancel later than the shim already gave up - the send can then land
 // in that gap and deliver after the model was told it failed. A shorter
-// deadline here narrows but does not eliminate that window; enforced by
-// TestReplyAckTimeoutMatchesFrontendSendTimeout in cmd/relay-shim.
+// deadline here narrows but does not eliminate that window.
 const FrontendSendTimeout = 12 * time.Second
 
 // Broker connects a Frontend to a Backend, intercepting slash commands and
