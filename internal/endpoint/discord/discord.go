@@ -51,8 +51,8 @@ import (
 // maxMessageLen is Discord's hard per-message character cap for a bot's
 // plain-text message (not 4096 like Telegram — see DESIGN.md §4). Checked
 // before ever making the REST call; the resulting error is marked permanent
-// (senderr.Permanent) so it is never queued for retry, mirroring the
-// Telegram maxMessageLen incident this pattern was built to prevent.
+// (senderr.Permanent) so it is never queued for retry: retrying an
+// oversized message just repeats the identical, guaranteed failure.
 const maxMessageLen = 2000
 
 // permanentSendError is the shared retry-classification type — see
@@ -404,11 +404,11 @@ func (f *Frontend) Connect(ctx context.Context) error {
 // treats a nonzero value as proof the connection is alive, refreshing
 // lastGatewayEventAt independent of Ready/Resumed/message traffic. Without
 // this, a healthy but quiet DM-only bot (no reconnects, no new messages) goes
-// "stale" by lastGatewayEventAt after any 5+ minute lull — a real false
-// positive the Discord Connectivity Lost alert hit on 2026-07-14, since
-// Ready/Resumed only fire on (re)connect, not on an ongoing idle-but-healthy
-// session. 30s poll interval, well under the alert's 5-minute threshold, so a
-// genuinely dead gateway (Latency() staying 0) still goes stale and fires.
+// "stale" by lastGatewayEventAt after any 5+ minute lull — a false positive,
+// since Ready/Resumed only fire on (re)connect, not on an ongoing
+// idle-but-healthy session. 30s poll interval, well under the alert's
+// 5-minute threshold, so a genuinely dead gateway (Latency() staying 0)
+// still goes stale and fires.
 func (f *Frontend) watchHeartbeat(client *bot.Client) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -634,7 +634,7 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 // message over Discord's real 2000-char limit is split into multiple
 // messages and sent in order (see senderr.Split) rather than permanently
 // dropped — the old behavior silently lost the whole reply with no error
-// surfaced to the sender (2026-07-14 incident). A missing channel_id or
+// surfaced to the sender. A missing channel_id or
 // non-429 4xx is still returned as-is and NOT queued for retry — see
 // senderr.Permanent. Anything else is assumed transient and gets queued for
 // background retry, mirroring telegram.Frontend.Send.
@@ -762,9 +762,8 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 		// Log the real Discord message id Discord itself assigned, so a
 		// "the daemon said success" claim can be cross-checked directly
 		// against the platform afterward (e.g. via GET .../messages) rather
-		// than trusting the ack alone — see the 2026-07-14 incident where a
-		// reply_ack reported success but the message never actually
-		// appeared in the channel history.
+		// than trusting the ack alone: a reply_ack can report success while
+		// the message never actually appears in the channel history.
 		f.logger.Printf("discord send ok: channel=%s message=%s", channelID, sent.ID)
 		return nil
 	}
@@ -778,8 +777,7 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 		// malformed/too-long, 403 missing SEND_MESSAGES permission, 404
 		// unknown/deleted channel) fails identically on retry, so it's
 		// classified permanent rather than burning maxRetryAttempts
-		// retries on a guaranteed-repeat failure — see maxMessageLen's
-		// sibling incident in telegram.go.
+		// retries on a guaranteed-repeat failure.
 		if status/100 == 4 && status != http.StatusTooManyRequests {
 			return permanentSendError{Err: fmt.Errorf("discord CreateMessage status %d: %s", status, restErr.Message)}
 		}
@@ -834,7 +832,12 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-f.retryQueue:
-			f.queueDepth.Add(-1)
+			// Deliberately not decremented here: the item is moving from the
+			// channel into the in-worker pending slice, not leaving the
+			// backlog. queueDepth is only decremented once an item is fully
+			// resolved (sent, dropped permanent, or exhausted), so the
+			// exported gauge reflects the whole retry backlog, not just
+			// what's still sitting in the channel buffer.
 			pending = append(pending, item)
 		case <-ticker.C:
 			now := time.Now()
@@ -848,12 +851,22 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 				err := f.sendOnce(sendCtx, item.msg)
 				cancel()
 				if err == nil {
+					f.queueDepth.Add(-1)
 					f.logger.Printf("discord retry succeeded after %d attempt(s) for channel %s",
 						item.attempts+1, item.msg.Meta["channel_id"])
 					continue
 				}
+				var perm permanentSendError
+				if errors.As(err, &perm) {
+					f.queueDepth.Add(-1)
+					f.permanentDrops.Add(1)
+					f.logger.Printf("discord retry gave up (permanent failure) for channel %s: %v",
+						item.msg.Meta["channel_id"], err)
+					continue
+				}
 				item.attempts++
 				if item.attempts >= maxRetryAttempts {
+					f.queueDepth.Add(-1)
 					f.permanentDrops.Add(1)
 					f.logger.Printf("discord retry gave up after %d attempts for channel %s: %v",
 						item.attempts, item.msg.Meta["channel_id"], err)
