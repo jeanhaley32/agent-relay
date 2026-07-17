@@ -124,6 +124,24 @@ func (e *Endpoint) SchedRespond(reqID, result, errText string) error {
 	return c.Send(ipc.Frame{Kind: ipc.KindSchedResp, RequestID: reqID, Result: result, Err: errText})
 }
 
+// ReplyRespond answers a pending reply frame by its correlation id, so the
+// reply tool call can surface a real delivery failure (e.g. Telegram's 4096-
+// char limit) back to the model instead of the fire-and-forget behavior that
+// let failed sends look successful (real incident 2026-07-11). errText is
+// empty on success.
+func (e *Endpoint) ReplyRespond(reqID, errText string) error {
+	if reqID == "" {
+		return nil // caller (an older shim, or a reply with no correlation id) isn't waiting
+	}
+	e.mu.Lock()
+	c := e.conn
+	e.mu.Unlock()
+	if c == nil {
+		return ErrNoSession
+	}
+	return c.Send(ipc.Frame{Kind: ipc.KindReplyAck, RequestID: reqID, Err: errText})
+}
+
 // Decide answers a pending permission request: allow=true proceeds, false rejects.
 func (e *Endpoint) Decide(requestID string, allow bool) error {
 	e.mu.Lock()
@@ -173,7 +191,10 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 				ConversationID: f.ChatID,
 				Role:           relay.Assistant,
 				Text:           f.Text,
-				Meta:           map[string]string{"chat_id": f.ChatID},
+				// reply_id carries the correlation id back to ReplyRespond,
+				// so the broker can report a real delivery failure to the
+				// waiting tool call instead of it always returning "sent".
+				Meta: map[string]string{"chat_id": f.ChatID, "reply_id": f.RequestID},
 			}
 			select {
 			case e.recv <- msg:
