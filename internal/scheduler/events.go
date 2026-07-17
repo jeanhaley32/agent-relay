@@ -131,8 +131,7 @@ type Tracker struct {
 
 // NewTracker builds a Tracker, loads any persisted events from path, and starts
 // the reconciliation ticker. inject/fallback/receipt wire it to the agent
-// session and the admin's Telegram. loc is unused here (timestamps are stored
-// as absolute instants); the clock defaults to time.Now.
+// session and the admin's configured frontend (e.g. Telegram or Discord).
 func NewTracker(path string, inject InjectFunc, fallback FallbackFunc, receipt ReceiptFunc, cfg TrackerConfig, logger *log.Logger) (*Tracker, error) {
 	if inject == nil {
 		return nil, errors.New("scheduler: nil inject")
