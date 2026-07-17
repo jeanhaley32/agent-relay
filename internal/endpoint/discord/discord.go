@@ -2,7 +2,7 @@
 // Bot API. Unlike Telegram's stateless long-poll, Discord's real-time events
 // arrive over the Gateway, a stateful websocket protocol with heartbeats and
 // session resume. This package uses github.com/disgoorg/disgo to own that
-// websocket/heartbeat/resume/backoff machinery (see DESIGN.md §1) rather than
+// websocket/heartbeat/resume/backoff machinery rather than
 // hand-rolling it — that class of bug (silent disconnect, missed messages,
 // burned IDENTIFY budget) is exactly what disgo already exists to get right.
 //
@@ -49,8 +49,7 @@ import (
 )
 
 // maxMessageLen is Discord's hard per-message character cap for a bot's
-// plain-text message (not 4096 like Telegram — see DESIGN.md's message-length
-// handling design). Checked
+// plain-text message (not 4096 like Telegram). Checked
 // before ever making the REST call; the resulting error is marked permanent
 // (senderr.Permanent) so it is never queued for retry: retrying an
 // oversized message just repeats the identical, guaranteed failure.
@@ -64,8 +63,8 @@ type permanentSendError = senderr.Permanent
 // from those who may not (so an admin can approve them later). It mirrors
 // telegram.Authorizer's two methods exactly (id type aside) so a single
 // access.Manager instance — with the int64/snowflake.ID conversion done at
-// this package's boundary, see DESIGN.md §3 option 1 — can back both
-// frontends' allowlists without access itself knowing about Discord.
+// this package's boundary — can back both frontends' allowlists without
+// access itself knowing about Discord.
 type Authorizer interface {
 	Allowed(id snowflake.ID) bool
 	Record(id snowflake.ID, name string)
@@ -79,8 +78,8 @@ func (s staticAuthorizer) Record(snowflake.ID, string)  {}
 
 // managerAdapter wraps an access.Manager-shaped int64 authorizer so it can
 // back this package's snowflake.ID-keyed Authorizer. Discord snowflakes are
-// uint64 but real values are time-based and well under math.MaxInt64 (see
-// DESIGN.md §3 option 1), so the conversion is lossless in practice.
+// uint64 but real values are time-based and well under math.MaxInt64, so
+// the conversion is lossless in practice.
 type managerAdapter struct {
 	m interface {
 		Allowed(id int64) bool
@@ -93,7 +92,7 @@ func (a managerAdapter) Record(id snowflake.ID, name string) { a.m.Record(int64(
 
 // Int64Authorizer adapts an int64-keyed authorizer (e.g. *access.Manager,
 // which is intentionally platform-agnostic) into this package's
-// snowflake.ID-keyed Authorizer, per DESIGN.md §3 option 1. Use with
+// snowflake.ID-keyed Authorizer. Use with
 // WithAuthorizer to share one allowlist/admin set between the Telegram and
 // Discord frontends.
 func Int64Authorizer(m interface {
@@ -106,8 +105,8 @@ func Int64Authorizer(m interface {
 // inboundMessage is the platform-neutral shape gate() operates on, derived
 // from a disgo events.MessageCreate by the gateway listener. Keeping gate()
 // decoupled from disgo's event/bot types is what makes the sender/guild/
-// mention policy (DESIGN.md §3) unit-testable without a real gateway
-// connection or bot token.
+// mention policy unit-testable without a real gateway connection or bot
+// token.
 type inboundMessage struct {
 	messageID    snowflake.ID
 	channelID    snowflake.ID
@@ -164,21 +163,21 @@ type Frontend struct {
 	// very first scheduled reminder to a user, before they've DMed the bot in
 	// this process's lifetime) still routes: sendOnce treats an unresolved
 	// ConversationID as a Discord user id and resolves/creates the DM channel
-	// via POST /users/@me/channels (rest.Users.CreateDMChannel), the path
-	// DESIGN.md §3 Option B flagged as missing. See sendOnce's doc comment.
+	// via POST /users/@me/channels (rest.Users.CreateDMChannel). See
+	// sendOnce's doc comment.
 	dmChannels sync.Map // user snowflake.ID -> snowflake.ID (DM channel)
 
 	// Same retry-queue rationale as Telegram's Frontend: Send() returns
 	// immediately and callers generally discard the error, so a transient
 	// failure needs a background path that keeps retrying instead of
-	// silently vanishing. See telegram.go's retryQueue doc comment.
+	// silently vanishing.
 	retryQueue     chan retryItem
 	sendFailures   atomic.Int64
 	permanentDrops atomic.Int64
 	queueDepth     atomic.Int64
 
 	// gatewayReconnects / lastGatewayEventAt are Discord's analogues of
-	// Telegram's getUpdatesFailures/lastPollSuccess (DESIGN.md's gateway health-signal design): the
+	// Telegram's getUpdatesFailures/lastPollSuccess: the
 	// signal that detects a Discord-side outage independent of whether any
 	// outbound Send happened to occur during it. gatewayReconnects counts
 	// only non-resumable reconnects (fresh IDENTIFY, not RESUME) since those
@@ -254,8 +253,8 @@ func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a
 func WithLogger(l *log.Logger) Option { return func(f *Frontend) { f.logger = l } }
 
 // WithAllowGuildMessages enables guild (server) messages in addition to DMs.
-// Default is DM-only, which requests zero privileged gateway intents (see
-// DESIGN.md §2). Guild messages additionally require the guild to be listed
+// Default is DM-only, which requests zero privileged gateway intents.
+// Guild messages additionally require the guild to be listed
 // via WithAllowedGuildIDs — an empty list denies all guilds even with this
 // enabled (fail closed, mirrors access.Manager's empty-allowlist stance).
 func WithAllowGuildMessages(on bool) Option { return func(f *Frontend) { f.allowGuildMessages = on } }
@@ -333,8 +332,8 @@ func New(token string, opts ...Option) (*Frontend, error) {
 // Connect builds the real disgo gateway client and opens the websocket
 // connection, wiring OnMessageCreate into f.recv via gate(). Split out from
 // New() so tests can construct a Frontend (for gate()/Send() unit tests)
-// without ever dialing Discord — mirrors the DESIGN.md §8 checklist item
-// requiring this endpoint be unit-testable without a real bot token.
+// without ever dialing Discord, keeping this endpoint unit-testable without
+// a real bot token.
 //
 // recv is closed from Close() (the same goroutine group as f.cancel, which
 // disgo's callbacks are NOT running under), not from a goroutine racing
@@ -368,7 +367,7 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		// Ready fires on every fresh IDENTIFY (non-resumed reconnect,
 		// including the very first connect); Resumed fires on a successful
 		// RESUME. Both are "the gateway is alive" signals for
-		// lastGatewayEventAt (DESIGN.md's gateway health-signal design says "any gateway event", not just
+		// lastGatewayEventAt: any gateway event counts, not just
 		// inbound messages — a quiet channel with a healthy gateway shouldn't
 		// look wedged). Only Ready increments gatewayReconnects: a RESUME
 		// doesn't risk a message gap or burn IDENTIFY budget the way a fresh
@@ -487,7 +486,7 @@ func (f *Frontend) onMessageCreate(e *events.MessageCreate) {
 	}
 }
 
-// gate applies the sender/guild/mention policy from DESIGN.md §3 and, if the
+// gate applies the sender/guild/mention policy and, if the
 // message passes, returns the relay.Message to publish. Pure function of its
 // input (plus the Frontend's static config/authorizer) so it's directly unit
 // testable without any disgo event/gateway machinery.
@@ -501,7 +500,7 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 
 	if m.guildID != nil {
 		// Guild message: default-deny on source, mirroring Telegram's
-		// outright refusal of non-private chats (DESIGN.md §3). This runs
+		// outright refusal of non-private chats. This runs
 		// BEFORE the sender allowlist check so a rando in some public guild
 		// the bot got invited to never even reaches that check.
 		if !f.allowGuildMessages || !f.allowedGuildIDs[*m.guildID] {
@@ -523,7 +522,7 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 		return relay.Message{}, false
 	}
 
-	// chat_id/from_id identity-pair invariant: DESIGN.md §3 Option B. In DMs,
+	// chat_id/from_id identity-pair invariant. In DMs,
 	// Discord's DM channel id is its own snowflake namespace distinct from
 	// the sender's user id, unlike Telegram where a private chat's id IS the
 	// sender's id. The Broker's session gate only needs *a* stable
@@ -564,8 +563,8 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 		// Marks this message as one where chat_id (the channel id) is NOT
 		// expected to equal from_id (the sender's user id) — the Broker's
 		// identity-pair tripwire (relay.go) treats presence of this key as
-		// an explicit per-frontend opt-out of that invariant, per
-		// DESIGN.md §3 Option A. DM messages deliberately don't set this:
+		// an explicit per-frontend opt-out of that invariant. DM messages
+		// deliberately don't set this:
 		// there chat_id IS from_id by construction (see convID above), so
 		// the invariant still holds and still guards against a regression.
 		msg.Meta["guild_id"] = m.guildID.String()
@@ -700,8 +699,8 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 //     user). For a DM, ConversationID IS the recipient's user id (see
 //     gate()'s convID comment), so it's treated as one and resolved via
 //     POST /users/@me/channels, which is idempotent — Discord returns the
-//     existing DM channel if one already exists. This is the missing path
-//     DESIGN.md §3 flagged: without it, every such message fell through to
+//     existing DM channel if one already exists. Without this path, every
+//     such message would fall through to
 //     CreateMessage(<user id>), which 404s (Unknown Channel) and gets
 //     misclassified permanent, silently dropping the reply. A guild
 //     ConversationID reaching this branch (no prior inbound message AND no
@@ -754,7 +753,7 @@ func (f *Frontend) resolveChannel(ctx context.Context, m relay.Message) (snowfla
 
 // sendOnce is the actual single REST attempt — both Send() and the retry
 // worker call this, so there's exactly one code path that talks to Discord.
-// Per DESIGN.md's message-length handling design, rate-limit (429) handling is intentionally NOT
+// Rate-limit (429) handling is intentionally NOT
 // duplicated here: disgo's REST client already parses Discord's
 // X-RateLimit-* headers and per-route buckets, which is the whole reason
 // disgo was chosen over discordgo. This only classifies the resulting error
@@ -799,9 +798,10 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 }
 
 // enqueueRetry adds a failed message to the background retry queue.
-// Non-blocking: if the queue is full, the oldest-in-flight item is dropped
-// rather than blocking the caller — identical policy to telegram.go's
-// enqueueRetry, see its doc comment for the reasoning.
+// Non-blocking: if the queue is full (a genuinely extreme backlog), the
+// oldest-in-flight item is dropped rather than blocking the caller, which
+// would stall the whole relay - a bounded, honest failure mode instead of
+// unbounded memory growth or a hung sender.
 func (f *Frontend) enqueueRetry(m relay.Message) {
 	item := retryItem{msg: m, attempts: 0, nextAt: time.Now().Add(retryBackoff(0))}
 	select {

@@ -18,6 +18,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/approval"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/session"
 )
 
@@ -98,10 +99,10 @@ type Broker struct {
 	// (success or failure) for a backend reply, so the backend can report the
 	// real outcome back to whatever originated the reply (e.g. the reply
 	// tool call, via claude.Endpoint.ReplyRespond) instead of it always
-	// looking like "sent" regardless of what actually happened. Real
-	// incident 2026-07-11: Send() failures (Telegram's 4096-char limit, most
-	// often) were silently discarded here, so a dropped reply gave the model
-	// no signal to retry or shorten it. nil ⇒ no hook.
+	// looking like "sent" regardless of what actually happened. Send()
+	// failures (Telegram's 4096-char limit, most often) were previously
+	// silently discarded here, so a dropped reply gave the model no signal
+	// to retry or shorten it. nil ⇒ no hook.
 	AckBackendReply func(m Message, sendErr error)
 
 	// Session gate: if Session and Approval are both set, inbound messages
@@ -131,16 +132,16 @@ type Broker struct {
 	// ConversationCaps optionally bounds cumulative estimated tokens for a
 	// specific chat_id within a rolling ConversationCapWindow, independent
 	// of and tighter than the global Meter budget - for a specific contact
-	// (e.g. real 2026-07-14 incident: an allowlisted-but-non-admin Discord
-	// user testing how much inference the relay would spend on an
+	// (e.g. an allowlisted-but-non-admin Discord user testing how much
+	// inference the relay would spend on an
 	// open-ended request) rather than the whole relay. Both directions
 	// count against the cap: an inbound message's estimate is added before
 	// it's forwarded to the backend, and a reply's estimate is added when
 	// it comes back - see conversationCapExceeded and addConversationUsage.
 	// Set at construction only; mutated at runtime exclusively through
 	// SetCaps (capsMu-guarded), which cmd/relayd's /webhook/reload-caps
-	// calls to pick up config.json changes without a process restart
-	// so caps can be tuned without a process restart. nil map ⇒ no explicit caps.
+	// calls to pick up config.json changes without a process restart.
+	// nil map ⇒ no explicit caps.
 	ConversationCaps map[string]int64
 
 	// DefaultConversationCap, if > 0, applies to any chat_id NOT explicitly
@@ -310,8 +311,8 @@ func (b *Broker) addConversationUsage(chatID string, tokens int) {
 // attribution hook (scripts/token-usage-hook.py via cmd/relayd's
 // /webhook/token-usage) to replace the interim chars/4 text-length estimate
 // with real per-conversation token usage pulled from the Claude API's own
-// usage data in the session transcript (2026-07-14: the estimate
-// undercounted real usage by roughly 2-3x since it only sees reply text, not
+// usage data in the session transcript (the interim estimate undercounted
+// real usage by roughly 2-3x since it only sees reply text, not
 // reasoning/tool-call tokens). A no-op if chatID has no configured cap.
 // Rolls the window first (same as every other accessor) so a call arriving
 // just after a rollover doesn't stomp on a legitimately-fresh window with a
@@ -398,7 +399,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			// only deliver to allowed chats.
 			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
 				if b.AckBackendReply != nil {
-					b.AckBackendReply(m, fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"]))
+					b.AckBackendReply(m, senderr.Permanent{Err: fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"])})
 				}
 				continue // dropped (the gate func is responsible for logging)
 			}
@@ -438,8 +439,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		// assumption broke.
 		//
 		// Discord guild (multi-party) channels are a real, deliberate
-		// exception (DESIGN.md's guild chat_id/from_id divergence design):
-		// chat_id there is the shared
+		// exception: chat_id there is the shared
 		// channel id, necessarily distinct from whichever member's from_id
 		// sent a given message. gate() marks any such message with
 		// Meta["guild_id"] so the invariant is enforced only for messages
