@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -39,6 +40,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/config"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -157,7 +159,7 @@ func main() {
 	}
 	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
 
-	// Discord frontend (optional, DESIGN.md §9): the endpoint has existed on
+	// Discord frontend (optional, per DESIGN.md's wiring/startup design): the endpoint has existed on
 	// disk since the previous PR but nothing constructed/started it, so
 	// discord.enabled=true validated cleanly and then did nothing — a config
 	// that silently ran no Discord frontend at all. Wired here the same way
@@ -267,8 +269,7 @@ func main() {
 	// decision, and a Tailscale-interface-only /approve page the request
 	// link points at. Being able to load the approve page at all is proof
 	// of tailnet membership - stronger than trusting a Telegram chat_id
-	// alone, which is spoofable if that account is ever compromised. See
-	// 2026-07-10 relay conversation with Jean for the design rationale.
+	// alone, which is spoofable if that account is ever compromised.
 	appr := approval.NewManager("http://100.99.212.119:9212")
 	reqListener, err := net.Listen("tcp", "127.0.0.1:9211")
 	if err != nil {
@@ -333,13 +334,18 @@ func main() {
 	// originated it (by RequestID, carried in Meta["reply_id"]), instead of
 	// the tool call always returning "sent" regardless of what actually
 	// happened - real incident 2026-07-11, see AckBackendReply's doc comment.
+	// Only a permanent failure (senderr.Permanent) is surfaced as a failure
+	// here - Frontend.Send also returns an error for transient failures that
+	// it has already queued for background retry, and telling the model those
+	// failed invites a resend that duplicates delivery once the retry lands.
 	b.AckBackendReply = func(m relay.Message, sendErr error) {
 		reqID := m.Meta["reply_id"]
 		if reqID == "" {
 			return // reply carries no correlation id (e.g. an internal/system reply) - nothing waiting
 		}
 		errText := ""
-		if sendErr != nil {
+		var perm senderr.Permanent
+		if sendErr != nil && errors.As(sendErr, &perm) {
 			errText = sendErr.Error()
 		}
 		if err := back.ReplyRespond(reqID, errText); err != nil {
@@ -463,7 +469,7 @@ func main() {
 // Fatal on error, mirroring the Telegram handshake's posture: an operator
 // who set discord.enabled=true with a bad token/config wants a clear
 // startup failure, not a frontend that silently never came up (the exact
-// gap this function exists to close - see DESIGN.md §9 / finding 3).
+// gap this function exists to close - see DESIGN.md's wiring/startup design).
 func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend, *access.Manager) {
 	token, err := cfg.DiscordToken()
 	if err != nil {
