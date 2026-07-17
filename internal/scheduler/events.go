@@ -121,7 +121,6 @@ type Tracker struct {
 	receipt  ReceiptFunc
 	logger   *log.Logger
 	cfg      TrackerConfig
-	now      func() time.Time // injectable clock (tests drive time)
 
 	mu     sync.Mutex
 	events map[string]*PendingEvent
@@ -153,7 +152,6 @@ func NewTracker(path string, inject InjectFunc, fallback FallbackFunc, receipt R
 		receipt:  receipt,
 		logger:   logger,
 		cfg:      c,
-		now:      c.Now,
 		events:   map[string]*PendingEvent{},
 		stop:     make(chan struct{}),
 	}
@@ -187,7 +185,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 			ex.Text = text
 			stuck := !ex.FallbackSentAt.IsZero()
 			if stuck {
-				ex.FiredAt = t.now()
+				ex.FiredAt = t.cfg.Now()
 				ex.DeliveredAt = time.Time{}
 				ex.LastNudgeAt = time.Time{}
 				ex.FallbackSentAt = time.Time{}
@@ -205,7 +203,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 				if delivered {
 					t.mu.Lock()
 					if e, ok := t.events[ex.ID]; ok && e.Status == StatusPending {
-						e.DeliveredAt = t.now()
+						e.DeliveredAt = t.cfg.Now()
 						_ = t.persist()
 					}
 					t.mu.Unlock()
@@ -221,7 +219,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 		ScheduleID: scheduleID,
 		ChatID:     chatID,
 		Text:       text,
-		FiredAt:    t.now(),
+		FiredAt:    t.cfg.Now(),
 		Status:     StatusPending,
 		FireCount:  1,
 	}
@@ -248,7 +246,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 	if delivered {
 		t.mu.Lock()
 		if e, ok := t.events[ev.ID]; ok && e.Status == StatusPending {
-			e.DeliveredAt = t.now()
+			e.DeliveredAt = t.cfg.Now()
 			_ = t.persist()
 		}
 		t.mu.Unlock()
@@ -276,7 +274,7 @@ func (t *Tracker) Ack(id, note string) error {
 	}
 	ev.Status = StatusAcknowledged
 	ev.AckNote = note
-	ev.AckedAt = t.now()
+	ev.AckedAt = t.cfg.Now()
 	_ = t.persist()
 	t.mu.Unlock()
 
@@ -350,7 +348,7 @@ func (t *Tracker) OpenCount() int {
 func (t *Tracker) OldestOpenAge() time.Duration {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	now := t.now()
+	now := t.cfg.Now()
 	var oldest time.Duration
 	for _, ev := range t.events {
 		if ev.Status != StatusPending {
@@ -385,7 +383,7 @@ func (t *Tracker) runLoop() {
 		case <-t.stop:
 			return
 		case <-tick.C:
-			t.Reconcile(t.now())
+			t.Reconcile(t.cfg.Now())
 		}
 	}
 }
