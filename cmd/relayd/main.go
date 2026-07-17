@@ -49,12 +49,11 @@ import (
 )
 
 // replyDriftTotal counts turns where the model produced assistant text in
-// response to a relay channel event but never called the reply tool - the
-// class of bug behind the 2026-07-14 incident (an answer composed entirely
-// in the terminal, never sent, invisible to every existing metric since no
-// send was ever attempted). Incremented by detect-reply-drift.py, a Claude
-// Code Stop hook that scans the session transcript for exactly this pattern;
-// see scripts/detect-reply-drift.py.
+// response to a relay channel event but never called the reply tool - an
+// answer composed entirely in the terminal, never sent, invisible to every
+// existing metric since no send was ever attempted. Incremented by
+// detect-reply-drift.py, a Claude Code Stop hook that scans the session
+// transcript for exactly this pattern; see scripts/detect-reply-drift.py.
 var replyDriftTotal atomic.Int64
 
 func main() {
@@ -159,12 +158,9 @@ func main() {
 	}
 	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
 
-	// Discord frontend (optional, per DESIGN.md's wiring/startup design): the endpoint has existed on
-	// disk since the previous PR but nothing constructed/started it, so
-	// discord.enabled=true validated cleanly and then did nothing — a config
-	// that silently ran no Discord frontend at all. Wired here the same way
-	// Telegram is: its own access manager (converted to snowflake ids), its
-	// own New/Connect handshake, then fanned into the Broker's single
+	// Discord frontend (optional, per DESIGN.md's wiring/startup design):
+	// Discord has its own snowflake id namespace and access manager, so it
+	// gets its own New/Connect handshake, then fans into the Broker's single
 	// Frontend slot via relay.MultiFrontend alongside Telegram.
 	frontendEndpoint := relay.Endpoint(front)
 	var discordFront *discord.Frontend

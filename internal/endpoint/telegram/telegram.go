@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -393,7 +394,7 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	if chatID == "" {
 		return permanentSendError{Err: fmt.Errorf("telegram send: no chat_id")}
 	}
-	if n := len(m.Text); n > maxMessageLen {
+	if n := utf8.RuneCountInString(m.Text); n > maxMessageLen {
 		return permanentSendError{Err: fmt.Errorf(
 			"message too long (%d chars, Telegram's limit is %d) - split it into multiple replies", n, maxMessageLen)}
 	}
