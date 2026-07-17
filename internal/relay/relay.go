@@ -314,16 +314,12 @@ func (b *Broker) addConversationUsage(chatID string, tokens int) {
 }
 
 // SetConversationUsage overwrites (does not add to) chatID's usage for the
-// current window with an authoritative real number - used by the token
-// attribution hook (scripts/token-usage-hook.py) to replace the interim
-// chars/4 text-length estimate
-// with real per-conversation token usage pulled from the Claude API's own
-// usage data in the session transcript (the interim estimate undercounted
-// real usage by roughly 2-3x since it only sees reply text, not
-// reasoning/tool-call tokens). A no-op if chatID has no configured cap.
-// Rolls the window first (same as every other accessor) so a call arriving
-// just after a rollover doesn't stomp on a legitimately-fresh window with a
-// stale pre-rollover number.
+// current window with an authoritative real number, replacing the interim
+// chars/4 text-length estimate (which only sees reply text, not
+// reasoning/tool-call tokens) once real per-conversation usage is known.
+// A no-op if chatID has no configured cap. Rolls the window first (same as
+// every other accessor) so a call arriving just after a rollover doesn't
+// stomp on a legitimately-fresh window with a stale pre-rollover number.
 func (b *Broker) SetConversationUsage(chatID string, tokens int64) {
 	if _, capped := b.capLimit(chatID); !capped {
 		return

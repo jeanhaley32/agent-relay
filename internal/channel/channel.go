@@ -70,7 +70,7 @@ func New(name, version, instructions string, onReply ReplyFunc) *Server {
 				var a struct {
 					ChatID  string `json:"chat_id"`
 					Text    string `json:"text"`
-					Message string `json:"message"` // alias: the model often sends "message" not "text"
+					Message string `json:"message"`
 				}
 				if err := json.Unmarshal(args, &a); err != nil {
 					return "", err
