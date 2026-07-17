@@ -70,11 +70,12 @@ func DefaultEstimator(text string) int {
 	return n
 }
 
-// frontendSendTimeout bounds a single synchronous Frontend.Send call from the
-// backend-reply pump. Kept equal to replyAckTimeout in cmd/relay-shim/main.go
-// (the reply tool's own wait) so the two time out together — see the comment
-// at the call site.
-const frontendSendTimeout = 15 * time.Second
+// FrontendSendTimeout bounds a single synchronous Frontend.Send call from the
+// backend-reply pump. Must stay equal to cmd/relay-shim's replyAckTimeout so
+// an outstanding send is deterministically classified as failed rather than
+// landing late and causing a duplicate reply; enforced by
+// TestReplyAckTimeoutMatchesFrontendSendTimeout in cmd/relay-shim.
+const FrontendSendTimeout = 15 * time.Second
 
 // Broker connects a Frontend to a Backend, intercepting slash commands and
 // gating model turns through a budget Meter. It is the deterministic,
@@ -93,34 +94,26 @@ type Broker struct {
 	OutboundAllowed func(chatID string) bool
 
 	// OnBackendReply, if set, is called for every reply the backend (model)
-	// emits, with its chat_id in Meta, AFTER the outbound gate passes and the
-	// reply is delivered to the frontend. The pending-event tracker uses it to
-	// infer that a fired trigger was handled (a reply promptly following the
-	// trigger on that chat auto-resolves it). A reply dropped by the gate, or
-	// one Frontend.Send actually failed to deliver, is never reported - see
-	// AckBackendReply, which is what learns about a failed Send. nil ⇒ no hook.
+	// emits, AFTER the outbound gate passes and the reply is delivered to the
+	// frontend - used to infer that a fired trigger was handled (a reply
+	// promptly following it on that chat auto-resolves it). A reply dropped
+	// by the gate, or one Send actually failed to deliver, is never reported
+	// here - that's AckBackendReply's job. nil ⇒ no hook.
 	OnBackendReply func(m Message)
 
 	// AckBackendReply, if set, is called after every Frontend.Send attempt
-	// (success or failure) for a backend reply, so the backend can report the
-	// real outcome back to whatever originated the reply (e.g. the reply
-	// tool call, via claude.Endpoint.ReplyRespond) instead of it always
-	// looking like "sent" regardless of what actually happened. Send()
-	// failures (Telegram's 4096-char limit, most often) were previously
-	// silently discarded here, so a dropped reply gave the model no signal
-	// to retry or shorten it. nil ⇒ no hook.
+	// (success or failure) for a backend reply, so whatever originated the
+	// reply can learn the real outcome instead of it always looking like
+	// "sent" regardless of what actually happened. nil ⇒ no hook.
 	AckBackendReply func(m Message, sendErr error)
 
 	// Session gate: if Session and Approval are both set, inbound messages
 	// from any user_id (from_id) in SessionGatedUsers require an active,
 	// non-idle-expired session before being processed - independently
 	// tracked per user, so one admin's idle timeout doesn't affect
-	// another's. Keyed on the sender's permanent account id, not chat_id:
-	// admin-privilege checks elsewhere (command dispatch, lockdown) already
-	// key on from_id, and chat_id only equals from_id by Telegram-frontend
-	// convention (private 1:1 chats) - keying the gate on chat_id made its
-	// correctness silently depend on that invariant holding two layers
-	// away, in a different package. An expired/missing session triggers a
+	// another's. Keyed on the sender's permanent account id, not chat_id,
+	// since chat_id only equals from_id by convention and that equivalence
+	// shouldn't be load-bearing here. An expired/missing session triggers a
 	// tailnet re-auth challenge (via Approval) instead of processing the
 	// message; the sender must click the approval link, then resend. nil
 	// Session ⇒ no gating (all other senders are unaffected regardless).
@@ -138,23 +131,21 @@ type Broker struct {
 	// ConversationCaps optionally bounds cumulative estimated tokens for a
 	// specific chat_id within a rolling ConversationCapWindow, independent
 	// of and tighter than the global Meter budget - for a specific contact
-	// (e.g. an allowlisted-but-non-admin Discord user testing how much
-	// inference the relay would spend on an
-	// open-ended request) rather than the whole relay. Both directions
-	// count against the cap: an inbound message's estimate is added before
-	// it's forwarded to the backend, and a reply's estimate is added when
-	// it comes back - see conversationCapExceeded and addConversationUsage.
-	// Set at construction only; mutated at runtime exclusively through
-	// SetCaps (capsMu-guarded), which cmd/relayd's /webhook/reload-caps
-	// calls to pick up config.json changes without a process restart.
-	// nil map ⇒ no explicit caps.
+	// (e.g. an allowlisted-but-non-admin user testing how much inference the
+	// relay would spend on an open-ended request) rather than the whole
+	// relay. Both directions count against the cap: an inbound message's
+	// estimate is added before it's forwarded to the backend, and a reply's
+	// estimate is added when it comes back. Set at construction only;
+	// mutated at runtime exclusively through SetCaps (capsMu-guarded), to
+	// pick up config changes without a process restart. nil map ⇒ no
+	// explicit caps.
 	ConversationCaps map[string]int64
 
 	// DefaultConversationCap, if > 0, applies to any chat_id NOT explicitly
 	// listed in ConversationCaps and not exempted by ConversationCapExempt -
 	// a blanket per-individual cap rather than requiring every contact to
-	// be added by hand. Same construction/
-	// SetCaps mutation rule as ConversationCaps.
+	// be added by hand. Same construction/SetCaps mutation rule as
+	// ConversationCaps.
 	DefaultConversationCap int64
 
 	// ConversationCapExempt, if set, reports whether chatID should never be
@@ -409,7 +400,7 @@ func (b *Broker) Run(ctx context.Context) error {
 				}
 				continue // dropped (the gate func is responsible for logging)
 			}
-			// Bound the synchronous send to frontendSendTimeout so it can never
+			// Bound the synchronous send to FrontendSendTimeout so it can never
 			// straddle the shim's reply-tool wait (replyAckTimeout in
 			// cmd/relay-shim/main.go, kept equal to this): without a matching
 			// deadline here, a slow-but-successful send (e.g. Discord's REST
@@ -418,7 +409,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			// Cancelling here at the same instant the shim times out means a
 			// send that hasn't landed by then is deterministically treated as
 			// failed and handed to the background retry queue instead.
-			sendCtx, cancel := context.WithTimeout(ctx, frontendSendTimeout)
+			sendCtx, cancel := context.WithTimeout(ctx, FrontendSendTimeout)
 			sendErr := b.Frontend.Send(sendCtx, m)
 			cancel()
 			if b.AckBackendReply != nil {

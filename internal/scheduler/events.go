@@ -169,7 +169,12 @@ func NewTracker(path string, inject InjectFunc, fallback FallbackFunc, receipt R
 // with an instruction to ack when done. If scheduleID is non-empty and an open
 // (pending) event from the SAME schedule already exists, it does NOT spawn a
 // sibling: it bumps that event's counter and refreshes its text instead, so a
-// wedged agent can't accumulate a pile of duplicate escalating events.
+// wedged agent can't accumulate a pile of duplicate escalating events. But if
+// that existing event has already been through the full escalation ladder
+// (fallback sent), silent coalescing would mean a single stuck event
+// suppresses every future fire of a recurring schedule forever — so that case
+// is treated as a fresh delivery instead: timers reset and the prompt is
+// re-injected, restarting the nudge/escalate cycle for the new fire.
 //
 // The pending event is persisted BEFORE the caller does any schedule cleanup,
 // so a crash between firing and one-shot deletion can never lose the event with
@@ -181,6 +186,13 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 		if ex := t.openBySchedule(scheduleID); ex != nil {
 			ex.FireCount++
 			ex.Text = text
+			stuck := !ex.FallbackSentAt.IsZero()
+			if stuck {
+				ex.FiredAt = t.now()
+				ex.DeliveredAt = time.Time{}
+				ex.LastNudgeAt = time.Time{}
+				ex.FallbackSentAt = time.Time{}
+			}
 			err := t.persist()
 			t.mu.Unlock()
 			if err != nil {
@@ -188,7 +200,20 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 				// schedule for a retry rather than deleting it.
 				return ex, fmt.Errorf("persist coalesced event %s: %w", ex.ID, err)
 			}
-			t.logger.Printf("coalesced re-fire of schedule %s onto event %s (count=%d)", scheduleID, ex.ID, ex.FireCount)
+			if stuck {
+				t.logger.Printf("re-fire of schedule %s onto escalated event %s: resetting and re-injecting (count=%d)", scheduleID, ex.ID, ex.FireCount)
+				delivered := t.inject(chatID, t.initialPrompt(ex))
+				if delivered {
+					t.mu.Lock()
+					if e, ok := t.events[ex.ID]; ok && e.Status == StatusPending {
+						e.DeliveredAt = t.now()
+						_ = t.persist()
+					}
+					t.mu.Unlock()
+				}
+			} else {
+				t.logger.Printf("coalesced re-fire of schedule %s onto event %s (count=%d)", scheduleID, ex.ID, ex.FireCount)
+			}
 			return ex, nil
 		}
 	}

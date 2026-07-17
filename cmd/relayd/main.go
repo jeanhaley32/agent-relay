@@ -329,22 +329,13 @@ func main() {
 	// Surface the real Send outcome back to the reply tool call that
 	// originated it (by RequestID, carried in Meta["reply_id"]), instead of
 	// the tool call always returning "sent" regardless of what actually
-	// happened; see AckBackendReply's doc comment.
-	// Only a permanent failure (senderr.Permanent) is surfaced as a failure
-	// here - Frontend.Send also returns an error for transient failures that
-	// it has already queued for background retry, and telling the model those
-	// failed invites a resend that duplicates delivery once the retry lands.
+	// happened. Classification lives in ackErrText.
 	b.AckBackendReply = func(m relay.Message, sendErr error) {
 		reqID := m.Meta["reply_id"]
 		if reqID == "" {
 			return // reply carries no correlation id (e.g. an internal/system reply) - nothing waiting
 		}
-		errText := ""
-		var perm senderr.Permanent
-		if sendErr != nil && errors.As(sendErr, &perm) {
-			errText = sendErr.Error()
-		}
-		if err := back.ReplyRespond(reqID, errText); err != nil {
+		if err := back.ReplyRespond(reqID, ackErrText(sendErr)); err != nil {
 			logger.Printf("reply ack for %s: %v", reqID, err)
 		}
 	}
@@ -466,6 +457,20 @@ func main() {
 // who set discord.enabled=true with a bad token/config wants a clear
 // startup failure, not a frontend that silently never came up (the exact
 // gap this function exists to close - see DESIGN.md's wiring/startup design).
+// ackErrText classifies a Send outcome for AckBackendReply: only a permanent
+// failure (senderr.Permanent) is surfaced as an error string - Frontend.Send
+// also returns an error for transient failures that it has already queued
+// for background retry, and reporting those to the model would invite a
+// resend that duplicates delivery once the retry lands. Returns "" for a nil
+// or transient error.
+func ackErrText(sendErr error) string {
+	var perm senderr.Permanent
+	if sendErr != nil && errors.As(sendErr, &perm) {
+		return sendErr.Error()
+	}
+	return ""
+}
+
 func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend, *access.Manager) {
 	token, err := cfg.DiscordToken()
 	if err != nil {
