@@ -137,10 +137,10 @@ func TestOutboundGate(t *testing.T) {
 
 // TestAckBackendReplyReportsFailureAndSuppressesOnBackendReply: a Send
 // failure must be reported via AckBackendReply (so the reply tool call can
-// surface it to the model - real incident 2026-07-11, replies over
-// Telegram's 4096-char limit were silently dropped with no error anywhere),
-// and must NOT fire OnBackendReply, since the reply never actually reached
-// the user and is not evidence a trigger was handled.
+// surface it to the model - otherwise a failed send, e.g. exceeding a
+// frontend's message-length limit, is silently dropped with no error
+// anywhere), and must NOT fire OnBackendReply, since the reply never
+// actually reached the user and is not evidence a trigger was handled.
 func TestAckBackendReplyReportsFailureAndSuppressesOnBackendReply(t *testing.T) {
 	sendErr := errors.New("telegram sendMessage status 400: message is too long")
 	front := &failFrontend{recv: make(chan Message), err: sendErr}
@@ -381,12 +381,12 @@ func TestSessionGate(t *testing.T) {
 	}
 }
 
-// TestConversationCap covers the real 2026-07-14 incident: an
-// allowlisted-but-non-admin contact testing how much inference the relay
-// would spend on an open-ended request. A per-conversation cap must stop
-// inbound messages from reaching the backend at all once the cap is hit -
-// not just gate the outbound reply - since the real cost is inference
-// tokens, spent the moment a message is forwarded to the model.
+// TestConversationCap covers an allowlisted-but-non-admin contact testing
+// how much inference the relay would spend on an open-ended request. A
+// per-conversation cap must stop inbound messages from reaching the backend
+// at all once the cap is hit - not just gate the outbound reply - since the
+// real cost is inference tokens, spent the moment a message is forwarded to
+// the model.
 func TestConversationCap(t *testing.T) {
 	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
 	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
@@ -437,9 +437,9 @@ func TestConversationCap(t *testing.T) {
 
 	// Third message: now genuinely over cap - must be dropped BEFORE
 	// reaching the backend at all (no more inference spent on this
-	// conversation), and a detailed notice sent AGAIN (Jean's explicit
-	// request, 2026-07-14: every rejection gets a notice, not just the
-	// first one - a conversation shouldn't go permanently silent).
+	// conversation), and a detailed notice sent AGAIN (every rejection gets
+	// a notice, not just the first one - a conversation shouldn't go
+	// permanently silent).
 	front.recv <- Message{Role: User, Text: "should not reach backend", ConversationID: "999",
 		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
 	select {
@@ -470,8 +470,7 @@ func TestConversationCap(t *testing.T) {
 	}
 }
 
-// TestConversationCapRollsOverOnWindow covers Jean's explicit request
-// (2026-07-14): the cap is a rate limit ("see the cap at every 3 hours"),
+// TestConversationCapRollsOverOnWindow covers that the cap is a rate limit,
 // not a lifetime ban - usage must reset once the configured window elapses.
 func TestConversationCapRollsOverOnWindow(t *testing.T) {
 	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
@@ -565,10 +564,9 @@ func TestSetConversationUsageOverridesEstimate(t *testing.T) {
 	}
 }
 
-// TestDefaultConversationCap covers Jean's explicit request (2026-07-14): a
-// blanket default cap applies to any conversation not explicitly listed,
-// admins are exempt, and an explicit ConversationCaps entry always wins
-// over the default.
+// TestDefaultConversationCap covers that a blanket default cap applies to
+// any conversation not explicitly listed, admins are exempt, and an
+// explicit ConversationCaps entry always wins over the default.
 func TestDefaultConversationCap(t *testing.T) {
 	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
 	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
@@ -629,9 +627,9 @@ func TestDefaultConversationCap(t *testing.T) {
 	}
 }
 
-// TestSetCapsLiveReload covers Jean's explicit request (2026-07-14): caps
-// can be changed at runtime via SetCaps (cmd/relayd's /webhook/reload-caps)
-// without losing already-accumulated usage/window state.
+// TestSetCapsLiveReload covers that caps can be changed at runtime via
+// SetCaps (cmd/relayd's /webhook/reload-caps) without losing
+// already-accumulated usage/window state.
 func TestSetCapsLiveReload(t *testing.T) {
 	b := &Broker{ConversationCaps: map[string]int64{"999": 10}}
 

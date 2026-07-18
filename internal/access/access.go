@@ -141,7 +141,6 @@ func (m *Manager) Record(id int64, name string) {
 	m.totalRecorded++
 }
 
-// TotalRecorded returns totalRecorded.
 func (m *Manager) TotalRecorded() int64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
