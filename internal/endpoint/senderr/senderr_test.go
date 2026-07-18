@@ -48,6 +48,18 @@ func chunkRuneLens(chunks []string) []int {
 	return lens
 }
 
+func TestSplitNonPositiveLimit(t *testing.T) {
+	// limit<=0 is nonsensical (nothing to bound), so the guard returns the
+	// text unsplit rather than looping forever or producing empty chunks.
+	text := strings.Repeat("x", 10)
+	for _, limit := range []int{0, -1} {
+		got := Split(text, limit)
+		if len(got) != 1 || got[0] != text {
+			t.Errorf("Split(text, %d) = %v, want unchanged single-element slice", limit, got)
+		}
+	}
+}
+
 func TestSplitFitsUnchanged(t *testing.T) {
 	got := Split("hello", 100)
 	if len(got) != 1 || got[0] != "hello" {
