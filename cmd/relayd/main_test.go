@@ -236,7 +236,8 @@ func newTestMux(t *testing.T, adminChatID string) (*http.ServeMux, *relay.Broker
 		t.Fatalf("write config: %v", err)
 	}
 
-	mux := newRelaydMux(back, adminChatID, nil, meter, nil, nil, tr, logger, b, cfgPath)
+	acc := access.New(nil, nil, "", logger)
+	mux := newRelaydMux(back, adminChatID, acc, meter, nil, nil, tr, logger, b, cfgPath)
 	return mux, b
 }
 
@@ -302,6 +303,32 @@ func TestWebhookReloadCapsHandler(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/reload-caps", nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("POST: got status %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+// TestMetricsHandler exercises /metrics with front=nil (as newTestMux always
+// passes) to guard against the handler unconditionally dereferencing the
+// Telegram frontend - safe in production where front is always non-nil, but
+// this is the largest handler on the mux and previously had zero coverage.
+func TestMetricsHandler(t *testing.T) {
+	mux, _ := newTestMux(t, "")
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics: got status %d, want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"relayd_budget_percent_used",
+		"relayd_circuit_breaker_state",
+		"relayd_telegram_send_failures_total 0",
+		"relayd_discord_send_failures_total 0",
+		"relayd_pending_events_open 0",
+	} {
+		if !contains(body, want) {
+			t.Errorf("/metrics body missing %q; got:\n%s", want, body)
+		}
 	}
 }
 

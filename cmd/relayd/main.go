@@ -534,8 +534,8 @@ func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend
 // listenWithRetry binds addr, retrying with a fixed 1s backoff until
 // deadline elapses. Used for listeners bound to an interface address (like
 // the Tailscale IP) that may not exist yet this early at boot.
-func listenWithRetry(network, addr string, deadline time.Duration, logger *log.Logger) (net.Listener, error) {
-	giveUp := time.Now().Add(deadline)
+func listenWithRetry(network, addr string, timeout time.Duration, logger *log.Logger) (net.Listener, error) {
+	giveUp := time.Now().Add(timeout)
 	var lastErr error
 	for {
 		l, err := net.Listen(network, addr)
@@ -620,6 +620,18 @@ func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manag
 			discordGatewayReconnects = discordFront.GatewayReconnects()
 			discordLastGatewayEventAt = discordFront.LastGatewayEventAt()
 		}
+		// Telegram frontend is always non-nil in production (unlike the
+		// optional Discord one) but newRelaydMux is also used directly by
+		// tests with front=nil, so guard the same way rather than assume.
+		var telegramSendFailures, telegramPermanentDrops, telegramQueueDepth int64
+		var telegramGetUpdatesFailures, telegramLastPollSuccess int64
+		if front != nil {
+			telegramSendFailures = front.SendFailures()
+			telegramPermanentDrops = front.PermanentDrops()
+			telegramQueueDepth = front.QueueDepth()
+			telegramGetUpdatesFailures = front.GetUpdatesFailures()
+			telegramLastPollSuccess = front.LastPollSuccess()
+		}
 		body := fmt.Sprintf(
 			"# HELP relayd_unrecognized_access_attempts_total Distinct non-allowlisted Telegram senders who have messaged the bot since relayd started.\n"+
 				"# TYPE relayd_unrecognized_access_attempts_total counter\n"+
@@ -693,8 +705,8 @@ func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manag
 			acc.TotalRecorded(), len(acc.Pending()), len(acc.Allowlist()),
 			snap.PercentUsed, snap.Used, snap.Limit, snap.WindowLeft.Seconds(),
 			stateNum, pausedNum,
-			front.SendFailures(), front.PermanentDrops(), front.QueueDepth(),
-			front.GetUpdatesFailures(), front.LastPollSuccess(),
+			telegramSendFailures, telegramPermanentDrops, telegramQueueDepth,
+			telegramGetUpdatesFailures, telegramLastPollSuccess,
 			tracker.OpenCount(), tracker.OldestOpenAge().Seconds(),
 			discordSendFailures, discordPermanentDrops, discordQueueDepth,
 			discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt,
