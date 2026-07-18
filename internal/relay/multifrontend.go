@@ -18,9 +18,9 @@ type Claimer interface {
 }
 
 // MultiFrontend fans multiple frontend Endpoints (e.g. Telegram + Discord)
-// into the single Frontend slot the Broker knows how to drive. The Broker
-// itself stays platform-agnostic; MultiFrontend is just wiring glue so
-// cmd/relayd can actually start more than one frontend at once.
+// into the single Frontend slot the Broker knows how to drive, keeping the
+// Broker itself platform-agnostic and letting callers run more than one
+// frontend at once without the Broker knowing multiple exist.
 //
 // Routing outbound Send calls back to the right underlying frontend is the
 // hard part: a relayd-originated message (scheduler reminder, admin notice,

@@ -348,8 +348,12 @@ func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
 		defer clearInFlight()
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
-		deadline := b.now().Add(ttl)
-		for b.now().Before(deadline) {
+		// The deadline is real wall-clock time (time.Now, not b.now()): the
+		// poll ticker is already real-time, so mixing in the overridable
+		// mock clock here would let a frozen-clock test spin this loop
+		// forever without ever reaching the deadline.
+		deadline := time.Now().Add(ttl)
+		for time.Now().Before(deadline) {
 			select {
 			case <-ctx.Done():
 				return

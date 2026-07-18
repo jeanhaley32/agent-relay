@@ -659,8 +659,7 @@ func TestDefaultConversationCap(t *testing.T) {
 }
 
 // TestSetCapsLiveReload covers that caps can be changed at runtime via
-// SetCaps (cmd/relayd's /webhook/reload-caps) without losing
-// already-accumulated usage/window state.
+// SetCaps without losing already-accumulated usage/window state.
 func TestSetCapsLiveReload(t *testing.T) {
 	b := &Broker{ConversationCaps: map[string]int64{"999": 10}}
 
