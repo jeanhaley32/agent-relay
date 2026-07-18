@@ -3,6 +3,7 @@ package scheduler
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -200,6 +201,12 @@ func TestReplyInferredAck(t *testing.T) {
 	tr.NoteReply("42", *clock)
 	if len(tr.ListPending()) != 0 {
 		t.Fatal("reply after fire should auto-resolve the event")
+	}
+	h.mu.Lock()
+	receipts := append([]string(nil), h.receipts...)
+	h.mu.Unlock()
+	if len(receipts) != 1 || !strings.HasPrefix(receipts[0], "✓ auto-resolved (reply): ") {
+		t.Fatalf("expected one auto-resolved receipt, got %v", receipts)
 	}
 }
 
