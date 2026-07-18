@@ -1,15 +1,11 @@
-// This file adds a pending-event tracker to the scheduler package. Where the
-// Scheduler decides WHEN something should fire, the Tracker records that a fire
-// actually happened and follows it until the agent acknowledges handling it —
-// closing the long-standing gap where a fired trigger could be silently buried
-// in a busy Claude session and never acted on.
+// The Tracker records that a scheduled fire actually happened and follows it
+// until acknowledged, closing the gap where a fired trigger could be silently
+// buried in a busy session and never acted on.
 //
-// Design (crash-safe by construction): the Tracker does NOT arm a per-event
-// timer. It persists only facts (when each event fired, whether it was
-// delivered/nudged/escalated) and a single reconciliation ticker periodically
-// derives what is due purely from wall-clock comparisons against those
-// timestamps. A restart at any point loses no state and needs no re-arming:
-// the next tick recomputes the correct action from the persisted file alone.
+// It is crash-safe by construction: rather than arming a per-event timer, it
+// persists only fire/delivery/nudge/escalation timestamps, and a periodic
+// reconciliation tick derives what's due from wall-clock comparisons against
+// those timestamps — so a restart at any point needs no re-arming.
 
 package scheduler
 
@@ -163,21 +159,16 @@ func NewTracker(path string, inject InjectFunc, fallback FallbackFunc, receipt R
 }
 
 // Fire records that a trigger fired and injects it into the agent's session
-// with an instruction to ack when done. If scheduleID is non-empty and an open
-// (pending) event from the SAME schedule already exists, it does NOT spawn a
-// sibling: it bumps that event's counter and refreshes its text instead, so a
-// wedged agent can't accumulate a pile of duplicate escalating events. But if
-// that existing event has already been through the full escalation ladder
-// (fallback sent), silent coalescing would mean a single stuck event
-// suppresses every future fire of a recurring schedule forever — so that case
-// is treated as a fresh delivery instead: timers reset and the prompt is
-// re-injected, restarting the nudge/escalate cycle for the new fire.
+// with an instruction to ack when done. An open (pending) event from the same
+// scheduleID is coalesced (counter bumped, text refreshed) instead of
+// spawning a sibling, so a wedged agent can't accumulate duplicate escalating
+// events — unless that event already went through the full escalation ladder
+// (fallback sent), in which case it's treated as a fresh delivery so a single
+// stuck event can't permanently suppress a recurring schedule.
 //
-// The pending event is persisted BEFORE the caller does any schedule cleanup,
-// so a crash between firing and one-shot deletion can never lose the event with
-// no trace. Returns a copy of the (new or coalesced) event — like ListPending,
-// callers must not receive a live pointer into the mutex-guarded map since
-// Reconcile mutates events concurrently.
+// This must persist before the caller does any schedule cleanup, so a crash
+// in between can't lose the event with no trace. Returns a copy, not a live
+// pointer, since Reconcile mutates the map concurrently.
 func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 	t.mu.Lock()
 	if scheduleID != "" {
@@ -425,26 +416,18 @@ func (t *Tracker) Reconcile(now time.Time) {
 			continue
 		}
 		age := now.Sub(ev.FiredAt)
-		// NOTE: no undelivered-retry inject here. The initial trigger is
-		// injected exactly once at Fire time over a lossless-buffered link, so
-		// re-injecting it every tick while the shim is briefly down would just
-		// spam duplicate prompts (and could evict other buffered frames). The
-		// nudge below is the only escalating re-inject, and it fires at most
-		// once by design.
+		// No undelivered-retry here: the trigger is injected once at Fire
+		// time over a lossless link, so re-injecting every tick would just
+		// spam duplicates. Nudge/fallback below are each at-most-once.
 		switch {
 		case age >= t.cfg.EscalateAfter:
-			// Past escalation: stop nagging the agent, tell Jean directly, once.
-			// FallbackSentAt is NOT marked here — it is stamped only after the
-			// send actually succeeds (below), so a crash or send failure in the
-			// gap doesn't record this last-line-of-defense ping as done.
+			// FallbackSentAt is stamped only after send succeeds (below), so
+			// a crash or send failure doesn't mark this last-resort ping done.
 			if ev.FallbackSentAt.IsZero() {
 				mins := int(age.Minutes())
 				actions = append(actions, action{ev.ID, "", t.fallbackText(ev, mins), true})
 			}
 		case age >= t.cfg.NudgeAfter:
-			// One escalating re-inject into the agent's own session. Lower
-			// stakes than the fallback, so kept at-most-once (marked before the
-			// send): a duplicated nudge matters less than a duplicated ping.
 			if ev.LastNudgeAt.IsZero() {
 				actions = append(actions, action{ev.ID, ev.ChatID, t.nudgePrompt(ev, int(age.Minutes())), false})
 				ev.LastNudgeAt = now
