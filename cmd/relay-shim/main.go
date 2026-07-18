@@ -325,7 +325,12 @@ func (c *client) request(f ipc.Frame, timeout time.Duration) (ipc.Frame, error) 
 	case resp := <-ch:
 		return resp, nil
 	case <-time.After(timeout):
-		return ipc.Frame{}, errors.New("timed out waiting for the daemon")
+		// Be explicit that this is UNCONFIRMED, not a success. A bare "timed
+		// out" reads as a transient hiccup, so the model has repeatedly assumed
+		// the message went out and told the user "sent" when nothing was
+		// delivered. Delivery is genuinely unknown here: say so.
+		return ipc.Frame{}, errors.New(
+			"no delivery confirmation from relayd - the message may NOT have been delivered; do not report it as sent, and re-send if the user has not acknowledged it")
 	}
 }
 
