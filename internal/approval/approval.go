@@ -49,7 +49,11 @@ func NewManager(approveBase string) *Manager {
 
 func newToken() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read failing means the platform's CSPRNG is broken;
+		// never hand out a predictable token for a security-critical approval.
+		panic(fmt.Sprintf("approval: crypto/rand.Read failed: %v", err))
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -242,6 +246,7 @@ func (m *Manager) ApproveHandler() http.Handler {
 			}
 			decided := req.status
 			m.mu.Unlock()
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			fmt.Fprintf(w, resultPage, html.EscapeString(string(decided)))
 			return
 		}
@@ -254,6 +259,7 @@ func (m *Manager) ApproveHandler() http.Handler {
 		m.mu.Lock()
 		st, desc := req.status, req.desc
 		m.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if st != StatusPending {
 			fmt.Fprintf(w, resultPage, html.EscapeString(string(st)))
 			return
