@@ -6,7 +6,10 @@ import (
 )
 
 func TestSessionLifecycle(t *testing.T) {
-	m := NewManager(20 * time.Millisecond)
+	// Wide TTL/sleep margins (hundreds of ms), not a tight window: on a
+	// loaded host a >5ms scheduler/GC stall between lines could otherwise
+	// flip Active()'s result and flake the test.
+	m := NewManager(400 * time.Millisecond)
 
 	if m.Active("admin") {
 		t.Fatal("expected no session before Activate")
@@ -18,15 +21,15 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 
 	// Touch should slide the window forward.
-	time.Sleep(15 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	m.Touch("admin")
-	time.Sleep(15 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	if !m.Active("admin") {
 		t.Fatal("expected session still active after Touch extended it")
 	}
 
 	// Let it fully idle out.
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	if m.Active("admin") {
 		t.Fatal("expected session to expire after idling past TTL")
 	}

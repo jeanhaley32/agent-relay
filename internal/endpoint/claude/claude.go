@@ -33,15 +33,17 @@ type PermRequest struct {
 	Detail string // human-readable description
 }
 
-// SchedRequest is a schedule-tool call surfaced from the Claude session. The
-// daemon performs the op and answers with SchedRespond, echoing ReqID.
+// SchedRequest is a schedule- or event-tool call surfaced from the Claude
+// session. The daemon performs the op and answers with SchedRespond, echoing
+// ReqID. Event ops (OpEventAck/OpEventList) reuse the schedule fields:
+// Text carries the ack note and SchedID carries the event id.
 type SchedRequest struct {
 	ReqID     string // correlation id to echo in the response
-	Op        string // ipc.OpSchedule* (create | list | cancel)
-	Text      string // reminder text (create)
+	Op        string // ipc.OpSchedule*/OpEvent* (create | list | cancel | ack)
+	Text      string // reminder text (schedule create); ack note (event ack)
 	Cron      string // recurring cron spec (create)
 	InSeconds int64  // one-shot delay seconds (create)
-	SchedID   string // schedule id (cancel)
+	SchedID   string // schedule id (cancel); event id (event ack)
 	ChatID    string // requesting conversation (create target / audit)
 }
 
