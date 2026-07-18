@@ -402,6 +402,57 @@ func TestPersistReloadEvents(t *testing.T) {
 	}
 }
 
+// TestRetentionPruning confirms an acknowledged event is kept until
+// cfg.Retention has elapsed since AckedAt, then pruned on the next Reconcile,
+// exactly once.
+func TestRetentionPruning(t *testing.T) {
+	h := &trackerHarness{connected: true}
+	path := filepath.Join(t.TempDir(), "events.json")
+	now := time.Now()
+	clock := &now
+	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{
+		NudgeAfter:     5 * time.Minute,
+		EscalateAfter:  12 * time.Minute,
+		Retention:      10 * time.Minute,
+		TickEvery:      time.Hour,
+		ReplyAckWindow: 2 * time.Minute,
+		Now:            func() time.Time { return *clock },
+	}, nil)
+	if err != nil {
+		t.Fatalf("new tracker: %v", err)
+	}
+	t.Cleanup(tr.Close)
+
+	ev, _ := tr.Fire("s", "42", "text")
+	if err := tr.Ack(ev.ID, "handled"); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+
+	// Just before the retention window elapses: still present.
+	*clock = clock.Add(9 * time.Minute)
+	tr.Reconcile(*clock)
+	tr.mu.Lock()
+	_, stillThere := tr.events[ev.ID]
+	tr.mu.Unlock()
+	if !stillThere {
+		t.Fatal("acknowledged event pruned before retention window elapsed")
+	}
+
+	// Past the retention window: pruned on the next reconcile.
+	*clock = clock.Add(2 * time.Minute)
+	tr.Reconcile(*clock)
+	tr.mu.Lock()
+	_, stillThere = tr.events[ev.ID]
+	tr.mu.Unlock()
+	if stillThere {
+		t.Fatal("acknowledged event should be pruned once retention window elapses")
+	}
+
+	// A further reconcile is a no-op (nothing left to prune, no panic/error).
+	*clock = clock.Add(time.Hour)
+	tr.Reconcile(*clock)
+}
+
 func TestMetricsAccessors(t *testing.T) {
 	h := &trackerHarness{connected: true}
 	tr, clock := newTestTracker(t, h)

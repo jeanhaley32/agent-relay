@@ -297,8 +297,8 @@ func (t *Tracker) Ack(id, note string) error {
 // after the outbound gate passes).
 func (t *Tracker) NoteReply(chatID string, at time.Time) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	changed := false
+	var resolved []string
 	for _, ev := range t.events {
 		if ev.Status != StatusPending || ev.ChatID != chatID {
 			continue
@@ -313,11 +313,19 @@ func (t *Tracker) NoteReply(chatID string, at time.Time) {
 			ev.AckNote = "inferred from prompt reply"
 			ev.AckedAt = at
 			changed = true
+			resolved = append(resolved, ev.ID)
 			t.logger.Printf("event %s auto-resolved (reply within %s of fire/nudge on chat %s)", ev.ID, t.cfg.ReplyAckWindow, chatID)
 		}
 	}
 	if changed {
 		_ = t.persist()
+	}
+	t.mu.Unlock()
+
+	// Send the same human-skimmable receipt an explicit Ack() would send, so
+	// inferred acks don't silently break the "every ack leaves a trail" invariant.
+	for _, id := range resolved {
+		t.receipt("✓ auto-resolved (reply): " + id)
 	}
 }
 
