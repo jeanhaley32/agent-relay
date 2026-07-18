@@ -141,11 +141,6 @@ func (m *Manager) Record(id int64, name string) {
 	m.totalRecorded++
 }
 
-// TotalRecorded returns the count of distinct unauthorized senders ever
-// queued as a pending request since this process started - a monotonic
-// counter suitable for Prometheus (unlike len(Pending()), which drops once
-// a request is approved/denied and would look like the alert "resolved" on
-// its own).
 func (m *Manager) TotalRecorded() int64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

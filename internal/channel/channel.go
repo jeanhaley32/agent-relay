@@ -12,6 +12,7 @@ package channel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 
 	"github.com/jeanhaley32/agent-relay/internal/mcp"
@@ -67,13 +68,30 @@ func New(name, version, instructions string, onReply ReplyFunc) *Server {
 			},
 			Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
 				var a struct {
-					ChatID string `json:"chat_id"`
-					Text   string `json:"text"`
+					ChatID  string `json:"chat_id"`
+					Text    string `json:"text"`
+					Message string `json:"message"`
 				}
 				if err := json.Unmarshal(args, &a); err != nil {
 					return "", err
 				}
-				if err := onReply(ctx, a.ChatID, a.Text); err != nil {
+				// Accept either field name. The schema advertises "text", but the
+				// model frequently calls this tool with "message"; before this
+				// alias, those replies unmarshalled to an empty Text and were sent
+				// to Telegram as empty, which 400s ("message text is empty") and
+				// is silently dropped - the user just sees no reply. Prefer text,
+				// fall back to message.
+				text := a.Text
+				if text == "" {
+					text = a.Message
+				}
+				if text == "" {
+					// Fail loudly back to the model instead of emitting an empty
+					// send: an empty reply is never valid and only wastes a
+					// guaranteed-400 round-trip.
+					return "", errors.New("reply has no text - put your message in the \"text\" field (\"message\" is also accepted)")
+				}
+				if err := onReply(ctx, a.ChatID, text); err != nil {
 					return "", err
 				}
 				return "sent", nil

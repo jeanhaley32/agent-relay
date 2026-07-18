@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,6 +26,19 @@ func (f *capFrontend) Name() string                            { return "front" 
 func (f *capFrontend) Recv() <-chan Message                    { return f.recv }
 func (f *capFrontend) Send(_ context.Context, m Message) error { f.sent <- m; return nil }
 func (f *capFrontend) Close() error                            { return nil }
+
+// failFrontend fails every Send with a fixed error - used to test that a
+// failed delivery is reported via AckBackendReply and does NOT fire
+// OnBackendReply (a failed send never reached the user).
+type failFrontend struct {
+	recv chan Message
+	err  error
+}
+
+func (f *failFrontend) Name() string                            { return "failfront" }
+func (f *failFrontend) Recv() <-chan Message                    { return f.recv }
+func (f *failFrontend) Send(_ context.Context, _ Message) error { return f.err }
+func (f *failFrontend) Close() error                            { return nil }
 
 // emitBackend emits replies the test pushes onto recv.
 type emitBackend struct{ recv chan Message }
@@ -118,6 +132,47 @@ func TestOutboundGate(t *testing.T) {
 		t.Fatalf("outbound gate leaked a reply to a stranger: %+v", m)
 	case <-time.After(300 * time.Millisecond):
 		// good — dropped
+	}
+}
+
+// TestAckBackendReplyReportsFailureAndSuppressesOnBackendReply: a Send
+// failure must be reported via AckBackendReply (so the reply tool call can
+// surface it to the model - otherwise a failed send, e.g. exceeding a
+// frontend's message-length limit, is silently dropped with no error
+// anywhere), and must NOT fire OnBackendReply, since the reply never
+// actually reached the user and is not evidence a trigger was handled.
+func TestAckBackendReplyReportsFailureAndSuppressesOnBackendReply(t *testing.T) {
+	sendErr := errors.New("telegram sendMessage status 400: message is too long")
+	front := &failFrontend{recv: make(chan Message), err: sendErr}
+	back := &emitBackend{recv: make(chan Message, 8)}
+	acked := make(chan error, 8)
+	onReplyFired := make(chan string, 8)
+	b := &Broker{
+		Frontend:        front,
+		Backend:         back,
+		Commands:        command.NewRegistry(),
+		Meter:           budget.New("pro", nil),
+		AckBackendReply: func(_ Message, err error) { acked <- err },
+		OnBackendReply:  func(m Message) { onReplyFired <- m.Meta["chat_id"] },
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	back.recv <- Message{Role: Assistant, Text: "too long", Meta: map[string]string{"chat_id": "111"}}
+
+	select {
+	case err := <-acked:
+		if err == nil || err.Error() != sendErr.Error() {
+			t.Fatalf("AckBackendReply err = %v, want %v", err, sendErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AckBackendReply never fired for a failed send")
+	}
+	select {
+	case id := <-onReplyFired:
+		t.Fatalf("OnBackendReply fired for a failed send (chat %q) - a failed send never reached the user", id)
+	case <-time.After(300 * time.Millisecond):
+		// good — suppressed
 	}
 }
 
@@ -240,6 +295,19 @@ func TestIdentityPairInvariant(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("matched identity pair was incorrectly dropped")
 	}
+
+	// A mismatched pair with Meta["guild_id"] set proceeds anyway — the
+	// carve-out for multi-party (e.g. Discord guild) chats where from_id and
+	// chat_id are legitimately different.
+	front.recv <- Message{Role: User, Text: "guild hello", Meta: map[string]string{"chat_id": "guild-chan-1", "from_id": "222", "guild_id": "guild-1"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "guild hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mismatched identity pair with guild_id set was incorrectly dropped")
+	}
 }
 
 // TestSessionGate exercises the real, end-to-end integration path: an
@@ -291,6 +359,24 @@ func TestSessionGate(t *testing.T) {
 		// would come from the frontend queue, and back.got must stay empty)
 	}
 
+	// 1b. A second message from the same gated user while the challenge is
+	// still in flight must be dropped too, but must NOT trigger a second
+	// challenge/link — challengeInFlight dedupes so one gated user hammering
+	// the bot before re-authing gets one link and one poller, not N.
+	front.recv <- Message{Role: User, Text: "again", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+	select {
+	case m := <-front.sent:
+		t.Fatalf("expected no second challenge while one is in flight, got %q", m.Text)
+	case <-time.After(300 * time.Millisecond):
+		// good — deduped
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expired session leaked a second message to the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+
 	token := link[strings.LastIndex(link, "/")+1:]
 
 	// 2. Approve via the same HTTP surface a human would hit (the tailnet
@@ -323,5 +409,407 @@ func TestSessionGate(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("message after re-auth was not forwarded to the backend")
+	}
+}
+
+// TestSessionGateDenied covers the challengeSession poller's deny branch
+// (relay.go's StatusDenied/StatusExpired case): a denied decision must NOT
+// activate the session, must clear challengeInFlight so a later message
+// re-challenges instead of being silently dropped forever, and must not leak
+// any message to the backend.
+func TestSessionGateDenied(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+	appr := approval.NewManager("http://tailnet.example")
+
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Session:           session.NewManager(30 * time.Minute),
+		Approval:          appr,
+		SessionGatedUsers: map[string]bool{"admin-chat": true},
+		SessionTTL:        2 * time.Second,
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// 1. First message: challenge issued.
+	front.recv <- Message{Role: User, Text: "/help", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+
+	var link string
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "http://tailnet.example/approve/") {
+			t.Fatalf("expected a challenge with an approval link, got %q", m.Text)
+		}
+		link = m.Text[strings.Index(m.Text, "http://tailnet.example/approve/"):]
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a session-expired challenge on the frontend")
+	}
+	token := link[strings.LastIndex(link, "/")+1:]
+
+	// 2. Deny via the same HTTP surface a human would hit.
+	appSrv := httptest.NewServer(appr.ApproveHandler())
+	defer appSrv.Close()
+	resp, err := http.PostForm(appSrv.URL+"/approve/"+token, url.Values{"decision": {"deny"}})
+	if err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	resp.Body.Close()
+
+	// 3. No activation confirmation should be sent, and the session must
+	// stay inactive. The poller only notices the denial on its next 3s
+	// tick (and clears challengeInFlight right after), so give it enough
+	// room here rather than racing it.
+	select {
+	case m := <-front.sent:
+		t.Fatalf("expected no message after a denial, got %q", m.Text)
+	case <-time.After(500 * time.Millisecond):
+		// good
+	}
+	time.Sleep(3 * time.Second)
+
+	// 4. A subsequent message from the same user must re-challenge (proves
+	// challengeInFlight was cleared) rather than being silently dropped, and
+	// must not reach the backend.
+	front.recv <- Message{Role: User, Text: "again", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "http://tailnet.example/approve/") {
+			t.Fatalf("expected a fresh challenge after denial, got %q", m.Text)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("expected a fresh challenge after the prior one was denied")
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("denied session leaked a message to the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+}
+
+// TestConversationCap covers an allowlisted-but-non-admin contact testing
+// how much inference the relay would spend on an open-ended request. A
+// per-conversation cap must stop inbound messages from reaching the backend
+// at all once the cap is hit - not just gate the outbound reply - since the
+// real cost is inference tokens, spent the moment a message is forwarded to
+// the model.
+func TestConversationCap(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	b := &Broker{
+		Frontend:         front,
+		Backend:          back,
+		Commands:         command.NewRegistry(),
+		Meter:            budget.New("pro", nil),
+		Estimate:         func(text string) int { return len(text) }, // 1 token/char for exact test math
+		ConversationCaps: map[string]int64{"999": 10},                // tiny cap, easy to exceed
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// First message (5 tokens) is well under the cap of 10 - forwarded.
+	front.recv <- Message{Role: User, Text: "hello", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("expected 'hello' forwarded to backend, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first message (under cap) was never forwarded to the backend")
+	}
+
+	// Second message (7 tokens) pushes cumulative usage (5+7=12) over the
+	// cap of 10 - this is the message that CROSSES the cap, so it must NOT
+	// itself reach the backend (a single oversized message could otherwise
+	// blow through an arbitrarily small cap); only the cap-hit notice goes
+	// out.
+	front.recv <- Message{Role: User, Text: "1234567", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("the message that crosses the cap must not reach the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good - the crossing message itself is not forwarded
+	}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "token budget") || !strings.Contains(m.Text, "Limit:") || !strings.Contains(m.Text, "Used:") || !strings.Contains(m.Text, "Resets in:") {
+			t.Fatalf("expected a detailed cap-rejection notice (limit/used/reset), got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-hit notice to be sent to the conversation")
+	}
+
+	// Third message: now genuinely over cap - must be dropped BEFORE
+	// reaching the backend at all (no more inference spent on this
+	// conversation), and a detailed notice sent AGAIN (every rejection gets
+	// a notice, not just the first one - a conversation shouldn't go
+	// permanently silent).
+	front.recv <- Message{Role: User, Text: "should not reach backend", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("conversation cap did not stop a message from reaching the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good - dropped before the backend
+	}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "token budget") {
+			t.Fatalf("expected another detailed cap-rejection notice, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a notice on every rejection, not just the first")
+	}
+
+	// A DIFFERENT, uncapped conversation must be entirely unaffected.
+	front.recv <- Message{Role: User, Text: "unrelated", ConversationID: "111",
+		Meta: map[string]string{"chat_id": "111", "from_id": "111"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "unrelated" {
+			t.Fatalf("expected the uncapped conversation's message forwarded, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an uncapped conversation must be unaffected by another conversation's cap")
+	}
+}
+
+// TestConversationCapChargesOutboundReplies covers the outbound reply
+// pump's addConversationUsage(chat_id, estimate) call in Run's backend->
+// frontend goroutine: a reply from the backend must count against the same
+// conversation's cap as inbound messages do, not just leave it unaffected.
+func TestConversationCapChargesOutboundReplies(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	b := &Broker{
+		Frontend:              front,
+		Backend:               back,
+		Commands:              command.NewRegistry(),
+		Meter:                 budget.New("pro", nil),
+		Estimate:              func(text string) int { return len(text) },
+		ConversationCaps:      map[string]int64{"999": 10},
+		ConversationCapWindow: time.Hour,
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// A backend reply attributed to chat "999" (9 chars) should be charged
+	// against that conversation's cap.
+	back.recv <- Message{Role: Assistant, Text: "123456789", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999"}}
+	select {
+	case <-front.sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("outbound reply was never delivered to the frontend")
+	}
+
+	// Now a 5-char inbound message (9+5=14 > 10) should already be over cap
+	// and dropped before reaching the backend - proving the outbound reply
+	// was actually charged, not silently ignored.
+	front.recv <- Message{Role: User, Text: "12345", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expected the inbound message to be dropped due to prior outbound charge, got %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "token budget") {
+			t.Fatalf("expected a cap-rejection notice, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-rejection notice after the outbound-charged conversation went over cap")
+	}
+}
+
+// TestConversationCapRollsOverOnWindow covers that the cap is a rate limit,
+// not a lifetime ban - usage must reset once the configured window elapses.
+func TestConversationCapRollsOverOnWindow(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	b := &Broker{
+		Frontend:              front,
+		Backend:               back,
+		Commands:              command.NewRegistry(),
+		Meter:                 budget.New("pro", nil),
+		Estimate:              func(text string) int { return len(text) },
+		ConversationCaps:      map[string]int64{"999": 10},
+		ConversationCapWindow: time.Hour,
+		clock:                 func() time.Time { return now },
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// Well under the cap of 10 - forwarded.
+	front.recv <- Message{Role: User, Text: "12345", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case <-back.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first message never reached the backend")
+	}
+
+	// Pushes cumulative usage (5+7=12) over the cap - dropped before the
+	// backend, one notice sent.
+	front.recv <- Message{Role: User, Text: "1234567", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expected drop while still within the window, got %+v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+	select {
+	case <-front.sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-hit notice")
+	}
+
+	// Advance past the 1-hour window - usage should roll over to zero.
+	now = now.Add(time.Hour + time.Minute)
+	front.recv <- Message{Role: User, Text: "y", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "y" {
+			t.Fatalf("unexpected message forwarded: %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("message after the window rolled over should have been forwarded - cap must reset, not stay a lifetime ban")
+	}
+}
+
+// TestSetConversationUsageOverridesEstimate covers the real attribution
+// hook: SetConversationUsage overwrites the interim chars/4
+// estimate with an authoritative real number, and takes effect immediately
+// for the next cap check - no double counting with prior estimate-based
+// addConversationUsage calls.
+func TestSetConversationUsageOverridesEstimate(t *testing.T) {
+	b := &Broker{
+		ConversationCaps: map[string]int64{"999": 100},
+	}
+
+	// Estimate-based tracking says 10 tokens used - well under cap.
+	b.addConversationUsage("999", 10)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("should not be exceeded yet (10 < 100)")
+	}
+
+	// Real attribution says the actual usage was much higher - overwrite,
+	// not add (10 + 150 would also exceed, but this proves it's a set).
+	b.SetConversationUsage("999", 150)
+	if !b.conversationCapExceeded("999") {
+		t.Fatal("expected the real usage override (150) to exceed the cap (100)")
+	}
+
+	// A lower real number can also bring a conversation back under cap -
+	// proves it's a true overwrite, not a monotonic add.
+	b.SetConversationUsage("999", 5)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("expected the corrected-down real usage (5) to no longer exceed the cap")
+	}
+
+	// No-op for an uncapped chat_id.
+	b.SetConversationUsage("111", 999999)
+	if b.conversationCapExceeded("111") {
+		t.Fatal("SetConversationUsage must be a no-op for a chat_id with no configured cap")
+	}
+}
+
+// TestDefaultConversationCap covers that a blanket default cap applies to
+// any conversation not explicitly listed, admins are exempt, and an
+// explicit ConversationCaps entry always wins over the default.
+func TestDefaultConversationCap(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	b := &Broker{
+		Frontend:               front,
+		Backend:                back,
+		Commands:               command.NewRegistry(),
+		Meter:                  budget.New("pro", nil),
+		Estimate:               func(text string) int { return len(text) },
+		DefaultConversationCap: 10,
+		ConversationCaps:       map[string]int64{"555": 1000}, // explicit override, higher than default
+		ConversationCapExempt:  func(chatID string) bool { return chatID == "admin" },
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// A random, never-configured chat_id gets the default cap (10) - a
+	// message longer than that must be rejected.
+	front.recv <- Message{Role: User, Text: "this text is definitely longer than ten chars", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expected the default cap to reject an over-limit message, got forwarded: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "token budget") {
+			t.Fatalf("expected a cap-rejection notice, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-rejection notice for a default-capped conversation")
+	}
+
+	// An explicit ConversationCaps entry (1000) wins over the default (10) -
+	// the same long message is fine for chat_id 555.
+	front.recv <- Message{Role: User, Text: "this text is definitely longer than ten chars", ConversationID: "555",
+		Meta: map[string]string{"chat_id": "555", "from_id": "555"}}
+	select {
+	case m := <-back.got:
+		if m.Text == "" {
+			t.Fatalf("unexpected empty message forwarded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("explicit cap (1000) should have allowed this message, not the default (10)")
+	}
+
+	// An exempt chat_id (admin) is never capped, even by the default.
+	front.recv <- Message{Role: User, Text: "this text is definitely longer than ten chars, way over the default", ConversationID: "admin",
+		Meta: map[string]string{"chat_id": "admin", "from_id": "admin"}}
+	select {
+	case m := <-back.got:
+		if m.Text == "" {
+			t.Fatalf("unexpected empty message forwarded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an exempt chat_id must never be capped by DefaultConversationCap")
+	}
+}
+
+// TestSetCapsLiveReload covers that caps can be changed at runtime via
+// SetCaps without losing already-accumulated usage/window state.
+func TestSetCapsLiveReload(t *testing.T) {
+	b := &Broker{ConversationCaps: map[string]int64{"999": 10}}
+
+	b.addConversationUsage("999", 8)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("should not be exceeded yet (8 < 10)")
+	}
+
+	// Live-reload to a lower cap - existing usage (8) now exceeds it (5),
+	// without needing to resend any messages to re-accumulate usage.
+	b.SetCaps(map[string]int64{"999": 5}, 0)
+	if !b.conversationCapExceeded("999") {
+		t.Fatal("expected the live-reloaded lower cap (5) to already be exceeded by existing usage (8)")
+	}
+
+	// Live-reload removing the cap entirely (empty map, no default) - no
+	// longer capped at all.
+	b.SetCaps(map[string]int64{}, 0)
+	if b.conversationCapExceeded("999") {
+		t.Fatal("expected removing the cap via SetCaps to actually remove it")
 	}
 }

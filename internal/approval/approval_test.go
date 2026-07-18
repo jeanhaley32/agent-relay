@@ -76,9 +76,131 @@ func TestApprovalFlow(t *testing.T) {
 	}
 }
 
+func TestRequestHandlerActionHashBinding(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	reqSrv := httptest.NewServer(m.RequestHandler())
+	defer reqSrv.Close()
+
+	// Create a request through the public HTTP surface with an action_hash
+	// form value, mirroring how a real caller binds a token to an action.
+	resp, err := http.PostForm(reqSrv.URL+"/request", url.Values{
+		"desc":        {"delete message 42"},
+		"action_hash": {"del:42"},
+	})
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	var created struct{ Token, Link string }
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
+	if created.Token == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	m.mu.Lock()
+	m.pending[created.Token].status = StatusApproved
+	m.mu.Unlock()
+
+	// A mismatched action_hash must be rejected even though the token is
+	// approved, proving the HTTP-created token carried the binding through.
+	if st, ok := m.Consume(created.Token, "del:99"); !ok || st == StatusApproved {
+		t.Fatalf("mismatched consume: status=%q ok=%v, want non-approved/true", st, ok)
+	}
+	// The bound action_hash must still work.
+	if st, ok := m.Consume(created.Token, "del:42"); !ok || st != StatusApproved {
+		t.Fatalf("bound consume: status=%q ok=%v, want approved/true", st, ok)
+	}
+}
+
+func TestStatusIsNonConsumingPeek(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("delete message 42", "del:42", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	// Status is documented as a read-only peek - calling it repeatedly on an
+	// approved token must not consume the decision.
+	for i := 0; i < 3; i++ {
+		st, ok := m.Status(token)
+		if !ok || st != StatusApproved {
+			t.Fatalf("Status call %d: status=%q ok=%v, want approved/true", i, st, ok)
+		}
+	}
+
+	// Consume must still succeed after repeated Status peeks.
+	st, ok := m.Consume(token, "del:42")
+	if !ok || st != StatusApproved {
+		t.Fatalf("consume after peeks: status=%q ok=%v, want approved/true", st, ok)
+	}
+}
+
+func TestConsumeOneShot(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("delete message 42", "del:42", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	st, ok := m.Consume(token, "del:42")
+	if !ok || st != StatusApproved {
+		t.Fatalf("first consume: status=%q ok=%v, want approved/true", st, ok)
+	}
+
+	// A second consume of the same approval must not succeed - one
+	// approval authorizes exactly one action.
+	st2, ok2 := m.Consume(token, "del:42")
+	if !ok2 || st2 == StatusApproved {
+		t.Fatalf("second consume: status=%q ok=%v, want non-approved/true (replay must be rejected)", st2, ok2)
+	}
+}
+
+func TestConsumeActionMismatch(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("delete message 42", "del:42", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	// Approval was bound to del:42 - presenting a different action hash
+	// (e.g. an attacker substituting a different target) must be rejected.
+	st, ok := m.Consume(token, "del:99")
+	if !ok || st == StatusApproved {
+		t.Fatalf("mismatched consume: status=%q ok=%v, want non-approved/true", st, ok)
+	}
+
+	// The original action hash must still work - the mismatched attempt
+	// above must not have consumed or corrupted the token.
+	st2, ok2 := m.Consume(token, "del:42")
+	if !ok2 || st2 != StatusApproved {
+		t.Fatalf("correct consume after mismatch: status=%q ok=%v, want approved/true", st2, ok2)
+	}
+}
+
+func TestConsumeUnboundToken(t *testing.T) {
+	// Tokens created via the plain Create (empty actionHash) accept any
+	// actionHash at Consume time - existing unbound callers keep working.
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("legacy caller", "", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	st, ok := m.Consume(token, "anything")
+	if !ok || st != StatusApproved {
+		t.Fatalf("unbound consume: status=%q ok=%v, want approved/true", st, ok)
+	}
+}
+
 func TestApprovalExpiry(t *testing.T) {
 	m := NewManager("http://tailnet.example")
-	token, _ := m.create("expires fast", 1*time.Millisecond)
+	token, _ := m.create("expires fast", "", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
 	req, ok := m.get(token)
 	if !ok {
