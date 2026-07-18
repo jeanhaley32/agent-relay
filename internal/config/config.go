@@ -43,16 +43,16 @@ type TelegramConfig struct {
 
 // DiscordConfig configures the Discord frontend. Discord is fully optional —
 // a config with only a "telegram" block (as today) keeps working unchanged.
-// See internal/endpoint/discord/DESIGN.md §5.
+// See internal/endpoint/discord/DESIGN.md.
 type DiscordConfig struct {
 	// Enabled gates whether relayd starts the Discord frontend at all. An
 	// explicit flag rather than "block present with non-empty admins" —
-	// per DESIGN.md §5/§9 open question 3 — because an all-zero-value
+	// per DESIGN.md — because an all-zero-value
 	// DiscordConfig{} is otherwise indistinguishable from "block omitted"
 	// once JSON-unmarshaled. Fail-closed default (false): no config block
 	// (or an empty one) means the frontend goroutine never exists, not
 	// "started with an empty allowlist that denies everyone" — see
-	// DESIGN.md §8's fail-closed-defaults checklist item.
+	// DESIGN.md's fail-closed-defaults checklist item.
 	Enabled bool `json:"enabled"`
 
 	TokenEnv string `json:"token_env"` // env var holding the bot token
@@ -61,8 +61,7 @@ type DiscordConfig struct {
 	// (not numbers) because a snowflake is a 64-bit value and JSON numbers
 	// are conventionally parsed as float64 by generic tooling — an operator
 	// hand-editing this file could silently lose precision. Discord's own
-	// API returns snowflakes as strings for the same reason. See DESIGN.md
-	// §5.
+	// API returns snowflakes as strings for the same reason. See DESIGN.md.
 	Admins        []string `json:"admins"`         // ids that may run admin commands (also allowed)
 	Allowlist     []string `json:"allowlist"`      // permitted sender user ids
 	AllowlistFile string   `json:"allowlist_file"` // optional: persist approved ids here
@@ -70,7 +69,7 @@ type DiscordConfig struct {
 	// AllowGuildMessages/AllowedGuildIDs/RequireMentionInGuild are
 	// Discord-specific (no Telegram concept of a guild). Default is the
 	// narrowest posture: DM-only, no guild intents requested at all — see
-	// internal/endpoint/discord DESIGN.md §2/§3.
+	// internal/endpoint/discord DESIGN.md.
 	AllowGuildMessages bool     `json:"allow_guild_messages"`
 	AllowedGuildIDs    []string `json:"allowed_guild_ids"`
 
@@ -80,7 +79,7 @@ type DiscordConfig struct {
 	// an explicit false, which previously meant wiring
 	// WithRequireMentionInGuild(cfg.Discord.RequireMentionInGuild) silently
 	// flipped the guild policy fail-open (ambient/unmentioned guild chatter
-	// relayable) even though DESIGN.md §5 and config.example.json document
+	// relayable) even though DESIGN.md and config.example.json document
 	// the default as true. Use RequireMentionInGuild() to read the resolved
 	// value.
 	RequireMentionInGuildRaw *bool `json:"require_mention_in_guild"`
@@ -230,7 +229,7 @@ func (c *Config) validate() error {
 		// deliberately NOT rejected here: it's a valid (if inert) config —
 		// fail-closed means every guild is denied until at least one is
 		// listed, not that the combination itself is invalid. See
-		// DESIGN.md §5.
+		// DESIGN.md.
 	}
 	return nil
 }
@@ -267,7 +266,7 @@ func (c *Config) Token() (string, error) {
 
 // DiscordToken resolves the Discord bot token from the configured env var —
 // same convention as Token(), extended for the second frontend rather than
-// inventing a new one (DESIGN.md §8).
+// inventing a new one (DESIGN.md).
 func (c *Config) DiscordToken() (string, error) {
 	v := os.Getenv(c.Discord.TokenEnv)
 	if v == "" {
