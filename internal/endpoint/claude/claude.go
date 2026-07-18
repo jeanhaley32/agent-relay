@@ -179,6 +179,12 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 	for {
 		f, err := c.Recv()
 		if err != nil {
+			// Close the socket, don't just drop our reference to it. Without
+			// this the connection stays half-open: we stop reading but the shim
+			// never sees EOF, so its reconnect loop never fires and it keeps
+			// writing replies into a socket nobody reads - outbound dies
+			// silently while inbound looks fine (real incident 2026-07-18).
+			_ = c.Close()
 			e.mu.Lock()
 			if e.conn == c {
 				e.conn = nil
@@ -199,7 +205,16 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 			}
 			select {
 			case e.recv <- msg:
-			default: // drop if the consumer is gone/slow rather than block accept loop
+			default:
+				// The consumer is gone or not draining, so this reply will
+				// never be delivered. Do NOT drop it silently: the model is
+				// blocked on this reply_id and, with no answer, its tool call
+				// only times out with a generic "daemon didn't respond" - so it
+				// assumes success and tells the user "sent" when nothing was.
+				// Answer with the real reason instead, so it can retry or say
+				// so honestly (mirrors the scheduler's busy-path below).
+				_ = e.ReplyRespond(f.RequestID,
+					"reply was NOT delivered: relay outbound queue full / consumer not draining - retry, and do not report this message as sent")
 			}
 		case ipc.KindPermRequest:
 			select {

@@ -191,3 +191,48 @@ func TestInboundBufferAcrossReconnect(t *testing.T) {
 		t.Fatalf("buffered message not delivered on reconnect: %+v", f)
 	}
 }
+
+// TestReadErrorClosesSocket guards the 2026-07-18 outage: when the daemon's
+// reader gives up on a connection it must CLOSE it, not just drop its
+// reference. Otherwise the socket stays half-open - the shim never sees EOF,
+// so its reconnect loop never fires and it keeps writing replies into a socket
+// nobody reads. Outbound dies silently while inbound looks perfectly healthy.
+func TestReadErrorClosesSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	e, err := New(sock)
+	if err != nil {
+		t.Fatalf("new endpoint: %v", err)
+	}
+	defer e.Close()
+
+	shim, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer shim.Close()
+
+	// Let the daemon accept and start reading.
+	if err := ipc.NewConn(shim).Send(ipc.Frame{Kind: ipc.KindReply, ChatID: "1", Text: "hi"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case <-e.Recv():
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon never received the first reply")
+	}
+
+	// Force the daemon's reader to error by sending garbage (undecodable JSON).
+	if _, err := shim.Write([]byte("}{ not json\n")); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+
+	// The daemon must close its end. The shim should therefore observe EOF
+	// rather than hanging forever on a half-open socket.
+	_ = shim.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := shim.Read(buf); err == nil {
+		t.Fatal("shim read succeeded; daemon left the socket half-open (regression)")
+	} else if os.IsTimeout(err) {
+		t.Fatal("shim read timed out: daemon did not close the socket - half-open leak (regression)")
+	}
+}
