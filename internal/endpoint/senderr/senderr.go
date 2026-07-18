@@ -20,7 +20,6 @@ func (e Permanent) Unwrap() error { return e.Err }
 // can deliver an oversized reply as multiple messages instead of permanently
 // dropping it — a long reply silently failing against a platform's
 // per-message length limit leaves the sender with no error and no message.
-// Returns a single-element slice unchanged if text already fits.
 //
 // Prefers breaking on paragraph boundaries ("\n\n"), then single newlines,
 // then spaces, so chunks read naturally rather than splitting mid-word; only

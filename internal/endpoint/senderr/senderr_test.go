@@ -1,10 +1,52 @@
 package senderr
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
 )
+
+func TestPermanentErrorAndUnwrap(t *testing.T) {
+	inner := errors.New("boom")
+	p := Permanent{Err: inner}
+	if p.Error() != "boom" {
+		t.Errorf("Error() = %q, want %q", p.Error(), "boom")
+	}
+	if !errors.Is(p, inner) {
+		t.Errorf("errors.Is(p, inner) = false, want true (Unwrap should expose inner error)")
+	}
+}
+
+func TestSplitMultiByteRunes(t *testing.T) {
+	// Multi-byte runes (3 bytes each in UTF-8) exercise runeLimitByteOffset's
+	// rune-aware counting - a byte-count cut would either split a rune in
+	// half or land at the wrong boundary.
+	text := strings.Repeat("日本語", 100) // 300 runes, 900 bytes
+	got := Split(text, 100)
+	if len(got) != 3 {
+		t.Fatalf("Split() = %d chunks, want 3 for 300 runes at limit 100: got lens %v", len(got), chunkRuneLens(got))
+	}
+	for i, c := range got {
+		if !utf8.ValidString(c) {
+			t.Errorf("chunk %d is not valid UTF-8: %q", i, c)
+		}
+		if n := utf8.RuneCountInString(c); n > 100 {
+			t.Errorf("chunk %d has %d runes, exceeds limit 100", i, n)
+		}
+	}
+	if strings.Join(got, "") != text {
+		t.Errorf("rejoined chunks lost or corrupted multi-byte content")
+	}
+}
+
+func chunkRuneLens(chunks []string) []int {
+	lens := make([]int, len(chunks))
+	for i, c := range chunks {
+		lens[i] = utf8.RuneCountInString(c)
+	}
+	return lens
+}
 
 func TestSplitFitsUnchanged(t *testing.T) {
 	got := Split("hello", 100)

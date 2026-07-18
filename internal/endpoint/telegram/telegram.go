@@ -330,29 +330,42 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
 // to m.ConversationID) via sendMessage. A message over Telegram's real limit
 // is split into multiple messages (see senderr.Split) rather than permanently
-// dropped - the old behavior silently lost the whole reply on anything over
-// 4096 chars with no error surfaced to the sender. Every chunk is attempted
-// regardless of an earlier chunk's outcome, since a transient failure is
-// already queued by sendChunk and skipping the rest would just strand them.
-// The first permanent failure is returned if any chunk hit one; otherwise the
-// first transient failure is returned, matching the single-message path
-// (sendChunk/sendOnce) which always reports its error to the caller instead
-// of swallowing it.
+// dropped, with an error surfaced to the caller if any chunk fails outright.
+// On a transient failure mid-split, remaining chunks are queued for
+// background retry (not sent immediately) so the reply reaches the chat in
+// order even when delivery is interleaved with retries; a permanent failure
+// on one chunk still lets later, independent chunks attempt delivery. The
+// first permanent failure is returned if any chunk hit one; otherwise the
+// first transient failure is returned.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
 		var permErr, firstErr error
+		queuing := false
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
+			if queuing {
+				f.enqueueRetry(cm)
+				continue
+			}
 			if err := f.sendChunk(ctx, cm); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}
 				var perm permanentSendError
-				if errors.As(err, &perm) && permErr == nil {
-					permErr = err
+				if errors.As(err, &perm) {
+					if permErr == nil {
+						permErr = err
+					}
+					continue
 				}
+				// Transient failure: sendChunk already queued this chunk for
+				// retry. Stop attempting later chunks immediately and queue
+				// them too, in order, so the retry worker delivers the rest
+				// of the split reply in the original order instead of racing
+				// ahead of the queued chunk.
+				queuing = true
 			}
 		}
 		if permErr != nil {
@@ -363,9 +376,8 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	return f.sendChunk(ctx, m)
 }
 
-// sendChunk is Send's single-message path - the pre-split body of what used
-// to be Send, still doing the retry/permanent-failure classification for one
-// already-within-limit message.
+// sendChunk is Send's single-message path, doing the retry/permanent-failure
+// classification for one already-within-limit message.
 func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	err := f.sendOnce(ctx, m)
 	if err == nil {
@@ -459,6 +471,8 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 		case f.retryQueue <- item:
 			f.queueDepth.Add(1)
 		default:
+			f.logger.Printf("telegram retry queue full again, dropping new item")
+			f.permanentDrops.Add(1)
 		}
 	}
 }
