@@ -39,9 +39,9 @@ type MultiFrontend struct {
 
 	mu sync.RWMutex
 	// owner grows one entry per distinct ConversationID ever seen inbound
-	// and is never purged, mirroring the Telegram/Discord convChannels
-	// pattern; bounded by the number of distinct conversations, so not a
-	// practical leak.
+	// and is never purged, but it's bounded by the number of distinct
+	// conversations rather than by message volume, so it isn't a practical
+	// leak.
 	owner map[string]Endpoint
 
 	recv chan Message

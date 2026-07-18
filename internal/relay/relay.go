@@ -71,9 +71,9 @@ func DefaultEstimator(text string) int {
 }
 
 // FrontendSendTimeout bounds a single synchronous Frontend.Send call from the
-// backend-reply pump. Kept strictly shorter than cmd/relay-shim's
-// replyAckTimeout so the broker can't cancel later than the shim already
-// gave up, which would let a send land after the model was told it failed.
+// backend-reply pump. It must stay shorter than the caller's own ack-wait
+// timeout so the broker can't cancel later than the caller already gave up,
+// which would let a send land after the model was told it failed.
 const FrontendSendTimeout = 12 * time.Second
 
 // Broker connects a Frontend to a Backend, intercepting slash commands and
