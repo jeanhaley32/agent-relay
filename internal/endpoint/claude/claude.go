@@ -295,6 +295,20 @@ func (e *Endpoint) Close() error {
 	e.closeOnce.Do(func() {
 		close(e.done)
 		err = e.ln.Close()
+		// Closing the listener only unblocks Accept(). acceptLoop spends nearly
+		// all its time inside readReplies, blocked on c.Recv() of the live
+		// connection - which a listener close does not touch. Without also
+		// closing that connection, readReplies never returns, so acceptLoop
+		// never runs its `defer close(e.recv)`, the broker's outbound pump
+		// blocks forever on `range Backend.Recv()`, and Broker.Run hangs in
+		// wg.Wait() - shutdown never completes and systemd has to SIGKILL
+		// ("Failed with result 'timeout'", observed 2026-07-18).
+		e.mu.Lock()
+		if e.conn != nil {
+			_ = e.conn.Close()
+			e.conn = nil
+		}
+		e.mu.Unlock()
 		_ = os.Remove(e.socketPath)
 	})
 	return err
