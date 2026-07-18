@@ -48,9 +48,12 @@ type MultiFrontend struct {
 }
 
 // NewMultiFrontend fans in the Recv() channel of every given frontend and
-// returns a single Endpoint that can stand in for Broker.Frontend. at least
-// one frontend must be given.
+// returns a single Endpoint that can stand in for Broker.Frontend. It
+// panics if no frontends are given.
 func NewMultiFrontend(frontends ...Endpoint) *MultiFrontend {
+	if len(frontends) == 0 {
+		panic("relay: NewMultiFrontend requires at least one frontend")
+	}
 	mf := &MultiFrontend{
 		frontends: frontends,
 		owner:     map[string]Endpoint{},

@@ -197,7 +197,6 @@ func (b *Broker) capLimit(chatID string) (limit int64, capped bool) {
 	return b.DefaultConversationCap, true
 }
 
-// defaultConversationCapWindow is used when ConversationCapWindow is unset.
 const defaultConversationCapWindow = 3 * time.Hour
 
 type conversationWindow struct {

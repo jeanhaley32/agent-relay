@@ -527,8 +527,8 @@ func TestConversationCapRollsOverOnWindow(t *testing.T) {
 	}
 }
 
-// TestSetConversationUsageOverridesEstimate covers the 2026-07-14 real
-// attribution hook: SetConversationUsage overwrites the interim chars/4
+// TestSetConversationUsageOverridesEstimate covers the real attribution
+// hook: SetConversationUsage overwrites the interim chars/4
 // estimate with an authoritative real number, and takes effect immediately
 // for the next cap check - no double counting with prior estimate-based
 // addConversationUsage calls.
