@@ -222,11 +222,18 @@ func main() {
 		})
 		return back.Connected()
 	}
+	// errNoAdminConfigured signals that an admin escalation could not be
+	// delivered because no admin chat ID is configured, not that the send
+	// itself failed.
+	errNoAdminConfigured := errors.New("relayd: no admin chat id configured")
 	// sendToAdmin returns the send error so the tracker's fallback path can
 	// avoid marking a failed last-line-of-defense escalation as delivered.
+	// With no admin configured there's nobody to escalate to, but that's
+	// still a failure to deliver - report it as one rather than silently
+	// claiming success, so callers don't mistake "delivered" for "no admin".
 	sendToAdmin := func(text string) error {
 		if adminChatID == "" {
-			return nil
+			return errNoAdminConfigured
 		}
 		return front.Send(context.Background(), relay.Message{
 			ConversationID: adminChatID, Text: text,
@@ -564,8 +571,16 @@ type grafanaWebhookPayload struct {
 func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) {
 	mux := newRelaydMux(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, cfgPath)
 	addr := "127.0.0.1:9210"
+	// Fatalf on bind failure, matching the approval listeners above: a silent
+	// failure here would leave /metrics, /webhook/token-usage,
+	// /webhook/reload-caps and /webhook/grafana all unreachable with nothing
+	// but a single startup log line to show for it.
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		logger.Fatalf("grafana webhook listener: %v", err)
+	}
 	logger.Printf("grafana webhook listening on %s/webhook/grafana", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.Serve(l, mux); err != nil {
 		logger.Printf("grafana webhook server stopped: %v", err)
 	}
 }
