@@ -496,7 +496,7 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 	}
 
 	if !f.auth.Allowed(m.authorID) {
-		f.auth.Record(m.authorID, m.authorName) // queue as a pending request
+		f.auth.Record(m.authorID, m.authorName)
 		f.logger.Printf("discord: dropped message from unauthorized sender id=%s (%s) — recorded as pending",
 			m.authorID, m.authorName)
 		return relay.Message{}, false
@@ -552,19 +552,13 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 	return msg, true
 }
 
-// discordSnowflakeFloor is a lower bound on any snowflake id minted by the
-// real Discord network today. Discord's snowflake epoch is 2015-01-01; the
-// timestamp component occupies the high 42 bits (shifted left 22), so any id
-// generated since roughly 2020 already exceeds 1e17. Telegram document ids as
-// int64, which can in principle occupy up to 52 bits (~4.5e15) - above this
-// floor - so this heuristic is not a proof, only a practical disambiguator:
-// real Telegram chat/user ids in use here are far smaller (a handful of
-// digits, or negative for groups/supergroups), so a collision would require a
-// Telegram id in a range Telegram doesn't currently hand out. Used by
-// OwnsConversationID to disambiguate a bare numeric ConversationID between
-// frontends when relay.MultiFrontend has never seen it delivered inbound —
-// see relay.Claimer's doc comment.
-const discordSnowflakeFloor = 1_000_000_000_000_000 // 1e15, well below current real Discord ids, well above real-world Telegram ids
+// discordSnowflakeFloor disambiguates a bare numeric ConversationID between
+// frontends (see relay.Claimer) when it's never been seen inbound: real
+// Discord snowflakes minted since ~2020 exceed 1e17, while real-world
+// Telegram chat/user ids stay far below 1e15, so a collision would require a
+// Telegram id in a range Telegram doesn't hand out. Not a proof, just a
+// practical heuristic.
+const discordSnowflakeFloor = 1_000_000_000_000_000
 
 // OwnsConversationID implements relay.Claimer: it reports whether id is
 // plausibly a Discord conversation id (DM user id or guild channel id) based
@@ -578,25 +572,16 @@ func (f *Frontend) OwnsConversationID(id string) bool {
 	return int64(sf) >= discordSnowflakeFloor
 }
 
-// KnownConversation reports whether chatID is a conversation id this
-// Frontend has already seen and gated inbound — i.e. it's a DM user id or a
-// guild channel id from an allowed guild that passed gate()'s checks. Used
-// by the outbound allowlist to permit replies into guild channels: guild
-// channels are never present in the Discord access.Manager's user-id
-// allowlist (that only holds sender ids), so without this every model reply
-// into an allowed guild channel would be silently dropped even though the
-// inbound message that prompted it was itself allowlisted. Fail-closed for
-// anything never seen inbound.
+// KnownConversation lets the outbound allowlist permit replies into guild
+// channels, which are never present in the Discord access.Manager's
+// user-id-keyed allowlist (that only holds sender ids) — without this, every
+// reply into an already-allowed guild channel would be silently dropped.
 //
-// For DMs specifically, chatID IS the sender's user id (see gate()'s convID
-// comment), so we additionally re-check f.auth.Allowed(chatID) live rather
-// than trusting the cached convChannels entry alone: convChannels is never
-// purged, so without this a user denied/removed from the allowlist after an
-// earlier authorized DM would stay reachable for outbound replies until
-// process restart — an asymmetry with Telegram, whose outbound gate consults
-// acc.Allowed live. Guild channel ids are never valid entries in the
-// user-id-keyed auth manager, so this check is a no-op (harmlessly false)
-// for the guild-channel path and doesn't change that behavior.
+// For DMs, chatID IS the sender's user id (see gate()'s convID comment), so
+// we re-check f.auth.Allowed(chatID) live instead of trusting the cached
+// convChannels entry: convChannels is never purged, so a user removed from
+// the allowlist after an earlier DM would otherwise stay reachable until
+// process restart — unlike Telegram, whose outbound gate checks live.
 func (f *Frontend) KnownConversation(chatID string) bool {
 	_, ok := f.convChannels.Load(chatID)
 	if !ok {
@@ -605,9 +590,8 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 	if sf, err := snowflake.Parse(chatID); err == nil && f.auth.Allowed(sf) {
 		return true
 	}
-	// Not currently allowed as a DM sender - only still "known" if this is a
-	// guild channel id, tracked separately in dmConvs (never set for guild
-	// channels, so this always allows the guild-channel path through).
+	// Guild channel ids are never set in dmConvs, so a non-DM chatID falls
+	// through here as known.
 	_, isDM := f.dmConvs.Load(chatID)
 	return !isDM
 }
@@ -619,7 +603,10 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 // attempted regardless of an earlier chunk's outcome, since a transient
 // failure is already queued by sendChunk and skipping the rest would just
 // strand them; only the first permanent failure is returned to the caller,
-// mirroring telegram.Frontend.Send.
+// mirroring telegram.Frontend.Send. Note: because a transiently-failed chunk
+// is queued for background retry while later chunks are sent immediately, a
+// retried chunk can land out of order relative to the rest of the split
+// message.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
@@ -659,28 +646,17 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 }
 
 // resolveChannel figures out which physical channel to CreateMessage into
-// for m, in priority order:
-//
-//  1. Meta["channel_id"] — set by gate() for a message that IS a reply
-//     within the same inbound turn (the common in-process case).
-//  2. convChannels — the channel id last seen for this ConversationID by
-//     gate(), covering relayd-originated replies (scheduler/admin/mcp)
-//     that only carry ConversationID/chat_id, as long as SOME inbound
-//     message from that conversation has been observed since process start.
-//  3. dmChannels / CreateDMChannel — last resort for a relayd-originated
-//     message whose ConversationID has never been seen inbound this
-//     process lifetime at all (e.g. the very first scheduled reminder to a
-//     user). For a DM, ConversationID IS the recipient's user id (see
-//     gate()'s convID comment), so it's treated as one and resolved via
-//     POST /users/@me/channels, which is idempotent — Discord returns the
-//     existing DM channel if one already exists. Without this path, every
-//     such message would fall through to
-//     CreateMessage(<user id>), which 404s (Unknown Channel) and gets
-//     misclassified permanent, silently dropping the reply. A guild
-//     ConversationID reaching this branch (no prior inbound message AND no
-//     channel_id) will also 404 via this path since the id isn't a real
-//     user — that failure is still correctly permanent/logged, just not a
-//     silent one.
+// for m, falling back in priority: Meta["channel_id"] (set by gate() for a
+// same-turn reply), then convChannels (last channel seen inbound for this
+// ConversationID, covering relayd-originated replies), then
+// dmChannels/CreateDMChannel as a last resort for a ConversationID never
+// seen inbound this process lifetime (e.g. the first scheduled reminder to
+// a user). For a DM, ConversationID IS the recipient's user id (see gate()'s
+// convID comment), so CreateDMChannel — idempotent, returns the existing
+// channel if any — resolves it; without this path such a message would
+// 404 against CreateMessage(<user id>) and get misclassified permanent,
+// dropping it silently. A guild ConversationID reaching this branch also
+// 404s here, but that failure is correctly permanent/logged, not silent.
 func (f *Frontend) resolveChannel(ctx context.Context, m relay.Message) (snowflake.ID, error) {
 	channelIDStr := m.Meta["channel_id"]
 	if channelIDStr == "" {

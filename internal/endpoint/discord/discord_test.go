@@ -551,6 +551,81 @@ func TestStartRetryWorkerDeliversQueuedMessage(t *testing.T) {
 	}
 }
 
+// TestStartRetryWorkerExhaustsMaxAttempts covers the give-up-after-attempts
+// terminal branch: an item that keeps failing transiently must be dropped
+// once it hits maxRetryAttempts, incrementing permanentDrops and
+// decrementing queueDepth rather than retrying forever.
+func TestStartRetryWorkerExhaustsMaxAttempts(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	// Seed the queue directly with an item one failure away from
+	// maxRetryAttempts so the test doesn't have to wait out the full
+	// exponential backoff schedule.
+	f.queueDepth.Add(1)
+	f.retryQueue <- retryItem{
+		msg:      relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}},
+		attempts: maxRetryAttempts - 1,
+		nextAt:   time.Now(),
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for f.permanentDrops.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.permanentDrops.Load(); got != 1 {
+		t.Fatalf("expected permanentDrops 1 after exhausting maxRetryAttempts, got %d", got)
+	}
+	if got := f.queueDepth.Load(); got != 0 {
+		t.Fatalf("expected queueDepth 0 after give-up, got %d", got)
+	}
+}
+
+// TestStartRetryWorkerPermanentErrorDuringRetry covers the other terminal
+// branch: a permanent error (e.g. a 403) surfacing during a retry attempt
+// must give up immediately rather than burning through maxRetryAttempts,
+// still incrementing permanentDrops and decrementing queueDepth.
+func TestStartRetryWorkerPermanentErrorDuringRetry(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	f.enqueueRetry(relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}})
+	if f.queueDepth.Load() != 1 {
+		t.Fatalf("expected queueDepth 1 right after enqueue, got %d", f.queueDepth.Load())
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for f.permanentDrops.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.permanentDrops.Load(); got != 1 {
+		t.Fatalf("expected permanentDrops 1 after permanent failure during retry, got %d", got)
+	}
+	if got := f.queueDepth.Load(); got != 0 {
+		t.Fatalf("expected queueDepth 0 after permanent give-up, got %d", got)
+	}
+}
+
 // --- test helpers ------------------------------------------------------------
 
 type recordingAuth struct {
