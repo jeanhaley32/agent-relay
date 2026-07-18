@@ -92,12 +92,8 @@ type Broker struct {
 	// allowlist only gates inbound. nil ⇒ no outbound gating.
 	OutboundAllowed func(chatID string) bool
 
-	// OnBackendReply, if set, is called for every reply the backend (model)
-	// emits, AFTER the outbound gate passes and the reply is delivered to the
-	// frontend - used to infer that a fired trigger was handled (a reply
-	// promptly following it on that chat auto-resolves it). A reply dropped
-	// by the gate, or one Send actually failed to deliver, is never reported
-	// here - that's AckBackendReply's job. nil ⇒ no hook.
+	// OnBackendReply, if set, fires after a reply is actually delivered -
+	// used to auto-resolve fired triggers. nil ⇒ no hook.
 	OnBackendReply func(m Message)
 
 	// AckBackendReply, if set, is called after every Frontend.Send attempt
@@ -124,27 +120,17 @@ type Broker struct {
 	// command itself being Admin: true), affects only non-admins.
 	Lockdown atomic.Bool
 
-	// ConversationCaps optionally bounds cumulative estimated tokens for a
-	// specific chat_id within a rolling ConversationCapWindow, independent
-	// of and tighter than the global Meter budget - per-contact spend
-	// limiting rather than relay-wide. Mutate only via SetCaps (capsMu
-	// guarded) so config changes apply without a restart. nil map ⇒ no
-	// explicit caps.
+	// ConversationCaps bounds per-chat_id cumulative token spend, tighter
+	// than and independent of the global Meter budget. Mutate only via
+	// SetCaps. nil map ⇒ no explicit caps.
 	ConversationCaps map[string]int64
 
-	// DefaultConversationCap, if > 0, applies to any chat_id NOT explicitly
-	// listed in ConversationCaps and not exempted by ConversationCapExempt -
-	// a blanket per-individual cap rather than requiring every contact to
-	// be added by hand. Same construction/SetCaps mutation rule as
-	// ConversationCaps.
+	// DefaultConversationCap, if > 0, is a blanket per-contact cap for any
+	// chat_id not explicitly listed in ConversationCaps or exempted.
 	DefaultConversationCap int64
 
-	// ConversationCapExempt, if set, reports whether chatID should never be
-	// capped regardless of ConversationCaps/DefaultConversationCap - wired
-	// in cmd/relayd to exempt admins, since a blanket default cap is meant
-	// for arbitrary allowlisted contacts, not the operator. nil ⇒ nothing
-	// exempted (only relevant when DefaultConversationCap > 0, since an
-	// explicit ConversationCaps entry is an explicit choice either way).
+	// ConversationCapExempt, if set, excludes chatID from
+	// DefaultConversationCap - used to exempt admins from the blanket cap.
 	ConversationCapExempt func(chatID string) bool
 
 	// ConversationCapWindow is how long a conversation's usage counts
@@ -299,13 +285,9 @@ func (b *Broker) addConversationUsage(chatID string, tokens int) {
 	w.tokens += int64(tokens)
 }
 
-// SetConversationUsage overwrites (does not add to) chatID's usage for the
-// current window with an authoritative real number, replacing the interim
-// chars/4 text-length estimate (which only sees reply text, not
-// reasoning/tool-call tokens) once real per-conversation usage is known.
-// A no-op if chatID has no configured cap. Rolls the window first (same as
-// every other accessor) so a call arriving just after a rollover doesn't
-// stomp on a legitimately-fresh window with a stale pre-rollover number.
+// SetConversationUsage overwrites chatID's current-window usage with an
+// authoritative number, replacing the interim chars/4 estimate. No-op if
+// chatID has no configured cap.
 func (b *Broker) SetConversationUsage(chatID string, tokens int64) {
 	if _, capped := b.capLimit(chatID); !capped {
 		return
@@ -366,8 +348,8 @@ func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
 		defer clearInFlight()
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
-		deadline := time.Now().Add(ttl)
-		for time.Now().Before(deadline) {
+		deadline := b.now().Add(ttl)
+		for b.now().Before(deadline) {
 			select {
 			case <-ctx.Done():
 				return
@@ -407,15 +389,15 @@ func (b *Broker) Run(ctx context.Context) error {
 		for m := range b.Backend.Recv() {
 			estimate := b.Estimate(m.Text)
 			b.Meter.Record(estimate)
-			b.addConversationUsage(m.Meta["chat_id"], estimate)
 			// Outbound gate: the model may target any chat via its reply tool;
 			// only deliver to allowed chats.
 			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
 				if b.AckBackendReply != nil {
 					b.AckBackendReply(m, senderr.Permanent{Err: fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"])})
 				}
-				continue // dropped (the gate func is responsible for logging)
+				continue // dropped (the gate func is responsible for logging); cap not charged
 			}
+			b.addConversationUsage(m.Meta["chat_id"], estimate)
 			sendCtx, cancel := context.WithTimeout(ctx, FrontendSendTimeout)
 			sendErr := b.Frontend.Send(sendCtx, m)
 			cancel()
@@ -440,22 +422,10 @@ func (b *Broker) Run(ctx context.Context) error {
 		if m.Role != User {
 			continue
 		}
-		// -2. Identity-pair invariant: chat_id must equal from_id whenever
-		// both are present. This holds by construction for every private
-		// 1:1 conversation on every current frontend (a Telegram private
-		// chat's id IS the sender's own id; Discord DMs synthesize chat_id
-		// = from_id for the same reason) - so for those it should never
-		// actually fire, which is what makes it a good tripwire there: a hit
-		// means some upstream assumption broke.
-		//
-		// Discord guild (multi-party) channels are a real, deliberate
-		// exception: chat_id there is the shared
-		// channel id, necessarily distinct from whichever member's from_id
-		// sent a given message. Messages that declare guild_id in Meta are
-		// understood to be multi-party, so the invariant is enforced only
-		// for messages that don't declare themselves multi-party - a
-		// frontend-aware exception keyed off the message itself, not a
-		// blanket carve-out.
+		// Identity-pair invariant tripwire: for 1:1 chats chat_id == from_id
+		// by construction, so a mismatch means an upstream assumption broke.
+		// Guild-tagged messages are exempt: multi-party chat_id is
+		// necessarily distinct from any one sender's from_id.
 		if fromID, chatID := m.Meta["from_id"], m.Meta["chat_id"]; fromID != "" && chatID != "" && fromID != chatID && m.Meta["guild_id"] == "" {
 			log.Printf("relay: dropped message with mismatched from_id=%q chat_id=%q - identity-pair invariant violated", fromID, chatID)
 			continue
