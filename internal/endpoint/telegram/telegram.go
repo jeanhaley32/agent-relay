@@ -34,10 +34,8 @@ const defaultBaseURL = "https://api.telegram.org"
 // just repeats the same guaranteed failure.
 const maxMessageLen = 4096
 
-// permanentSendError is an alias for the shared senderr.Permanent type (see
-// its doc comment for the permanent-vs-transient taxonomy), kept as a single
-// definition so retry-classification logic can't drift apart between
-// frontends that need the same semantics.
+// permanentSendError is an alias for the shared senderr.Permanent type; see
+// that package's doc comment for the permanent-vs-transient taxonomy.
 type permanentSendError = senderr.Permanent
 
 // Authorizer decides whether a sender may use the relay and records requests
@@ -325,10 +323,12 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
 // to m.ConversationID). Messages over Telegram's real limit are split (see
-// senderr.Split) rather than dropped. Ordering across chunks is best-effort
-// only: a transient failure queues the remaining chunks for background
-// retry instead of blocking, so a later chunk's retry can still land before
-// an earlier one's.
+// senderr.Split) rather than dropped. Chunks are sent in order, and on a
+// transient failure the remaining chunks are queued for background retry in
+// the same order rather than attempted immediately, to preserve sequence as
+// far as possible. That said, ordering is still only best-effort: once
+// chunks are in the retry queue, each is retried independently, so a later
+// chunk's retry can still land before an earlier one's.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
@@ -562,7 +562,6 @@ func (f *Frontend) PermanentDrops() int64 { return f.permanentDrops.Load() }
 func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }
 
 // GetUpdatesFailures and LastPollSuccess expose the getUpdates polling
-// health signal - this is what actually detects a Telegram-side outage,
-// independent of whether any outbound Send happened to occur during it.
+// health signal (see the field comments on Frontend for why).
 func (f *Frontend) GetUpdatesFailures() int64 { return f.getUpdatesFailures.Load() }
 func (f *Frontend) LastPollSuccess() int64    { return f.lastPollSuccess.Load() }
