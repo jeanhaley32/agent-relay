@@ -34,8 +34,6 @@ const defaultBaseURL = "https://api.telegram.org"
 // just repeats the same guaranteed failure.
 const maxMessageLen = 4096
 
-// permanentSendError is an alias for the shared senderr.Permanent type; see
-// that package's doc comment for the permanent-vs-transient taxonomy.
 type permanentSendError = senderr.Permanent
 
 // Authorizer decides whether a sender may use the relay and records requests
@@ -72,7 +70,7 @@ type Frontend struct {
 	// worker to keep retrying with backoff, instead of just vanishing.
 	retryQueue     chan retryItem
 	sendFailures   atomic.Int64 // failed immediate attempts only, not background retries
-	permanentDrops atomic.Int64 // count of drops: retry queue full, a permanent failure hit during background retry, or retry attempts exhausted
+	permanentDrops atomic.Int64 // count of drops: an immediate send hit a permanent error, retry queue full, a permanent failure hit during background retry, or retry attempts exhausted
 	queueDepth     atomic.Int64
 
 	// getUpdatesFailures/lastPollSuccess are the real signal for an outage:
