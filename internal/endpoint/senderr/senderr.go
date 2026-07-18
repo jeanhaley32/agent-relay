@@ -38,11 +38,12 @@ func Split(text string, limit int) []string {
 	return chunks
 }
 
-// bestBreak returns a byte offset into s, at or before the rune-limit
-// boundary, preferring the latest paragraph/newline/space break so chunks
-// don't split mid-word. Falls back to a hard rune-count cut (always valid,
-// since it's counted in runes not bytes) if no separator exists in range.
-// The second return value reports whether the cut landed on a separator.
+// bestBreak prefers the latest separator at or before the rune-limit
+// boundary so chunks don't split mid-word, falling back to a hard rune-count
+// cut (always valid, since it's counted in runes not bytes) when none exists
+// in range. The second return value reports whether the cut landed on a
+// separator, which Split needs to decide whether trimming the leading
+// separator off the remainder is safe.
 func bestBreak(s string, limit int) (int, bool) {
 	limitByte := runeLimitByteOffset(s, limit)
 	window := s[:limitByte]
@@ -59,8 +60,6 @@ func bestBreak(s string, limit int) (int, bool) {
 	return limitByte, false
 }
 
-// runeLimitByteOffset returns the byte offset of the limit-th rune in s (or
-// len(s) if s has fewer runes than limit).
 func runeLimitByteOffset(s string, limit int) int {
 	count := 0
 	for i := range s {
