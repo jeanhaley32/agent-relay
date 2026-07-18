@@ -66,7 +66,6 @@ type Authorizer interface {
 	Record(id snowflake.ID, name string)
 }
 
-// staticAuthorizer is a fixed allowlist (WithAllowlist). It records nothing.
 type staticAuthorizer map[snowflake.ID]bool
 
 func (s staticAuthorizer) Allowed(id snowflake.ID) bool { return s[id] }
@@ -246,7 +245,6 @@ func WithAllowlist(ids ...snowflake.ID) Option {
 // requests.
 func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a } }
 
-// WithLogger sets a logger (default: discard).
 func WithLogger(l *log.Logger) Option { return func(f *Frontend) { f.logger = l } }
 
 // WithAllowGuildMessages enables guild (server) messages in addition to DMs.
@@ -635,12 +633,11 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 // Send delivers a message to the channel named by m.Meta["channel_id"]
 // (falling back to m.ConversationID) via the REST CreateMessage endpoint. A
 // message over Discord's real 2000-char limit is split into multiple
-// messages (see senderr.Split) rather than permanently dropped — the old
-// behavior silently lost the whole reply with no error surfaced to the
-// sender. Every chunk is attempted regardless of an earlier chunk's outcome,
-// since a transient failure is already queued by sendChunk and skipping the
-// rest would just strand them; only the first permanent failure is returned
-// to the caller, mirroring telegram.Frontend.Send.
+// messages (see senderr.Split) so it isn't silently dropped. Every chunk is
+// attempted regardless of an earlier chunk's outcome, since a transient
+// failure is already queued by sendChunk and skipping the rest would just
+// strand them; only the first permanent failure is returned to the caller,
+// mirroring telegram.Frontend.Send.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
@@ -819,7 +816,6 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 	}
 }
 
-// retryBackoff is exponential with a cap.
 func retryBackoff(attempts int) time.Duration {
 	d := time.Duration(1<<uint(attempts)) * time.Second
 	if d > 5*time.Minute {
@@ -892,11 +888,7 @@ func (f *Frontend) SendFailures() int64   { return f.sendFailures.Load() }
 func (f *Frontend) PermanentDrops() int64 { return f.permanentDrops.Load() }
 func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }
 
-// RecvDrops exposes the inbound-drop counter — see the recvDrops field doc.
 func (f *Frontend) RecvDrops() int64 { return f.recvDrops.Load() }
 
-// GatewayReconnects and LastGatewayEventAt expose the gateway connection
-// health signal — the gateway-health-signal design's analogue of Telegram's
-// GetUpdatesFailures/LastPollSuccess.
 func (f *Frontend) GatewayReconnects() int64  { return f.gatewayReconnects.Load() }
 func (f *Frontend) LastGatewayEventAt() int64 { return f.lastGatewayEventAt.Load() }
