@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/disgo/events"
 	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -413,6 +415,39 @@ func TestKnownConversationDMRevoked(t *testing.T) {
 	delete(auth.allowed, 111)
 	if f.KnownConversation("111") {
 		t.Fatalf("expected a DM sender removed from the allowlist to no longer be known")
+	}
+}
+
+// TestOnMessageCreateRecvFullDrop covers the recv-full drop path in
+// onMessageCreate directly (not via gate(), which every other inbound test
+// uses): when f.recv is still full after the 5s wait, the message must be
+// counted in recvDrops rather than blocking forever.
+func TestOnMessageCreateRecvFullDrop(t *testing.T) {
+	f := &Frontend{
+		auth:            &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+		logger:          testLogger(t),
+		allowedGuildIDs: map[snowflake.ID]bool{},
+		recv:            make(chan relay.Message, 1),
+	}
+	// Fill the buffered recv channel so the next send has nowhere to go.
+	f.recv <- relay.Message{Text: "filler"}
+
+	msg := &events.MessageCreate{GenericMessage: &events.GenericMessage{
+		Message: discord.Message{
+			ID:        1,
+			ChannelID: 9001,
+			Author:    discord.User{ID: 111, Username: "jean"},
+			Content:   "hello",
+		},
+	}}
+
+	start := time.Now()
+	f.onMessageCreate(msg)
+	if elapsed := time.Since(start); elapsed < 5*time.Second {
+		t.Fatalf("expected onMessageCreate to wait out the full 5s send timeout, only waited %s", elapsed)
+	}
+	if got := f.RecvDrops(); got != 1 {
+		t.Fatalf("RecvDrops() = %d, want 1", got)
 	}
 }
 

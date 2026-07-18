@@ -599,12 +599,12 @@ func (f *Frontend) OwnsConversationID(id string) bool {
 // KnownConversation reports whether chatID is a conversation id this
 // Frontend has already seen and gated inbound — i.e. it's a DM user id or a
 // guild channel id from an allowed guild that passed gate()'s checks. Used
-// by relayd's outbound allowlist (OutboundAllowed in cmd/relayd/main.go) to
-// permit replies into guild channels: guild channels are never present in
-// the Discord access.Manager's user-id allowlist (that only holds sender
-// ids), so without this every model reply into an allowed guild channel
-// would be silently dropped even though the inbound message that prompted
-// it was itself allowlisted. Fail-closed for anything never seen inbound.
+// by the outbound allowlist to permit replies into guild channels: guild
+// channels are never present in the Discord access.Manager's user-id
+// allowlist (that only holds sender ids), so without this every model reply
+// into an allowed guild channel would be silently dropped even though the
+// inbound message that prompted it was itself allowlisted. Fail-closed for
+// anything never seen inbound.
 //
 // For DMs specifically, chatID IS the sender's user id (see gate()'s convID
 // comment), so we additionally re-check f.auth.Allowed(chatID) live rather
