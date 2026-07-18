@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/disgoorg/snowflake/v2"
 
@@ -195,10 +196,9 @@ func TestSendRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSendOversizedSplitAndDelivered locks in the fix for the real
-// 2026-07-14 incident: a message over Discord's 2000-char limit used to be
-// permanently dropped with no error surfaced and no message ever delivered.
-// Send now splits it via senderr.Split and delivers every chunk in order.
+// TestSendOversizedSplitAndDelivered verifies that a message over Discord's
+// 2000-char limit is split via senderr.Split and every chunk is delivered
+// in order, rather than being dropped.
 func TestSendOversizedSplitAndDelivered(t *testing.T) {
 	var callCount int
 	mux := http.NewServeMux()
@@ -362,6 +362,137 @@ func TestSendResolvesDMChannelFromConversationID(t *testing.T) {
 	}
 	if !gotMessagePost {
 		t.Fatal("expected the message to be posted to the resolved DM channel")
+	}
+}
+
+// TestOwnsConversationID covers the snowflake-magnitude heuristic that
+// disambiguates a bare numeric ConversationID between frontends: below the
+// floor, non-numeric, and a real Discord-sized id.
+func TestOwnsConversationID(t *testing.T) {
+	f := &Frontend{}
+
+	if f.OwnsConversationID("12345") {
+		t.Fatalf("expected a small (Telegram-range) numeric id to not be owned")
+	}
+	if f.OwnsConversationID("not-a-number") {
+		t.Fatalf("expected a non-numeric id to not be owned")
+	}
+	if !f.OwnsConversationID("111111111111111111") {
+		t.Fatalf("expected a real-magnitude Discord snowflake to be owned")
+	}
+}
+
+// TestKnownConversationGuildChannelStaysAllowed covers the guild-channel
+// branch: once gate() has recorded a channel id in convChannels, it stays
+// known even though it's never a valid entry in the user-id-keyed auth
+// manager.
+func TestKnownConversationGuildChannelStaysAllowed(t *testing.T) {
+	f := &Frontend{auth: &recordingAuth{allowed: map[snowflake.ID]bool{}}}
+	f.convChannels.Store("42", snowflake.ID(42))
+	// Deliberately not stored in dmConvs - mirrors gate() never marking a
+	// guild channel id as a DM.
+	if !f.KnownConversation("42") {
+		t.Fatalf("expected a known guild channel id to remain known")
+	}
+}
+
+// TestKnownConversationDMRevoked covers the security-relevant revoke path: a
+// DM sender removed from the allowlist after an earlier authorized DM must
+// no longer be reachable for outbound replies, even though convChannels
+// still has a cached entry for them.
+func TestKnownConversationDMRevoked(t *testing.T) {
+	auth := &recordingAuth{allowed: map[snowflake.ID]bool{111: true}}
+	f := &Frontend{auth: auth}
+	f.convChannels.Store("111", snowflake.ID(111))
+	f.dmConvs.Store("111", struct{}{})
+
+	if !f.KnownConversation("111") {
+		t.Fatalf("expected a currently-allowed DM sender to be known")
+	}
+
+	delete(auth.allowed, 111)
+	if f.KnownConversation("111") {
+		t.Fatalf("expected a DM sender removed from the allowlist to no longer be known")
+	}
+}
+
+// TestEnqueueRetryQueueFullEviction covers the queue-full eviction path: when
+// the retry queue is at capacity, enqueueRetry must drop the oldest item
+// (counting it in permanentDrops and decrementing queueDepth) rather than
+// blocking the caller, and still admit the new item.
+func TestEnqueueRetryQueueFullEviction(t *testing.T) {
+	f := &Frontend{
+		logger:     testLogger(t),
+		retryQueue: make(chan retryItem, 2),
+	}
+
+	f.enqueueRetry(relay.Message{Text: "one"})
+	f.enqueueRetry(relay.Message{Text: "two"})
+	if f.queueDepth.Load() != 2 {
+		t.Fatalf("expected queueDepth 2 after filling capacity, got %d", f.queueDepth.Load())
+	}
+
+	// Queue is now full (capacity 2); this must evict "one" rather than block.
+	f.enqueueRetry(relay.Message{Text: "three"})
+
+	if f.permanentDrops.Load() != 1 {
+		t.Fatalf("expected permanentDrops 1 after eviction, got %d", f.permanentDrops.Load())
+	}
+	if f.queueDepth.Load() != 2 {
+		t.Fatalf("expected queueDepth back at 2 after eviction, got %d", f.queueDepth.Load())
+	}
+
+	var got []string
+	close(f.retryQueue)
+	for item := range f.retryQueue {
+		got = append(got, item.msg.Text)
+	}
+	if len(got) != 2 || got[0] != "two" || got[1] != "three" {
+		t.Fatalf("expected remaining queue [two three], got %v", got)
+	}
+}
+
+// TestStartRetryWorkerDeliversQueuedMessage exercises the retry worker
+// end-to-end: a message queued via enqueueRetry is eventually delivered by
+// startRetryWorker's background loop, with queueDepth dropping back to 0 on
+// success.
+func TestStartRetryWorkerDeliversQueuedMessage(t *testing.T) {
+	delivered := make(chan struct{}, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1","channel_id":"123","content":"hi","author":{"id":"1","username":"bot"}}`)
+		select {
+		case delivered <- struct{}{}:
+		default:
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	f.enqueueRetry(relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}})
+	if f.queueDepth.Load() != 1 {
+		t.Fatalf("expected queueDepth 1 right after enqueue, got %d", f.queueDepth.Load())
+	}
+
+	select {
+	case <-delivered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the retry worker to deliver the queued message")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for f.queueDepth.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if f.queueDepth.Load() != 0 {
+		t.Fatalf("expected queueDepth 0 after successful retry, got %d", f.queueDepth.Load())
 	}
 }
 
