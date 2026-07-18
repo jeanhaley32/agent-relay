@@ -28,6 +28,7 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
+	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
@@ -531,6 +532,10 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 		Role:           relay.User,
 		Text:           m.content,
 		Meta: map[string]string{
+			// See telegram.go: msg_id is stamped once at ingress and rides in
+			// Meta through the whole relay, so every log line for this message
+			// can be correlated back to what the user actually sent.
+			"msg_id":     eventlog.NewMsgID(),
 			"chat_id":    convID,
 			"channel_id": m.channelID.String(),
 			"from_id":    m.authorID.String(),

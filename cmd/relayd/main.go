@@ -42,6 +42,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
+	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
@@ -297,7 +298,21 @@ func main() {
 	// Service schedule-tool and event-tool calls coming from the model (via the shim).
 	go serveSchedules(back, sched, tracker, logger)
 
+	// Durable audit trail: one JSON line per lifecycle step of every message,
+	// keyed by the msg_id stamped at ingress. This is what makes "what happened
+	// to the message I sent at 16:31?" answerable in seconds instead of an hour
+	// of forensics. Failing to open it is not fatal - observability must never
+	// keep the relay from running.
+	events, err := eventlog.Open("relay-events.jsonl")
+	if err != nil {
+		logger.Printf("event log disabled (%v)", err)
+	} else {
+		defer events.Close()
+		logger.Printf("event log: relay-events.jsonl")
+	}
+
 	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter,
+		Events:                 events,
 		ConversationCaps:       cfg.Budget.ConversationCaps,
 		DefaultConversationCap: cfg.Budget.DefaultConversationCap,
 		// Admins are exempt from DefaultConversationCap - the blanket cap is

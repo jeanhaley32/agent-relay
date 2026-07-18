@@ -35,3 +35,6 @@ schedules.json.events
 .relay_session_id
 __pycache__/
 /relay-shim
+
+# Message audit trail: contains chat_id/from_id, never commit
+relay-events.jsonl

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
+	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
@@ -249,6 +250,12 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 				Role:           relay.User,
 				Text:           m.Text,
 				Meta: map[string]string{
+					// msg_id is this message's identity for the whole relay. It
+					// is stamped once here at ingress and rides along in Meta
+					// (which propagates into the inject frame and the <channel>
+					// tag), so every later log line can be correlated back to
+					// the exact message a user sent.
+					"msg_id":    eventlog.NewMsgID(),
 					"chat_id":   strconv.FormatInt(m.Chat.ID, 10),
 					"from_id":   strconv.FormatInt(m.From.ID, 10),
 					"from_name": m.From.Username,

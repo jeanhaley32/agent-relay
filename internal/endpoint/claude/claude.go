@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
@@ -201,7 +202,10 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 				// reply_id carries the correlation id back to ReplyRespond,
 				// so the broker can report a real delivery failure to the
 				// waiting tool call instead of it always returning "sent".
-				Meta: map[string]string{"chat_id": f.ChatID, "reply_id": f.RequestID},
+				// Outbound replies get their own msg_id too: "uniquely identify
+				// EVERY message" means model-generated ones as well, otherwise a
+				// reply can be seen in the audit trail but never referred to.
+				Meta: map[string]string{"chat_id": f.ChatID, "reply_id": f.RequestID, "msg_id": eventlog.NewMsgID()},
 			}
 			select {
 			case e.recv <- msg:
