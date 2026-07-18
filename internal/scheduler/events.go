@@ -1,15 +1,12 @@
-// This file adds a pending-event tracker to the scheduler package. Where the
-// Scheduler decides WHEN something should fire, the Tracker records that a fire
-// actually happened and follows it until the agent acknowledges handling it —
-// closing the long-standing gap where a fired trigger could be silently buried
-// in a busy Claude session and never acted on.
+// The Tracker records that a scheduled fire actually happened and follows it
+// until acknowledged, closing the gap where a fired trigger could be silently
+// buried in a busy session and never acted on.
 //
-// Design (crash-safe by construction): the Tracker does NOT arm a per-event
-// timer. It persists only facts (when each event fired, whether it was
-// delivered/nudged/escalated) and a single reconciliation ticker periodically
-// derives what is due purely from wall-clock comparisons against those
-// timestamps. A restart at any point loses no state and needs no re-arming:
-// the next tick recomputes the correct action from the persisted file alone.
+// It is crash-safe by construction: rather than arming a per-event timer, it
+// persists only fire/delivery/nudge/escalation timestamps, and a periodic
+// reconciliation tick derives what's due from wall-clock comparisons against
+// those timestamps — so a restart at any point needs no re-arming.
+
 package scheduler
 
 import (
@@ -25,7 +22,6 @@ import (
 	"time"
 )
 
-// Event status values.
 const (
 	StatusPending      = "pending"
 	StatusAcknowledged = "acknowledged"
@@ -36,19 +32,19 @@ const (
 // so the process can restart at any point without losing track of it.
 type PendingEvent struct {
 	ID          string    `json:"id"`
-	ScheduleID  string    `json:"schedule_id,omitempty"` // which schedule fired this (empty for non-schedule sources)
+	ScheduleID  string    `json:"schedule_id,omitempty"`
 	ChatID      string    `json:"chat_id"`
 	Text        string    `json:"text"`
 	FiredAt     time.Time `json:"fired_at"`
-	DeliveredAt time.Time `json:"delivered_at,omitempty"`  // zero until confirmed injected into a live session
-	LastNudgeAt time.Time `json:"last_nudge_at,omitempty"` // zero until the 5-min re-inject happened
+	DeliveredAt time.Time `json:"delivered_at,omitempty"`
+	LastNudgeAt time.Time `json:"last_nudge_at,omitempty"`
 	Status      string    `json:"status"`
 	AckNote     string    `json:"ack_note,omitempty"`
 	AckedAt     time.Time `json:"acked_at,omitempty"`
 
 	// Bookkeeping beyond the core model:
-	FireCount      int       `json:"fire_count"`                 // times the source (re)fired while still open — coalescing counter
-	FallbackSentAt time.Time `json:"fallback_sent_at,omitempty"` // zero until the direct-to-Jean escalation fired
+	FireCount      int       `json:"fire_count"`
+	FallbackSentAt time.Time `json:"fallback_sent_at,omitempty"`
 }
 
 // InjectFunc delivers text into the agent's session. It reports whether the
@@ -163,24 +159,21 @@ func NewTracker(path string, inject InjectFunc, fallback FallbackFunc, receipt R
 }
 
 // Fire records that a trigger fired and injects it into the agent's session
-// with an instruction to ack when done. If scheduleID is non-empty and an open
-// (pending) event from the SAME schedule already exists, it does NOT spawn a
-// sibling: it bumps that event's counter and refreshes its text instead, so a
-// wedged agent can't accumulate a pile of duplicate escalating events. But if
-// that existing event has already been through the full escalation ladder
-// (fallback sent), silent coalescing would mean a single stuck event
-// suppresses every future fire of a recurring schedule forever — so that case
-// is treated as a fresh delivery instead: timers reset and the prompt is
-// re-injected, restarting the nudge/escalate cycle for the new fire.
+// with an instruction to ack when done. An open (pending) event from the same
+// scheduleID is coalesced (counter bumped, text refreshed) instead of
+// spawning a sibling, so a wedged agent can't accumulate duplicate escalating
+// events — unless that event already went through the full escalation ladder
+// (fallback sent), in which case it's treated as a fresh delivery so a single
+// stuck event can't permanently suppress a recurring schedule.
 //
-// The pending event is persisted BEFORE the caller does any schedule cleanup,
-// so a crash between firing and one-shot deletion can never lose the event with
-// no trace. Returns the (new or coalesced) event.
-func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
+// This must persist before the caller does any schedule cleanup, so a crash
+// in between can't lose the event with no trace. Returns a copy, not a live
+// pointer, since Reconcile mutates the map concurrently.
+func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 	t.mu.Lock()
-	// Coalesce onto an existing open event from the same schedule.
 	if scheduleID != "" {
 		if ex := t.openBySchedule(scheduleID); ex != nil {
+			prior := *ex
 			ex.FireCount++
 			ex.Text = text
 			stuck := !ex.FallbackSentAt.IsZero()
@@ -190,20 +183,26 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 				ex.LastNudgeAt = time.Time{}
 				ex.FallbackSentAt = time.Time{}
 			}
+			snapshot := *ex
 			err := t.persist()
-			t.mu.Unlock()
 			if err != nil {
-				// Not durably persisted — surface so the caller keeps the
-				// schedule for a retry rather than deleting it.
-				return ex, fmt.Errorf("persist coalesced event %s: %w", ex.ID, err)
+				// Not durably persisted — roll back the in-memory mutations
+				// so memory doesn't diverge from disk, and surface the error
+				// so the caller keeps the schedule for a retry rather than
+				// deleting it.
+				*ex = prior
+				t.mu.Unlock()
+				return prior, fmt.Errorf("persist coalesced event %s: %w", ex.ID, err)
 			}
+			t.mu.Unlock()
 			if stuck {
 				t.logger.Printf("re-fire of schedule %s onto escalated event %s: resetting and re-injecting (count=%d)", scheduleID, ex.ID, ex.FireCount)
-				delivered := t.inject(chatID, t.initialPrompt(ex))
+				delivered := t.inject(chatID, t.initialPrompt(&snapshot))
 				if delivered {
 					t.mu.Lock()
 					if e, ok := t.events[ex.ID]; ok && e.Status == StatusPending {
 						e.DeliveredAt = t.cfg.Now()
+						snapshot.DeliveredAt = e.DeliveredAt
 						_ = t.persist()
 					}
 					t.mu.Unlock()
@@ -211,7 +210,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 			} else {
 				t.logger.Printf("coalesced re-fire of schedule %s onto event %s (count=%d)", scheduleID, ex.ID, ex.FireCount)
 			}
-			return ex, nil
+			return snapshot, nil
 		}
 	}
 	ev := &PendingEvent{
@@ -233,8 +232,9 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 	if err := t.persist(); err != nil {
 		delete(t.events, ev.ID)
 		t.mu.Unlock()
-		return nil, fmt.Errorf("persist pending event %s: %w", ev.ID, err)
+		return PendingEvent{}, fmt.Errorf("persist pending event %s: %w", ev.ID, err)
 	}
+	snapshot := *ev
 	t.mu.Unlock()
 
 	// Inject the trigger exactly once, here. The Claude endpoint's Send is
@@ -242,16 +242,17 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 	// so a "not yet delivered" event is NOT lost and must not be re-injected on
 	// every reconcile tick. Connected() is used only as a best-effort signal to
 	// stamp DeliveredAt for metrics — never as a gate that re-sends the prompt.
-	delivered := t.inject(chatID, t.initialPrompt(ev))
+	delivered := t.inject(chatID, t.initialPrompt(&snapshot))
 	if delivered {
 		t.mu.Lock()
 		if e, ok := t.events[ev.ID]; ok && e.Status == StatusPending {
 			e.DeliveredAt = t.cfg.Now()
+			snapshot.DeliveredAt = e.DeliveredAt
 			_ = t.persist()
 		}
 		t.mu.Unlock()
 	}
-	return ev, nil
+	return snapshot, nil
 }
 
 // Ack marks an event acknowledged. A non-empty note is required by design: it
@@ -293,8 +294,8 @@ func (t *Tracker) Ack(id, note string) error {
 // after the outbound gate passes).
 func (t *Tracker) NoteReply(chatID string, at time.Time) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	changed := false
+	var resolved []string
 	for _, ev := range t.events {
 		if ev.Status != StatusPending || ev.ChatID != chatID {
 			continue
@@ -309,11 +310,19 @@ func (t *Tracker) NoteReply(chatID string, at time.Time) {
 			ev.AckNote = "inferred from prompt reply"
 			ev.AckedAt = at
 			changed = true
+			resolved = append(resolved, ev.ID)
 			t.logger.Printf("event %s auto-resolved (reply within %s of fire/nudge on chat %s)", ev.ID, t.cfg.ReplyAckWindow, chatID)
 		}
 	}
 	if changed {
 		_ = t.persist()
+	}
+	t.mu.Unlock()
+
+	// Inferred acks get their own receipt (event ID, not a note) so they don't
+	// silently break the "every ack leaves a trail" invariant Ack() upholds.
+	for _, id := range resolved {
+		t.receipt("✓ auto-resolved (reply): " + id)
 	}
 }
 
@@ -361,7 +370,6 @@ func (t *Tracker) OldestOpenAge() time.Duration {
 	return oldest
 }
 
-// Close stops the reconciliation loop.
 func (t *Tracker) Close() {
 	t.mu.Lock()
 	if t.closed {
@@ -413,26 +421,18 @@ func (t *Tracker) Reconcile(now time.Time) {
 			continue
 		}
 		age := now.Sub(ev.FiredAt)
-		// NOTE: no undelivered-retry inject here. The initial trigger is
-		// injected exactly once at Fire time over a lossless-buffered link, so
-		// re-injecting it every tick while the shim is briefly down would just
-		// spam duplicate prompts (and could evict other buffered frames). The
-		// nudge below is the only escalating re-inject, and it fires at most
-		// once by design.
+		// No undelivered-retry here: the trigger is injected once at Fire
+		// time over a lossless link, so re-injecting every tick would just
+		// spam duplicates. Nudge/fallback below are each at-most-once.
 		switch {
 		case age >= t.cfg.EscalateAfter:
-			// Past escalation: stop nagging the agent, tell Jean directly, once.
-			// FallbackSentAt is NOT marked here — it is stamped only after the
-			// send actually succeeds (below), so a crash or send failure in the
-			// gap doesn't record this last-line-of-defense ping as done.
+			// FallbackSentAt is stamped only after send succeeds (below), so
+			// a crash or send failure doesn't mark this last-resort ping done.
 			if ev.FallbackSentAt.IsZero() {
 				mins := int(age.Minutes())
 				actions = append(actions, action{ev.ID, "", t.fallbackText(ev, mins), true})
 			}
 		case age >= t.cfg.NudgeAfter:
-			// One escalating re-inject into the agent's own session. Lower
-			// stakes than the fallback, so kept at-most-once (marked before the
-			// send): a duplicated nudge matters less than a duplicated ping.
 			if ev.LastNudgeAt.IsZero() {
 				actions = append(actions, action{ev.ID, ev.ChatID, t.nudgePrompt(ev, int(age.Minutes())), false})
 				ev.LastNudgeAt = now
@@ -552,12 +552,13 @@ func (t *Tracker) persist() error {
 		t.logger.Printf("warning: marshal pending events: %v", err)
 		return err
 	}
-	tmp := t.path + ".tmp"
+	cleanPath := filepath.Clean(t.path)
+	tmp := cleanPath + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		t.logger.Printf("warning: persist pending events: %v", err)
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Clean(t.path)); err != nil {
+	if err := os.Rename(tmp, cleanPath); err != nil {
 		t.logger.Printf("warning: rename pending events: %v", err)
 		return err
 	}
