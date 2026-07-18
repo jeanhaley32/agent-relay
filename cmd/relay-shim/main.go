@@ -57,21 +57,7 @@ func main() {
 			`arrives prefixed with "[scheduled trigger you set earlier fired]". When you have `+
 			`handled a fired trigger, call ack_event with its id and a short note of what you did, `+
 			`or it will keep escalating; list_pending_events shows what is still open.`,
-		func(_ context.Context, chatID, text string) error {
-			// Request/response (not fire-and-forget send): the daemon answers
-			// with a reply_ack frame carrying the real delivery outcome (e.g.
-			// Telegram's 4096-char limit), so a failed send surfaces as a
-			// genuine tool error the model can react to - split the message,
-			// retry, etc. - instead of always looking like "sent".
-			resp, err := cl.request(ipc.Frame{Kind: ipc.KindReply, ChatID: chatID, Text: text}, replyAckTimeout)
-			if err != nil {
-				return err
-			}
-			if resp.Err != "" {
-				return errors.New(resp.Err)
-			}
-			return nil
-		})
+		replyHandler(cl))
 	srv.EnablePermissionRelay(func(req channel.PermissionRequest) {
 		detail := req.Description
 		if req.InputPreview != "" {
@@ -144,9 +130,26 @@ const schedTimeout = 10 * time.Second
 // to confirm delivery. Must stay strictly greater than relay.FrontendSendTimeout
 // so the broker's own send deadline expires first, narrowing (though not
 // eliminating - see relay.FrontendSendTimeout's doc) the window in which a
-// send lands after this call has already given up; enforced by
-// TestReplyAckTimeoutMatchesFrontendSendTimeout.
+// send lands after this call has already given up.
 const replyAckTimeout = 15 * time.Second
+
+// replyHandler builds the reply-tool callback: a request/response round-trip
+// (not fire-and-forget) so the daemon's reply_ack frame carrying the real
+// delivery outcome (e.g. Telegram's 4096-char limit) surfaces a failed send
+// as a genuine tool error the model can react to - split the message, retry,
+// etc. - instead of always looking like "sent".
+func replyHandler(cl *client) channel.ReplyFunc {
+	return func(_ context.Context, chatID, text string) error {
+		resp, err := cl.request(ipc.Frame{Kind: ipc.KindReply, ChatID: chatID, Text: text}, replyAckTimeout)
+		if err != nil {
+			return err
+		}
+		if resp.Err != "" {
+			return errors.New(resp.Err)
+		}
+		return nil
+	}
+}
 
 // registerScheduleTools adds the schedule_message/list_schedules/cancel_schedule
 // tools. Each turns a call into a sched_req frame, waits for the daemon's
