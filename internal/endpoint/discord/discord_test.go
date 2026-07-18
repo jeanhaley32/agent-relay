@@ -374,8 +374,7 @@ func TestSendResolvesDMChannelFromConversationID(t *testing.T) {
 	}
 	defer f.Close()
 
-	// No Meta at all, and never previously seen inbound — exactly the shape
-	// of a scheduled reminder built by cmd/relayd/main.go.
+	// No Meta at all, and never previously seen inbound.
 	if err := f.Send(context.Background(), relay.Message{ConversationID: userID, Text: "hi"}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}

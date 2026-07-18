@@ -327,10 +327,8 @@ func New(token string, opts ...Option) (*Frontend, error) {
 // without ever calling Close(), the gateway connection is NOT torn down by
 // that alone and f.recv is never closed — a goroutine blocked reading Recv()
 // (e.g. the Broker) can wait forever. Close() MUST always be called to
-// release recv, regardless of ctx state. Harmless in relayd's current wiring
-// (it passes context.Background() to Connect and always calls Close on
-// shutdown), but a future caller that expects ctx cancellation alone to be
-// sufficient will hang.
+// release recv, regardless of ctx state. A caller that expects ctx
+// cancellation alone to be sufficient will hang.
 func (f *Frontend) Connect(ctx context.Context) error {
 	intents := []gateway.Intents{gateway.IntentGuilds, gateway.IntentDirectMessages}
 	if f.allowGuildMessages {
@@ -721,11 +719,8 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	create := discord.MessageCreate{Content: m.Text}
 	sent, err := f.channels.CreateMessage(channelID, create, rest.WithCtx(ctx))
 	if err == nil {
-		// Log the real Discord message id Discord itself assigned, so a
-		// "the daemon said success" claim can be cross-checked directly
-		// against the platform afterward (e.g. via GET .../messages) rather
-		// than trusting the ack alone: a reply_ack can report success while
-		// the message never actually appears in the channel history.
+		// Log Discord's own message id so a later ack can be cross-checked
+		// against the platform, not just trusted at face value.
 		f.logger.Printf("discord send ok: channel=%s message=%s", channelID, sent.ID)
 		return nil
 	}
