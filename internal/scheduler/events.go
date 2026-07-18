@@ -10,6 +10,7 @@
 // derives what is due purely from wall-clock comparisons against those
 // timestamps. A restart at any point loses no state and needs no re-arming:
 // the next tick recomputes the correct action from the persisted file alone.
+
 package scheduler
 
 import (
@@ -39,8 +40,8 @@ type PendingEvent struct {
 	ChatID      string    `json:"chat_id"`
 	Text        string    `json:"text"`
 	FiredAt     time.Time `json:"fired_at"`
-	DeliveredAt time.Time `json:"delivered_at,omitempty"`  // zero until confirmed injected into a live session
-	LastNudgeAt time.Time `json:"last_nudge_at,omitempty"` // zero until the 5-min re-inject happened
+	DeliveredAt time.Time `json:"delivered_at,omitempty"`
+	LastNudgeAt time.Time `json:"last_nudge_at,omitempty"`
 	Status      string    `json:"status"`
 	AckNote     string    `json:"ack_note,omitempty"`
 	AckedAt     time.Time `json:"acked_at,omitempty"`
