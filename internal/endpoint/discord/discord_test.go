@@ -10,7 +10,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/disgo/events"
 	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -113,6 +116,26 @@ func TestGateGuildPolicy(t *testing.T) {
 	}
 }
 
+// TestGateGuildMessagesDisallowedByDefault ensures that with
+// allowGuildMessages=false (the default), every guild message is dropped
+// regardless of allowedGuildIDs, mention state, or sender allowlist status.
+func TestGateGuildMessagesDisallowedByDefault(t *testing.T) {
+	someGuild := snowflake.ID(500)
+	f := &Frontend{
+		auth:                  &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+		logger:                testLogger(t),
+		allowGuildMessages:    false,
+		allowedGuildIDs:       map[snowflake.ID]bool{someGuild: true},
+		requireMentionInGuild: true,
+	}
+
+	if _, ok := f.gate(inboundMessage{
+		authorID: 111, guildID: &someGuild, content: "@bot hi", mentionsBot: true,
+	}); ok {
+		t.Fatalf("expected guild message to be dropped when allowGuildMessages is false")
+	}
+}
+
 // TestGateDropsBots ensures messages authored by other bots (including the
 // frontend's own echoes) are never relayed, to avoid bot-loops.
 func TestGateDropsBots(t *testing.T) {
@@ -195,10 +218,9 @@ func TestSendRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSendOversizedSplitAndDelivered locks in the fix for the real
-// 2026-07-14 incident: a message over Discord's 2000-char limit used to be
-// permanently dropped with no error surfaced and no message ever delivered.
-// Send now splits it via senderr.Split and delivers every chunk in order.
+// TestSendOversizedSplitAndDelivered verifies that a message over Discord's
+// 2000-char limit is split via senderr.Split and every chunk is delivered
+// in order, rather than being dropped.
 func TestSendOversizedSplitAndDelivered(t *testing.T) {
 	var callCount int
 	mux := http.NewServeMux()
@@ -352,8 +374,7 @@ func TestSendResolvesDMChannelFromConversationID(t *testing.T) {
 	}
 	defer f.Close()
 
-	// No Meta at all, and never previously seen inbound — exactly the shape
-	// of a scheduled reminder built by cmd/relayd/main.go.
+	// No Meta at all, and never previously seen inbound.
 	if err := f.Send(context.Background(), relay.Message{ConversationID: userID, Text: "hi"}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -362,6 +383,338 @@ func TestSendResolvesDMChannelFromConversationID(t *testing.T) {
 	}
 	if !gotMessagePost {
 		t.Fatal("expected the message to be posted to the resolved DM channel")
+	}
+}
+
+// TestOwnsConversationID covers the snowflake-magnitude heuristic that
+// disambiguates a bare numeric ConversationID between frontends: below the
+// floor, non-numeric, and a real Discord-sized id.
+func TestOwnsConversationID(t *testing.T) {
+	f := &Frontend{}
+
+	if f.OwnsConversationID("12345") {
+		t.Fatalf("expected a small (Telegram-range) numeric id to not be owned")
+	}
+	if f.OwnsConversationID("not-a-number") {
+		t.Fatalf("expected a non-numeric id to not be owned")
+	}
+	if !f.OwnsConversationID("111111111111111111") {
+		t.Fatalf("expected a real-magnitude Discord snowflake to be owned")
+	}
+}
+
+// TestKnownConversationGuildChannelStaysAllowed covers the guild-channel
+// branch: once gate() has recorded a channel id in convChannels, it stays
+// known even though it's never a valid entry in the user-id-keyed auth
+// manager.
+func TestKnownConversationGuildChannelStaysAllowed(t *testing.T) {
+	f := &Frontend{auth: &recordingAuth{allowed: map[snowflake.ID]bool{}}}
+	f.convChannels.Store("42", snowflake.ID(42))
+	// Deliberately not stored in dmConvs - mirrors gate() never marking a
+	// guild channel id as a DM.
+	if !f.KnownConversation("42") {
+		t.Fatalf("expected a known guild channel id to remain known")
+	}
+}
+
+// TestKnownConversationDMRevoked covers the security-relevant revoke path: a
+// DM sender removed from the allowlist after an earlier authorized DM must
+// no longer be reachable for outbound replies, even though convChannels
+// still has a cached entry for them.
+func TestKnownConversationDMRevoked(t *testing.T) {
+	auth := &recordingAuth{allowed: map[snowflake.ID]bool{111: true}}
+	f := &Frontend{auth: auth}
+	f.convChannels.Store("111", snowflake.ID(111))
+	f.dmConvs.Store("111", struct{}{})
+
+	if !f.KnownConversation("111") {
+		t.Fatalf("expected a currently-allowed DM sender to be known")
+	}
+
+	delete(auth.allowed, 111)
+	if f.KnownConversation("111") {
+		t.Fatalf("expected a DM sender removed from the allowlist to no longer be known")
+	}
+}
+
+// TestOnMessageCreateRecvFullDrop covers the recv-full drop path in
+// onMessageCreate directly (not via gate(), which every other inbound test
+// uses): when f.recv is still full after the 5s wait, the message must be
+// counted in recvDrops rather than blocking forever.
+func TestOnMessageCreateRecvFullDrop(t *testing.T) {
+	f := &Frontend{
+		auth:            &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+		logger:          testLogger(t),
+		allowedGuildIDs: map[snowflake.ID]bool{},
+		recv:            make(chan relay.Message, 1),
+	}
+	// Fill the buffered recv channel so the next send has nowhere to go.
+	f.recv <- relay.Message{Text: "filler"}
+
+	msg := &events.MessageCreate{GenericMessage: &events.GenericMessage{
+		Message: discord.Message{
+			ID:        1,
+			ChannelID: 9001,
+			Author:    discord.User{ID: 111, Username: "jean"},
+			Content:   "hello",
+		},
+	}}
+
+	start := time.Now()
+	f.onMessageCreate(msg)
+	if elapsed := time.Since(start); elapsed < 5*time.Second {
+		t.Fatalf("expected onMessageCreate to wait out the full 5s send timeout, only waited %s", elapsed)
+	}
+	if got := f.RecvDrops(); got != 1 {
+		t.Fatalf("RecvDrops() = %d, want 1", got)
+	}
+}
+
+// TestOnMessageCreateMentionAndReplyExtraction drives onMessageCreate with a
+// real events.MessageCreate (populated Mentions/ReferencedMessage, matching
+// what disgo hands us off the gateway) rather than setting mentionsBot /
+// isReplyToBot directly on an inboundMessage, so a regression in the
+// extraction logic in onMessageCreate itself (not just in gate()) would fail
+// this test.
+func TestOnMessageCreateMentionAndReplyExtraction(t *testing.T) {
+	selfID := snowflake.ID(777)
+	allowedGuild := snowflake.ID(500)
+
+	newFrontend := func() *Frontend {
+		return &Frontend{
+			auth:                  &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+			logger:                testLogger(t),
+			selfID:                selfID,
+			allowGuildMessages:    true,
+			allowedGuildIDs:       map[snowflake.ID]bool{allowedGuild: true},
+			requireMentionInGuild: true,
+			recv:                  make(chan relay.Message, 1),
+		}
+	}
+
+	// A guild message that @-mentions the bot (via Mentions, not a direct
+	// mentionsBot flag) must satisfy requireMentionInGuild and be relayed.
+	t.Run("mention", func(t *testing.T) {
+		f := newFrontend()
+		f.onMessageCreate(&events.MessageCreate{GenericMessage: &events.GenericMessage{
+			Message: discord.Message{
+				ID:        1,
+				ChannelID: 42,
+				GuildID:   &allowedGuild,
+				Author:    discord.User{ID: 111, Username: "jean"},
+				Content:   "@bot hi",
+				Mentions:  []discord.User{{ID: selfID}},
+			},
+		}})
+		select {
+		case msg := <-f.recv:
+			if msg.Text != "@bot hi" {
+				t.Fatalf("unexpected message text: %+v", msg)
+			}
+		default:
+			t.Fatalf("expected mentioned guild message to be relayed")
+		}
+	})
+
+	// A reply to the bot's own message (via ReferencedMessage) must also
+	// satisfy requireMentionInGuild, without any explicit mention.
+	t.Run("reply-to-bot", func(t *testing.T) {
+		f := newFrontend()
+		f.onMessageCreate(&events.MessageCreate{GenericMessage: &events.GenericMessage{
+			Message: discord.Message{
+				ID:        2,
+				ChannelID: 42,
+				GuildID:   &allowedGuild,
+				Author:    discord.User{ID: 111, Username: "jean"},
+				Content:   "yes",
+				ReferencedMessage: &discord.Message{
+					Author: discord.User{ID: selfID},
+				},
+			},
+		}})
+		select {
+		case msg := <-f.recv:
+			if msg.Text != "yes" {
+				t.Fatalf("unexpected message text: %+v", msg)
+			}
+		default:
+			t.Fatalf("expected reply-to-bot guild message to be relayed")
+		}
+	})
+
+	// Unaddressed guild chatter (no mention, no reply-to-bot) must still be
+	// dropped when driven through the real extraction path.
+	t.Run("unaddressed", func(t *testing.T) {
+		f := newFrontend()
+		f.onMessageCreate(&events.MessageCreate{GenericMessage: &events.GenericMessage{
+			Message: discord.Message{
+				ID:        3,
+				ChannelID: 42,
+				GuildID:   &allowedGuild,
+				Author:    discord.User{ID: 111, Username: "jean"},
+				Content:   "ambient chatter",
+			},
+		}})
+		select {
+		case msg := <-f.recv:
+			t.Fatalf("expected unaddressed guild message to be dropped, got %+v", msg)
+		default:
+		}
+	})
+}
+
+// TestEnqueueRetryQueueFullEviction covers the queue-full eviction path: when
+// the retry queue is at capacity, enqueueRetry must drop the oldest item
+// (counting it in permanentDrops and decrementing queueDepth) rather than
+// blocking the caller, and still admit the new item.
+func TestEnqueueRetryQueueFullEviction(t *testing.T) {
+	f := &Frontend{
+		logger:     testLogger(t),
+		retryQueue: make(chan retryItem, 2),
+	}
+
+	f.enqueueRetry(relay.Message{Text: "one"})
+	f.enqueueRetry(relay.Message{Text: "two"})
+	if f.queueDepth.Load() != 2 {
+		t.Fatalf("expected queueDepth 2 after filling capacity, got %d", f.queueDepth.Load())
+	}
+
+	// Queue is now full (capacity 2); this must evict "one" rather than block.
+	f.enqueueRetry(relay.Message{Text: "three"})
+
+	if f.permanentDrops.Load() != 1 {
+		t.Fatalf("expected permanentDrops 1 after eviction, got %d", f.permanentDrops.Load())
+	}
+	if f.queueDepth.Load() != 2 {
+		t.Fatalf("expected queueDepth back at 2 after eviction, got %d", f.queueDepth.Load())
+	}
+
+	var got []string
+	close(f.retryQueue)
+	for item := range f.retryQueue {
+		got = append(got, item.msg.Text)
+	}
+	if len(got) != 2 || got[0] != "two" || got[1] != "three" {
+		t.Fatalf("expected remaining queue [two three], got %v", got)
+	}
+}
+
+// TestStartRetryWorkerDeliversQueuedMessage exercises the retry worker
+// end-to-end: a message queued via enqueueRetry is eventually delivered by
+// startRetryWorker's background loop, with queueDepth dropping back to 0 on
+// success.
+func TestStartRetryWorkerDeliversQueuedMessage(t *testing.T) {
+	delivered := make(chan struct{}, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1","channel_id":"123","content":"hi","author":{"id":"1","username":"bot"}}`)
+		select {
+		case delivered <- struct{}{}:
+		default:
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	f.enqueueRetry(relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}})
+	if f.queueDepth.Load() != 1 {
+		t.Fatalf("expected queueDepth 1 right after enqueue, got %d", f.queueDepth.Load())
+	}
+
+	select {
+	case <-delivered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the retry worker to deliver the queued message")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for f.queueDepth.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if f.queueDepth.Load() != 0 {
+		t.Fatalf("expected queueDepth 0 after successful retry, got %d", f.queueDepth.Load())
+	}
+}
+
+// TestStartRetryWorkerExhaustsMaxAttempts covers the give-up-after-attempts
+// terminal branch: an item that keeps failing transiently must be dropped
+// once it hits maxRetryAttempts, incrementing permanentDrops and
+// decrementing queueDepth rather than retrying forever.
+func TestStartRetryWorkerExhaustsMaxAttempts(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	// Seed the queue directly with an item one failure away from
+	// maxRetryAttempts so the test doesn't have to wait out the full
+	// exponential backoff schedule.
+	f.queueDepth.Add(1)
+	f.retryQueue <- retryItem{
+		msg:      relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}},
+		attempts: maxRetryAttempts - 1,
+		nextAt:   time.Now(),
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for f.permanentDrops.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.permanentDrops.Load(); got != 1 {
+		t.Fatalf("expected permanentDrops 1 after exhausting maxRetryAttempts, got %d", got)
+	}
+	if got := f.queueDepth.Load(); got != 0 {
+		t.Fatalf("expected queueDepth 0 after give-up, got %d", got)
+	}
+}
+
+// TestStartRetryWorkerPermanentErrorDuringRetry covers the other terminal
+// branch: a permanent error (e.g. a 403) surfacing during a retry attempt
+// must give up immediately rather than burning through maxRetryAttempts,
+// still incrementing permanentDrops and decrementing queueDepth.
+func TestStartRetryWorkerPermanentErrorDuringRetry(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	f.enqueueRetry(relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}})
+	if f.queueDepth.Load() != 1 {
+		t.Fatalf("expected queueDepth 1 right after enqueue, got %d", f.queueDepth.Load())
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for f.permanentDrops.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.permanentDrops.Load(); got != 1 {
+		t.Fatalf("expected permanentDrops 1 after permanent failure during retry, got %d", got)
+	}
+	if got := f.queueDepth.Load(); got != 0 {
+		t.Fatalf("expected queueDepth 0 after permanent give-up, got %d", got)
 	}
 }
 

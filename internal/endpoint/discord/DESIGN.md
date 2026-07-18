@@ -161,8 +161,8 @@ frontend applies an analogous **default-deny on message source**:
   channel chatter it was never asked to look at, on top of the sender
   allowlist. DMs have no such requirement (every message in a DM is
   addressed to the bot by construction, same as Telegram's private chats).
-- `chat_id`/`from_id` identity-pair invariant (relay.go's tripwire, line
-  224-238): in DM mode `chat_id` (the DM channel id) is **not** equal to
+- `chat_id`/`from_id` identity-pair invariant (the Broker's chat-id-equals-from-id
+  tripwire in relay.go): in DM mode `chat_id` (the DM channel id) is **not** equal to
   `from_id` (the user id) the way Telegram's private-chat id happens to
   equal the sender id — Discord DM channel ids are their own snowflake
   namespace. **This means the Broker's existing identity-pair tripwire
@@ -374,10 +374,7 @@ Concrete, mapped to this design (not generic advice):
       `GUILD_PRESENCES` explicitly never requested.
 - [ ] **Sender-gated on user ID via the shared `access.Manager`**, never on
       channel/guild ID — per §3. No code path treats "message arrived in
-      channel X" as suf
-
-ficient authorization on its own; the sender-id
-            channel X" as sufficient authorization on its own; the sender-id
+      channel X" as sufficient authorization on its own; the sender-id
       check runs regardless of channel/guild.
 - [ ] **Fail-closed defaults**: no config block ⇒ Discord frontend not
       started at all (not "started with an empty allowlist that denies
