@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // fakeEndpoint is a minimal Endpoint for routing tests.
@@ -118,5 +119,63 @@ func TestMultiFrontendSendRouting(t *testing.T) {
 				t.Errorf("expected discord to NOT receive the send, got %d messages", len(dc.sent))
 			}
 		})
+	}
+}
+
+// TestNewMultiFrontendFanInLearnsOwnership exercises the actual goroutine
+// NewMultiFrontend starts: pushing a Message through a sub-frontend's Recv()
+// channel must both surface it on the fanned-in Recv() and record ownership,
+// so a later Send with the same ConversationID routes back to that
+// sub-frontend (not frontends[0]).
+func TestNewMultiFrontendFanInLearnsOwnership(t *testing.T) {
+	tg := newFakeEndpoint("telegram") // frontends[0]
+	dc := newFakeEndpoint("discord")  // frontends[1]
+
+	mf := NewMultiFrontend(tg, dc)
+
+	in := Message{ConversationID: "disc-123", Text: "hello"}
+	dc.recv <- in
+
+	select {
+	case got := <-mf.Recv():
+		if got.ConversationID != in.ConversationID {
+			t.Fatalf("fanned-in message mismatch: got %+v want %+v", got, in)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("message pushed into a sub-frontend's Recv() was not fanned in")
+	}
+
+	if err := mf.Send(context.Background(), Message{ConversationID: "disc-123", Text: "reply"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(dc.sent) != 1 {
+		t.Fatalf("expected the reply to route to discord (the learned owner), got %d messages", len(dc.sent))
+	}
+	if len(tg.sent) != 0 {
+		t.Fatalf("expected telegram (frontends[0]) to NOT receive the reply, got %d messages", len(tg.sent))
+	}
+}
+
+// TestNewMultiFrontendCloseLifecycle covers Close()'s fan-in shutdown: once
+// every sub-frontend's Recv() channel is closed, the wg.Wait goroutine must
+// close mf.recv so a caller ranging over mf.Recv() terminates instead of
+// blocking forever.
+func TestNewMultiFrontendCloseLifecycle(t *testing.T) {
+	tg := newFakeEndpoint("telegram")
+	dc := newFakeEndpoint("discord")
+
+	mf := NewMultiFrontend(tg, dc)
+
+	if err := mf.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case _, ok := <-mf.Recv():
+		if ok {
+			t.Fatal("expected mf.Recv() to be closed (no pending messages) after Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mf.Recv() was not closed after Close() closed every sub-frontend")
 	}
 }
