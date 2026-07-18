@@ -130,8 +130,7 @@ const schedTimeout = 10 * time.Second
 // to confirm delivery. Must stay strictly greater than relay.FrontendSendTimeout
 // so the broker's own send deadline expires first, narrowing (though not
 // eliminating - see relay.FrontendSendTimeout's doc) the window in which a
-// send lands after this call has already given up; enforced by
-// TestReplyAckTimeoutExceedsFrontendSendTimeout.
+// send lands after this call has already given up.
 const replyAckTimeout = 15 * time.Second
 
 // replyHandler builds the reply-tool callback: a request/response round-trip
