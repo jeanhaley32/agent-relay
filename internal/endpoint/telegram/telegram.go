@@ -69,7 +69,7 @@ type Frontend struct {
 	// retrying with backoff, instead of just vanishing.
 	retryQueue     chan retryItem
 	sendFailures   atomic.Int64 // failed immediate attempts only, not background retries
-	permanentDrops atomic.Int64 // count of drops across all give-up paths (see increment sites)
+	permanentDrops atomic.Int64 // count of drops across all give-up paths
 	queueDepth     atomic.Int64
 
 	// getUpdatesFailures/lastPollSuccess are the real signal for an outage:
@@ -492,18 +492,10 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-f.retryQueue:
-			// Deliberately not decremented here: the item is moving from the
-			// channel into the in-worker pending slice, not leaving the
-			// backlog. queueDepth is only decremented once an item is fully
-			// resolved (sent, dropped permanent, or exhausted), so the
-			// exported gauge reflects the whole retry backlog, not just
-			// what's still sitting in the channel buffer.
-			//
-			// pending itself is capped at retryQueueCapacity: without this,
-			// the channel's 200-slot bound is illusory, since every loop
-			// iteration drains the channel into this slice and frees it to
-			// accept more, letting the real in-flight backlog grow with
-			// failure-rate x retry-exhaustion-time instead of staying capped.
+			// pending is capped separately from the channel: draining the
+			// channel each iteration would otherwise make the channel's
+			// 200-slot bound illusory, letting the in-flight backlog grow
+			// unbounded with failure-rate x retry-exhaustion-time.
 			if len(pending) >= retryQueueCapacity {
 				f.logger.Printf("telegram retry backlog full (%d), dropping oldest pending item", retryQueueCapacity)
 				f.queueDepth.Add(-1)
