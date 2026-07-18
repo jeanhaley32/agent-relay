@@ -116,6 +116,26 @@ func TestGateGuildPolicy(t *testing.T) {
 	}
 }
 
+// TestGateGuildMessagesDisallowedByDefault ensures that with
+// allowGuildMessages=false (the default), every guild message is dropped
+// regardless of allowedGuildIDs, mention state, or sender allowlist status.
+func TestGateGuildMessagesDisallowedByDefault(t *testing.T) {
+	someGuild := snowflake.ID(500)
+	f := &Frontend{
+		auth:                  &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+		logger:                testLogger(t),
+		allowGuildMessages:    false,
+		allowedGuildIDs:       map[snowflake.ID]bool{someGuild: true},
+		requireMentionInGuild: true,
+	}
+
+	if _, ok := f.gate(inboundMessage{
+		authorID: 111, guildID: &someGuild, content: "@bot hi", mentionsBot: true,
+	}); ok {
+		t.Fatalf("expected guild message to be dropped when allowGuildMessages is false")
+	}
+}
+
 // TestGateDropsBots ensures messages authored by other bots (including the
 // frontend's own echoes) are never relayed, to avoid bot-loops.
 func TestGateDropsBots(t *testing.T) {
