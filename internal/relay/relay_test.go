@@ -295,6 +295,19 @@ func TestIdentityPairInvariant(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("matched identity pair was incorrectly dropped")
 	}
+
+	// A mismatched pair with Meta["guild_id"] set proceeds anyway — the
+	// carve-out for multi-party (e.g. Discord guild) chats where from_id and
+	// chat_id are legitimately different.
+	front.recv <- Message{Role: User, Text: "guild hello", Meta: map[string]string{"chat_id": "guild-chan-1", "from_id": "222", "guild_id": "guild-1"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "guild hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mismatched identity pair with guild_id set was incorrectly dropped")
+	}
 }
 
 // TestSessionGate exercises the real, end-to-end integration path: an
@@ -344,6 +357,24 @@ func TestSessionGate(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		// good — the /help command was NOT dispatched either (no reply here
 		// would come from the frontend queue, and back.got must stay empty)
+	}
+
+	// 1b. A second message from the same gated user while the challenge is
+	// still in flight must be dropped too, but must NOT trigger a second
+	// challenge/link — challengeInFlight dedupes so one gated user hammering
+	// the bot before re-authing gets one link and one poller, not N.
+	front.recv <- Message{Role: User, Text: "again", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+	select {
+	case m := <-front.sent:
+		t.Fatalf("expected no second challenge while one is in flight, got %q", m.Text)
+	case <-time.After(300 * time.Millisecond):
+		// good — deduped
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expired session leaked a second message to the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
 	}
 
 	token := link[strings.LastIndex(link, "/")+1:]
