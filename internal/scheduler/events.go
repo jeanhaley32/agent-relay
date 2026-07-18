@@ -25,7 +25,6 @@ import (
 	"time"
 )
 
-// Event status values.
 const (
 	StatusPending      = "pending"
 	StatusAcknowledged = "acknowledged"
@@ -175,8 +174,10 @@ func NewTracker(path string, inject InjectFunc, fallback FallbackFunc, receipt R
 //
 // The pending event is persisted BEFORE the caller does any schedule cleanup,
 // so a crash between firing and one-shot deletion can never lose the event with
-// no trace. Returns the (new or coalesced) event.
-func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
+// no trace. Returns a copy of the (new or coalesced) event — like ListPending,
+// callers must not receive a live pointer into the mutex-guarded map since
+// Reconcile mutates events concurrently.
+func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 	t.mu.Lock()
 	// Coalesce onto an existing open event from the same schedule.
 	if scheduleID != "" {
@@ -190,20 +191,22 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 				ex.LastNudgeAt = time.Time{}
 				ex.FallbackSentAt = time.Time{}
 			}
+			snapshot := *ex
 			err := t.persist()
 			t.mu.Unlock()
 			if err != nil {
 				// Not durably persisted — surface so the caller keeps the
 				// schedule for a retry rather than deleting it.
-				return ex, fmt.Errorf("persist coalesced event %s: %w", ex.ID, err)
+				return snapshot, fmt.Errorf("persist coalesced event %s: %w", ex.ID, err)
 			}
 			if stuck {
 				t.logger.Printf("re-fire of schedule %s onto escalated event %s: resetting and re-injecting (count=%d)", scheduleID, ex.ID, ex.FireCount)
-				delivered := t.inject(chatID, t.initialPrompt(ex))
+				delivered := t.inject(chatID, t.initialPrompt(&snapshot))
 				if delivered {
 					t.mu.Lock()
 					if e, ok := t.events[ex.ID]; ok && e.Status == StatusPending {
 						e.DeliveredAt = t.cfg.Now()
+						snapshot.DeliveredAt = e.DeliveredAt
 						_ = t.persist()
 					}
 					t.mu.Unlock()
@@ -211,7 +214,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 			} else {
 				t.logger.Printf("coalesced re-fire of schedule %s onto event %s (count=%d)", scheduleID, ex.ID, ex.FireCount)
 			}
-			return ex, nil
+			return snapshot, nil
 		}
 	}
 	ev := &PendingEvent{
@@ -233,8 +236,9 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 	if err := t.persist(); err != nil {
 		delete(t.events, ev.ID)
 		t.mu.Unlock()
-		return nil, fmt.Errorf("persist pending event %s: %w", ev.ID, err)
+		return PendingEvent{}, fmt.Errorf("persist pending event %s: %w", ev.ID, err)
 	}
+	snapshot := *ev
 	t.mu.Unlock()
 
 	// Inject the trigger exactly once, here. The Claude endpoint's Send is
@@ -247,11 +251,12 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (*PendingEvent, error) {
 		t.mu.Lock()
 		if e, ok := t.events[ev.ID]; ok && e.Status == StatusPending {
 			e.DeliveredAt = t.cfg.Now()
+			snapshot.DeliveredAt = e.DeliveredAt
 			_ = t.persist()
 		}
 		t.mu.Unlock()
 	}
-	return ev, nil
+	return snapshot, nil
 }
 
 // Ack marks an event acknowledged. A non-empty note is required by design: it
