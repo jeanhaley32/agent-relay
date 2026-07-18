@@ -447,10 +447,11 @@ func (b *Broker) Run(ctx context.Context) error {
 		// Discord guild (multi-party) channels are a real, deliberate
 		// exception: chat_id there is the shared
 		// channel id, necessarily distinct from whichever member's from_id
-		// sent a given message. gate() marks any such message with
-		// Meta["guild_id"] so the invariant is enforced only for messages
-		// that don't declare themselves multi-party - a frontend-aware
-		// exception keyed off the message itself, not a blanket carve-out.
+		// sent a given message. Messages that declare guild_id in Meta are
+		// understood to be multi-party, so the invariant is enforced only
+		// for messages that don't declare themselves multi-party - a
+		// frontend-aware exception keyed off the message itself, not a
+		// blanket carve-out.
 		if fromID, chatID := m.Meta["from_id"], m.Meta["chat_id"]; fromID != "" && chatID != "" && fromID != chatID && m.Meta["guild_id"] == "" {
 			log.Printf("relay: dropped message with mismatched from_id=%q chat_id=%q - identity-pair invariant violated", fromID, chatID)
 			continue
@@ -491,21 +492,10 @@ func (b *Broker) Run(ctx context.Context) error {
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, why))
 			continue
 		}
-		// 2.5. Per-conversation token cap: checked before the message ever
-		// reaches the backend, so a capped conversation stops consuming
-		// inference tokens entirely once it hits its limit - see
-		// ConversationCaps' doc comment. A detailed notice (reason, limit,
-		// usage, time to reset) is sent on EVERY rejection, not just the
-		// first time the cap is crossed: a conversation going silent forever
-		// with no explanation is worse than a repeated notice.
-		//
-		// The message that crosses the cap is charged via addConversationUsage
-		// below and then rejected by the re-check that follows it: it is never
-		// forwarded to the backend, but its estimate still counts against the
-		// conversation's usage. This is deliberate fail-safe behavior against a
-		// single huge message straddling the cap (reordering to check-only
-		// would let an unbounded message through once, since nothing would
-		// have charged it yet to trip the cap).
+		// 2.5. Per-conversation token cap (see ConversationCaps' doc comment).
+		// Charge-then-reject, not check-only: the message is charged via
+		// addConversationUsage below before the re-check rejects it, so a
+		// single huge message can't slip through uncounted and dodge the cap.
 		if b.conversationCapExceeded(m.Meta["chat_id"]) {
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, b.conversationCapRejectionNotice(m.Meta["chat_id"])))
 			continue
