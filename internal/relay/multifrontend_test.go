@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -23,6 +24,23 @@ func (f *fakeEndpoint) Close() error         { close(f.recv); return nil }
 func (f *fakeEndpoint) Send(ctx context.Context, m Message) error {
 	f.sent = append(f.sent, m)
 	return nil
+}
+
+// failingCloseEndpoint wraps a fakeEndpoint but returns an error from Close,
+// so tests can verify MultiFrontend.Close aggregates sub-frontend errors
+// instead of silently swallowing them.
+type failingCloseEndpoint struct {
+	*fakeEndpoint
+	closeErr error
+}
+
+func newFailingCloseEndpoint(name string, closeErr error) *failingCloseEndpoint {
+	return &failingCloseEndpoint{fakeEndpoint: newFakeEndpoint(name), closeErr: closeErr}
+}
+
+func (f *failingCloseEndpoint) Close() error {
+	close(f.recv)
+	return f.closeErr
 }
 
 // claimerEndpoint additionally implements Claimer, owning any conversation
@@ -177,5 +195,29 @@ func TestNewMultiFrontendCloseLifecycle(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("mf.Recv() was not closed after Close() closed every sub-frontend")
+	}
+}
+
+// TestMultiFrontendCloseAggregatesFirstError verifies Close() attempts every
+// sub-frontend's Close (even after one fails) and returns the first error
+// encountered, per its documented contract.
+func TestMultiFrontendCloseAggregatesFirstError(t *testing.T) {
+	wantErr := errors.New("telegram close failed")
+	tg := newFailingCloseEndpoint("telegram", wantErr)
+	dc := newFakeEndpoint("discord")
+
+	mf := NewMultiFrontend(tg, dc)
+
+	if err := mf.Close(); err != wantErr {
+		t.Fatalf("Close() = %v, want %v", err, wantErr)
+	}
+
+	// Both sub-frontends' Recv channels must be closed regardless of the
+	// first one's error, proving Close attempted all of them.
+	if _, ok := <-tg.Recv(); ok {
+		t.Fatal("expected telegram's Recv() to be closed")
+	}
+	if _, ok := <-dc.Recv(); ok {
+		t.Fatal("expected discord's Recv() to be closed")
 	}
 }
