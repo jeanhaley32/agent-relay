@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
@@ -319,5 +320,57 @@ func TestPermanentHTTPErrorNotQueued(t *testing.T) {
 	}
 	if got := f.QueueDepth(); got != 0 {
 		t.Errorf("QueueDepth = %d, want 0 - a deterministic 400 must not be queued for retry", got)
+	}
+}
+
+// TestSplitMidFailureQueuesRemainingInOrder verifies that when a chunk in the
+// middle of a split reply hits a transient failure, later chunks are not
+// sent immediately (which could deliver them before the retried chunk and
+// scramble the reply's order) - they're queued for background retry instead,
+// in original order.
+func TestSplitMidFailureQueuesRemainingInOrder(t *testing.T) {
+	var sendMessageCalls atomic.Int64
+	var failSecondOnward atomic.Bool
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bot"+testToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	})
+	mux.HandleFunc("/bot"+testToken+"/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		n := sendMessageCalls.Add(1)
+		if n >= 2 && failSecondOnward.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithPollTimeout(0))
+	defer f.Close()
+
+	failSecondOnward.Store(true)
+	oversized := strings.Repeat("x", maxMessageLen*3+500)
+	err := f.Send(context.Background(), relay.Message{
+		ConversationID: "555",
+		Text:           oversized,
+		Meta:           map[string]string{"chat_id": "555"},
+	})
+	if err == nil {
+		t.Fatal("expected an error from the mid-split transient failure")
+	}
+
+	// Chunk 0 succeeds and chunk 1 is attempted and fails - that's the only
+	// two synchronous sendMessage calls. Every chunk after the failure must
+	// be queued rather than attempted out of turn.
+	if got := sendMessageCalls.Load(); got != 2 {
+		t.Fatalf("sendMessage called %d time(s) synchronously, want exactly 2 (remaining chunks must be queued, not sent immediately)", got)
+	}
+	wantQueued := int64(len(senderr.Split(oversized, maxMessageLen))) - 1
+	if got := f.QueueDepth(); got != wantQueued {
+		t.Fatalf("QueueDepth = %d, want %d (the failed chunk plus every chunk after it)", got, wantQueued)
 	}
 }
