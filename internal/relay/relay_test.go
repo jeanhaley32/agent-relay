@@ -412,6 +412,87 @@ func TestSessionGate(t *testing.T) {
 	}
 }
 
+// TestSessionGateDenied covers the challengeSession poller's deny branch
+// (relay.go's StatusDenied/StatusExpired case): a denied decision must NOT
+// activate the session, must clear challengeInFlight so a later message
+// re-challenges instead of being silently dropped forever, and must not leak
+// any message to the backend.
+func TestSessionGateDenied(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+	appr := approval.NewManager("http://tailnet.example")
+
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Session:           session.NewManager(30 * time.Minute),
+		Approval:          appr,
+		SessionGatedUsers: map[string]bool{"admin-chat": true},
+		SessionTTL:        2 * time.Second,
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// 1. First message: challenge issued.
+	front.recv <- Message{Role: User, Text: "/help", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+
+	var link string
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "http://tailnet.example/approve/") {
+			t.Fatalf("expected a challenge with an approval link, got %q", m.Text)
+		}
+		link = m.Text[strings.Index(m.Text, "http://tailnet.example/approve/"):]
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a session-expired challenge on the frontend")
+	}
+	token := link[strings.LastIndex(link, "/")+1:]
+
+	// 2. Deny via the same HTTP surface a human would hit.
+	appSrv := httptest.NewServer(appr.ApproveHandler())
+	defer appSrv.Close()
+	resp, err := http.PostForm(appSrv.URL+"/approve/"+token, url.Values{"decision": {"deny"}})
+	if err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	resp.Body.Close()
+
+	// 3. No activation confirmation should be sent, and the session must
+	// stay inactive. The poller only notices the denial on its next 3s
+	// tick (and clears challengeInFlight right after), so give it enough
+	// room here rather than racing it.
+	select {
+	case m := <-front.sent:
+		t.Fatalf("expected no message after a denial, got %q", m.Text)
+	case <-time.After(500 * time.Millisecond):
+		// good
+	}
+	time.Sleep(3 * time.Second)
+
+	// 4. A subsequent message from the same user must re-challenge (proves
+	// challengeInFlight was cleared) rather than being silently dropped, and
+	// must not reach the backend.
+	front.recv <- Message{Role: User, Text: "again", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "http://tailnet.example/approve/") {
+			t.Fatalf("expected a fresh challenge after denial, got %q", m.Text)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("expected a fresh challenge after the prior one was denied")
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("denied session leaked a message to the backend: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+}
+
 // TestConversationCap covers an allowlisted-but-non-admin contact testing
 // how much inference the relay would spend on an open-ended request. A
 // per-conversation cap must stop inbound messages from reaching the backend
@@ -498,6 +579,56 @@ func TestConversationCap(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("an uncapped conversation must be unaffected by another conversation's cap")
+	}
+}
+
+// TestConversationCapChargesOutboundReplies covers the outbound reply
+// pump's addConversationUsage(chat_id, estimate) call in Run's backend->
+// frontend goroutine: a reply from the backend must count against the same
+// conversation's cap as inbound messages do, not just leave it unaffected.
+func TestConversationCapChargesOutboundReplies(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	b := &Broker{
+		Frontend:              front,
+		Backend:               back,
+		Commands:              command.NewRegistry(),
+		Meter:                 budget.New("pro", nil),
+		Estimate:              func(text string) int { return len(text) },
+		ConversationCaps:      map[string]int64{"999": 10},
+		ConversationCapWindow: time.Hour,
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// A backend reply attributed to chat "999" (9 chars) should be charged
+	// against that conversation's cap.
+	back.recv <- Message{Role: Assistant, Text: "123456789", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999"}}
+	select {
+	case <-front.sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("outbound reply was never delivered to the frontend")
+	}
+
+	// Now a 5-char inbound message (9+5=14 > 10) should already be over cap
+	// and dropped before reaching the backend - proving the outbound reply
+	// was actually charged, not silently ignored.
+	front.recv <- Message{Role: User, Text: "12345", ConversationID: "999",
+		Meta: map[string]string{"chat_id": "999", "from_id": "999"}}
+	select {
+	case m := <-back.got:
+		t.Fatalf("expected the inbound message to be dropped due to prior outbound charge, got %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "token budget") {
+			t.Fatalf("expected a cap-rejection notice, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a cap-rejection notice after the outbound-charged conversation went over cap")
 	}
 }
 

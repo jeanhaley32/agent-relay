@@ -247,6 +247,7 @@ func (b *Broker) conversationCapExceeded(chatID string) bool {
 func (b *Broker) conversationCapRejectionNotice(chatID string) string {
 	limit, _ := b.capLimit(chatID)
 	b.conversationUsedMu.Lock()
+	b.rollIfExpired(chatID)
 	w := b.conversationUsed[chatID]
 	var used int64
 	var resetIn time.Duration
