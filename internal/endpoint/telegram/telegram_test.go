@@ -321,6 +321,9 @@ func TestPermanentHTTPErrorNotQueued(t *testing.T) {
 	if got := f.QueueDepth(); got != 0 {
 		t.Errorf("QueueDepth = %d, want 0 - a deterministic 400 must not be queued for retry", got)
 	}
+	if got := f.PermanentDrops(); got != 1 {
+		t.Errorf("PermanentDrops = %d, want 1 - the synchronous permanent error must be counted", got)
+	}
 }
 
 // TestSplitMidFailureQueuesRemainingInOrder verifies that when a chunk in the
