@@ -43,8 +43,8 @@ type PendingEvent struct {
 	AckedAt     time.Time `json:"acked_at,omitempty"`
 
 	// Bookkeeping beyond the core model:
-	FireCount      int       `json:"fire_count"`                 // times the source (re)fired while still open — coalescing counter
-	FallbackSentAt time.Time `json:"fallback_sent_at,omitempty"` // zero until the direct-to-Jean escalation fired
+	FireCount      int       `json:"fire_count"`
+	FallbackSentAt time.Time `json:"fallback_sent_at,omitempty"`
 }
 
 // InjectFunc delivers text into the agent's session. It reports whether the
@@ -314,8 +314,8 @@ func (t *Tracker) NoteReply(chatID string, at time.Time) {
 	}
 	t.mu.Unlock()
 
-	// Send the same human-skimmable receipt an explicit Ack() would send, so
-	// inferred acks don't silently break the "every ack leaves a trail" invariant.
+	// Inferred acks get their own receipt (event ID, not a note) so they don't
+	// silently break the "every ack leaves a trail" invariant Ack() upholds.
 	for _, id := range resolved {
 		t.receipt("✓ auto-resolved (reply): " + id)
 	}
