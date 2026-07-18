@@ -237,8 +237,10 @@ func (s *Scheduler) fire(id string) {
 	// case the schedule fires again on reload, which the tracker coalesces.
 	if err := s.deliver(schedID, chatID, text); err != nil {
 		// The pending event was NOT durably recorded. Keep the schedule intact
-		// (skip the one-shot deletion) so the next fire retries, rather than
-		// deleting the durable schedule and losing the event on a crash.
+		// rather than deleting it and losing the event. Recurring schedules
+		// retry on their next cron tick; a one-shot's timer has already fired
+		// and is not re-armed here, so it only retries if the process
+		// restarts (load re-arms missed one-shots).
 		s.logger.Printf("warning: deliver of schedule %s failed, keeping it for retry: %v", id, err)
 		return
 	}

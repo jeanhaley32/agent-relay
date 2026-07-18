@@ -207,8 +207,11 @@ func (c *failingCollector) count() int {
 }
 
 // TestFireKeepsScheduleOnDeliverError: when deliver returns an error, the
-// one-shot schedule must survive (not be deleted) so the next tick retries
-// it, rather than silently losing the event.
+// one-shot schedule must survive (not be deleted) rather than silently
+// losing the event. A one-shot's timer has already fired and is not
+// re-armed in-process on this error path, so it only actually retries if
+// the scheduler restarts and reloads it (load re-arms missed one-shots);
+// this test only asserts the schedule isn't lost, not that it re-fires.
 func TestFireKeepsScheduleOnDeliverError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sched.json")
 	c := newFailingCollector()
