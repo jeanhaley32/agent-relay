@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -34,14 +33,6 @@ const defaultBaseURL = "https://api.telegram.org"
 // just repeats the same guaranteed failure.
 const maxMessageLen = 4096
 
-// permanentSendError marks a Send failure as non-retryable: the same input
-// will fail identically no matter how many times it's resent (an oversized
-// message, a missing chat_id), as opposed to a transient failure (network
-// blip, Telegram outage) that background retry can legitimately fix.
-//
-// This is the shared senderr.Permanent type (extracted once Discord needed
-// the identical semantics) rather than a package-local definition, so the
-// two frontends' retry-classification logic can't silently drift apart.
 type permanentSendError = senderr.Permanent
 
 // Authorizer decides whether a sender may use the relay and records requests
@@ -70,15 +61,14 @@ type Frontend struct {
 	recv   chan relay.Message
 	cancel context.CancelFunc
 
-	// Every caller discards Send()'s error (`_ = frontend.Send(...)`), so a
-	// transient Telegram outage would otherwise drop a reply forever with no
-	// trace of the failure anywhere. retryQueue is a bounded background
-	// retry path: Send() still returns immediately (callers' behavior is
-	// unchanged), but a failed send is also queued here for a background
-	// worker to keep retrying with backoff, instead of just vanishing.
+	// Send() returns immediately without waiting on delivery, so a transient
+	// Telegram outage would otherwise drop a reply forever with no trace of
+	// the failure anywhere. retryQueue is a bounded background retry path: a
+	// failed send is also queued here for a background worker to keep
+	// retrying with backoff, instead of just vanishing.
 	retryQueue     chan retryItem
-	sendFailures   atomic.Int64 // every failed immediate attempt (retries included)
-	permanentDrops atomic.Int64 // gave up after maxRetryAttempts
+	sendFailures   atomic.Int64 // failed immediate attempts only, not background retries
+	permanentDrops atomic.Int64 // count of drops across all give-up paths
 	queueDepth     atomic.Int64
 
 	// getUpdatesFailures/lastPollSuccess are the real signal for an outage:
@@ -129,8 +119,16 @@ func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a
 // WithPollTimeout sets the long-poll timeout in seconds (default 30).
 func WithPollTimeout(sec int) Option { return func(f *Frontend) { f.pollTimeout = sec } }
 
-// WithLogger sets a logger (default: discard).
-func WithLogger(l *log.Logger) Option { return func(f *Frontend) { f.logger = l } }
+// WithLogger sets a logger (default: discard). A nil logger is treated as
+// discard so every other f.logger.Printf call site can assume non-nil.
+func WithLogger(l *log.Logger) Option {
+	return func(f *Frontend) {
+		if l == nil {
+			l = log.New(io.Discard, "", 0)
+		}
+		f.logger = l
+	}
+}
 
 // New builds a Telegram frontend and starts polling. Close stops it.
 func New(token string, opts ...Option) *Frontend {
@@ -233,7 +231,7 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 			// chat. BotFather is also configured to disallow group invites,
 			// but this is the code-level backstop in case that setting is
 			// ever changed or reset.
-			if m.Chat.Type != "" && m.Chat.Type != "private" {
+			if m.Chat.Type != "private" {
 				f.logger.Printf("dropped message from non-private chat id=%d type=%q sender=%d", m.Chat.ID, m.Chat.Type, m.From.ID)
 				continue
 			}
@@ -328,35 +326,49 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 }
 
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
-// to m.ConversationID) via sendMessage. A message over Telegram's real limit
-// is split into multiple messages (see senderr.Split) rather than permanently
-// dropped - the old behavior silently lost the whole reply on anything over
-// 4096 chars with no error surfaced to the sender. Every chunk is attempted
-// regardless of an earlier chunk's outcome, since a transient failure is
-// already queued by sendChunk and skipping the rest would just strand them;
-// only the first permanent failure is returned to the caller.
+// to m.ConversationID), splitting it via senderr.Split if over Telegram's
+// limit. Ordering across chunks is best-effort only: once a chunk is queued
+// for background retry, it's retried independently, so a later chunk can
+// still land before an earlier one.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
-		var permErr error
+		var permErr, firstErr error
+		queuing := false
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
+			if queuing {
+				f.enqueueRetry(cm)
+				continue
+			}
 			if err := f.sendChunk(ctx, cm); err != nil {
-				var perm permanentSendError
-				if errors.As(err, &perm) && permErr == nil {
-					permErr = err
+				if firstErr == nil {
+					firstErr = err
 				}
+				var perm permanentSendError
+				if errors.As(err, &perm) {
+					if permErr == nil {
+						permErr = err
+					}
+					continue
+				}
+				// Transient failure: sendChunk already queued this chunk for
+				// retry. Stop attempting later chunks immediately and queue
+				// them too, in order, so the retry worker delivers the rest
+				// of the split reply in the original order instead of racing
+				// ahead of the queued chunk.
+				queuing = true
 			}
 		}
-		return permErr
+		if permErr != nil {
+			return permErr
+		}
+		return firstErr
 	}
 	return f.sendChunk(ctx, m)
 }
 
-// sendChunk is Send's single-message path - the pre-split body of what used
-// to be Send, still doing the retry/permanent-failure classification for one
-// already-within-limit message.
 func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	err := f.sendOnce(ctx, m)
 	if err == nil {
@@ -365,20 +377,19 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	f.sendFailures.Add(1)
 	var perm permanentSendError
 	if errors.As(err, &perm) {
-		if f.logger != nil {
-			f.logger.Printf("telegram send permanently failed (not retrying): %v", err)
-		}
+		// Never retried, so it's dropped right here - count it alongside the
+		// async gave-up-after-retries drops so PermanentDrops() reflects every
+		// message that will never be delivered, not just the ones that went
+		// through the retry queue first.
+		f.permanentDrops.Add(1)
+		f.logger.Printf("telegram send permanently failed (not retrying): %v", err)
 		return err
 	}
-	if f.logger != nil {
-		f.logger.Printf("telegram send failed, queuing for background retry: %v", err)
-	}
+	f.logger.Printf("telegram send failed, queuing for background retry: %v", err)
 	f.enqueueRetry(m)
 	return err
 }
 
-// sendOnce is the actual single HTTP attempt - both Send() and the retry
-// worker call this, so there's exactly one code path that talks to Telegram.
 func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	chatID := m.Meta["chat_id"]
 	if chatID == "" {
@@ -386,10 +397,6 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	}
 	if chatID == "" {
 		return permanentSendError{Err: fmt.Errorf("telegram send: no chat_id")}
-	}
-	if n := utf8.RuneCountInString(m.Text); n > maxMessageLen {
-		return permanentSendError{Err: fmt.Errorf(
-			"message too long (%d chars, Telegram's limit is %d) - split it into multiple replies", n, maxMessageLen)}
 	}
 	body, _ := json.Marshal(map[string]any{"chat_id": chatID, "text": m.Text})
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", f.base, f.token)
@@ -416,33 +423,23 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 		}
 		return sendErr
 	}
-	// Log Telegram's own assigned message_id on success, so a "the daemon
-	// said success" claim can be cross-checked directly against the
-	// platform afterward rather than trusting the ack alone.
-	var parsed struct {
-		Result struct {
-			MessageID int64 `json:"message_id"`
-		} `json:"result"`
-	}
-	b, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(b, &parsed); err == nil && f.logger != nil {
-		f.logger.Printf("telegram send ok: chat=%s message_id=%d", chatID, parsed.Result.MessageID)
-	}
 	return nil
 }
 
 // enqueueRetry adds a failed message to the background retry queue.
-// Non-blocking: if the queue is full (a genuinely extreme backlog), the
+// Non-blocking: if the channel is full (a genuinely extreme backlog), the
 // oldest-in-flight item is dropped rather than blocking the caller, which
-// would stall the whole relay - a bounded, honest failure mode instead of
-// unbounded memory growth or a hung sender.
+// would stall the whole relay. The actual backlog bound is enforced in
+// startRetryWorker (which caps its pending slice too), since draining the
+// channel each loop would otherwise let the real in-flight count grow well
+// past retryQueueCapacity.
 func (f *Frontend) enqueueRetry(m relay.Message) {
 	item := retryItem{msg: m, attempts: 0, nextAt: time.Now().Add(retryBackoff(0))}
 	select {
 	case f.retryQueue <- item:
 		f.queueDepth.Add(1)
 	default:
-		f.logger.Printf("telegram retry queue full (%d), dropping oldest to make room", retryQueueCapacity)
+		f.logger.Printf("telegram retry queue full (%d), dropping oldest queued item to make room", retryQueueCapacity)
 		select {
 		case <-f.retryQueue:
 			f.queueDepth.Add(-1)
@@ -453,6 +450,8 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 		case f.retryQueue <- item:
 			f.queueDepth.Add(1)
 		default:
+			f.logger.Printf("telegram retry queue full again, dropping new item")
+			f.permanentDrops.Add(1)
 		}
 	}
 }
@@ -480,12 +479,16 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-f.retryQueue:
-			// Deliberately not decremented here: the item is moving from the
-			// channel into the in-worker pending slice, not leaving the
-			// backlog. queueDepth is only decremented once an item is fully
-			// resolved (sent, dropped permanent, or exhausted), so the
-			// exported gauge reflects the whole retry backlog, not just
-			// what's still sitting in the channel buffer.
+			// pending is capped separately from the channel: draining the
+			// channel each iteration would otherwise make the channel's
+			// 200-slot bound illusory, letting the in-flight backlog grow
+			// unbounded with failure-rate x retry-exhaustion-time.
+			if len(pending) >= retryQueueCapacity {
+				f.logger.Printf("telegram retry backlog full (%d), dropping oldest pending item", retryQueueCapacity)
+				f.queueDepth.Add(-1)
+				f.permanentDrops.Add(1)
+				pending = pending[1:]
+			}
 			pending = append(pending, item)
 		case <-ticker.C:
 			now := time.Now()
@@ -533,7 +536,6 @@ func (f *Frontend) PermanentDrops() int64 { return f.permanentDrops.Load() }
 func (f *Frontend) QueueDepth() int64     { return f.queueDepth.Load() }
 
 // GetUpdatesFailures and LastPollSuccess expose the getUpdates polling
-// health signal - this is what actually detects a Telegram-side outage,
-// independent of whether any outbound Send happened to occur during it.
+// health signal (see the field comments on Frontend for why).
 func (f *Frontend) GetUpdatesFailures() int64 { return f.getUpdatesFailures.Load() }
 func (f *Frontend) LastPollSuccess() int64    { return f.lastPollSuccess.Load() }
