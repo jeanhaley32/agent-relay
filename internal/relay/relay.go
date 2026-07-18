@@ -368,7 +368,11 @@ func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
 		defer ticker.Stop()
 		deadline := time.Now().Add(ttl)
 		for time.Now().Before(deadline) {
-			<-ticker.C
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 			st, ok := b.Approval.Consume(token, actionHash)
 			if !ok {
 				return
