@@ -412,24 +412,12 @@ func (b *Broker) Run(ctx context.Context) error {
 				}
 				continue // dropped (the gate func is responsible for logging)
 			}
-			// Bound the synchronous send to FrontendSendTimeout, kept strictly
-			// shorter than the shim's reply-tool wait (replyAckTimeout in
-			// cmd/relay-shim/main.go): without a deadline here, a slow-but-
-			// successful send (e.g. Discord's REST client's own ~20s default)
-			// can complete AFTER the shim has already given up and told the
-			// model to retry, causing a duplicate reply. Cancelling here before
-			// the shim's own deadline narrows that window, but doesn't close it
-			// entirely - see FrontendSendTimeout's doc.
 			sendCtx, cancel := context.WithTimeout(ctx, FrontendSendTimeout)
 			sendErr := b.Frontend.Send(sendCtx, m)
 			cancel()
 			if b.AckBackendReply != nil {
 				b.AckBackendReply(m, sendErr)
 			}
-			// Reply-inferred ack runs only AFTER the gate passes and the reply
-			// is actually delivered — a reply dropped by the gate, or one that
-			// Frontend.Send failed to deliver, never reached the user, so it
-			// is not evidence the trigger was handled.
 			if sendErr == nil && b.OnBackendReply != nil {
 				b.OnBackendReply(m)
 			}
