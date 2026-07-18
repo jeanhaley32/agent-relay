@@ -1,26 +1,9 @@
 // Package discord implements a relay frontend Endpoint backed by the Discord
-// Bot API. Unlike Telegram's stateless long-poll, Discord's real-time events
-// arrive over the Gateway, a stateful websocket protocol with heartbeats and
-// session resume. This package uses github.com/disgoorg/disgo to own that
-// websocket/heartbeat/resume/backoff machinery rather than
-// hand-rolling it — that class of bug (silent disconnect, missed messages,
-// burned IDENTIFY budget) is exactly what disgo already exists to get right.
-//
-// Inbound messages are gated by a sender allowlist (on the sender's Discord
-// user id, never the channel/guild id) — an ungated channel is a
-// prompt-injection vector, same reasoning as the Telegram frontend. Guild
-// (server) messages are additionally gated: the guild must be explicitly
-// allow-listed and, by default, the message must @-mention the bot or reply
-// to one of its messages — a guild channel is inherently multi-party, so
-// channel membership alone is not "addressed to the bot" the way every
-// message in a Telegram private chat or Discord DM is.
-//
-// The gating logic (gate()) operates on the platform-neutral inboundMessage
-// struct rather than disgo's event/bot types directly, so it is unit
-// testable without spinning up a real gateway connection or bot token — see
-// discord_test.go. The outbound REST client is injectable the same way
-// Telegram's HTTP client is (WithHTTPClient/WithBaseURL), so Send() is also
-// testable against an httptest server.
+// Bot API, using github.com/disgoorg/disgo to own the Gateway
+// websocket/heartbeat/resume/backoff machinery rather than hand-rolling it.
+// Inbound messages are gated by sender user id, never channel/guild id, for
+// the same prompt-injection reasons as the Telegram frontend; see gate() and
+// DESIGN.md for the full guild/DM gating policy.
 package discord
 
 import (
@@ -402,12 +385,11 @@ func (f *Frontend) Connect(ctx context.Context) error {
 // watchHeartbeat periodically checks the gateway's heartbeat-ack latency and
 // treats a nonzero value as proof the connection is alive, refreshing
 // lastGatewayEventAt independent of Ready/Resumed/message traffic. Without
-// this, a healthy but quiet DM-only bot (no reconnects, no new messages) goes
-// "stale" by lastGatewayEventAt after any 5+ minute lull — a false positive,
-// since Ready/Resumed only fire on (re)connect, not on an ongoing
-// idle-but-healthy session. 30s poll interval, well under the alert's
-// 5-minute threshold, so a genuinely dead gateway (Latency() staying 0)
-// still goes stale and fires.
+// this, a healthy but quiet DM-only bot (no reconnects, no new messages)
+// would look stale after any long lull, since Ready/Resumed only fire on
+// (re)connect, not during an idle-but-healthy session. A genuinely dead
+// gateway (Latency() staying 0) still goes stale and fires, since nothing
+// here refreshes lastGatewayEventAt in that case.
 func (f *Frontend) watchHeartbeat(client *bot.Client) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
