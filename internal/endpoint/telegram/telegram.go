@@ -376,6 +376,11 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	f.sendFailures.Add(1)
 	var perm permanentSendError
 	if errors.As(err, &perm) {
+		// Never retried, so it's dropped right here - count it alongside the
+		// async gave-up-after-retries drops so PermanentDrops() reflects every
+		// message that will never be delivered, not just the ones that went
+		// through the retry queue first.
+		f.permanentDrops.Add(1)
 		if f.logger != nil {
 			f.logger.Printf("telegram send permanently failed (not retrying): %v", err)
 		}
@@ -440,10 +445,12 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 }
 
 // enqueueRetry adds a failed message to the background retry queue.
-// Non-blocking: if the queue is full (a genuinely extreme backlog), the
+// Non-blocking: if the channel is full (a genuinely extreme backlog), the
 // oldest-in-flight item is dropped rather than blocking the caller, which
-// would stall the whole relay - a bounded, honest failure mode instead of
-// unbounded memory growth or a hung sender.
+// would stall the whole relay. The actual backlog bound is enforced in
+// startRetryWorker (which caps its pending slice too), since draining the
+// channel each loop would otherwise let the real in-flight count grow well
+// past retryQueueCapacity.
 func (f *Frontend) enqueueRetry(m relay.Message) {
 	item := retryItem{msg: m, attempts: 0, nextAt: time.Now().Add(retryBackoff(0))}
 	select {
@@ -496,6 +503,18 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 			// resolved (sent, dropped permanent, or exhausted), so the
 			// exported gauge reflects the whole retry backlog, not just
 			// what's still sitting in the channel buffer.
+			//
+			// pending itself is capped at retryQueueCapacity: without this,
+			// the channel's 200-slot bound is illusory, since every loop
+			// iteration drains the channel into this slice and frees it to
+			// accept more, letting the real in-flight backlog grow with
+			// failure-rate x retry-exhaustion-time instead of staying capped.
+			if len(pending) >= retryQueueCapacity {
+				f.logger.Printf("telegram retry backlog full (%d), dropping oldest pending item", retryQueueCapacity)
+				f.queueDepth.Add(-1)
+				f.permanentDrops.Add(1)
+				pending = pending[1:]
+			}
 			pending = append(pending, item)
 		case <-ticker.C:
 			now := time.Now()
