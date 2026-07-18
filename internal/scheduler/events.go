@@ -173,6 +173,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 	t.mu.Lock()
 	if scheduleID != "" {
 		if ex := t.openBySchedule(scheduleID); ex != nil {
+			prior := *ex
 			ex.FireCount++
 			ex.Text = text
 			stuck := !ex.FallbackSentAt.IsZero()
@@ -184,12 +185,16 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 			}
 			snapshot := *ex
 			err := t.persist()
-			t.mu.Unlock()
 			if err != nil {
-				// Not durably persisted — surface so the caller keeps the
-				// schedule for a retry rather than deleting it.
-				return snapshot, fmt.Errorf("persist coalesced event %s: %w", ex.ID, err)
+				// Not durably persisted — roll back the in-memory mutations
+				// so memory doesn't diverge from disk, and surface the error
+				// so the caller keeps the schedule for a retry rather than
+				// deleting it.
+				*ex = prior
+				t.mu.Unlock()
+				return prior, fmt.Errorf("persist coalesced event %s: %w", ex.ID, err)
 			}
+			t.mu.Unlock()
 			if stuck {
 				t.logger.Printf("re-fire of schedule %s onto escalated event %s: resetting and re-injecting (count=%d)", scheduleID, ex.ID, ex.FireCount)
 				delivered := t.inject(chatID, t.initialPrompt(&snapshot))
@@ -237,7 +242,7 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 	// so a "not yet delivered" event is NOT lost and must not be re-injected on
 	// every reconcile tick. Connected() is used only as a best-effort signal to
 	// stamp DeliveredAt for metrics — never as a gate that re-sends the prompt.
-	delivered := t.inject(chatID, t.initialPrompt(ev))
+	delivered := t.inject(chatID, t.initialPrompt(&snapshot))
 	if delivered {
 		t.mu.Lock()
 		if e, ok := t.events[ev.ID]; ok && e.Status == StatusPending {
