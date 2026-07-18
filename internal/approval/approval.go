@@ -246,6 +246,7 @@ func (m *Manager) ApproveHandler() http.Handler {
 			}
 			decided := req.status
 			m.mu.Unlock()
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			fmt.Fprintf(w, resultPage, html.EscapeString(string(decided)))
 			return
 		}
@@ -258,6 +259,7 @@ func (m *Manager) ApproveHandler() http.Handler {
 		m.mu.Lock()
 		st, desc := req.status, req.desc
 		m.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if st != StatusPending {
 			fmt.Fprintf(w, resultPage, html.EscapeString(string(st)))
 			return
