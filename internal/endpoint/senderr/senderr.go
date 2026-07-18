@@ -1,11 +1,5 @@
-// Package senderr provides shared outbound-message plumbing used by every
-// frontend (Telegram, Discord, ...): the retry-classification error type and
-// a length-aware message splitter. A "permanent" send failure is one where
-// retrying is guaranteed to reproduce the same failure (a missing
-// destination id, a 4xx that isn't a rate limit) as opposed to a transient
-// one (network blip, provider outage) that background retry can legitimately
-// fix. Shared here so the frontends' retry classification can't silently
-// drift apart from each other.
+// Package senderr is shared across frontends (Telegram, Discord, ...) so
+// their retry classification can't silently drift apart from each other.
 package senderr
 
 import "unicode/utf8"
@@ -16,9 +10,7 @@ type Permanent struct{ Err error }
 func (e Permanent) Error() string { return e.Err.Error() }
 func (e Permanent) Unwrap() error { return e.Err }
 
-// Split breaks text into chunks no longer than limit runes, so an oversized
-// reply can be delivered as multiple messages instead of silently dropped
-// against a platform's per-message length limit.
+// Split breaks text into chunks of at most limit runes each.
 func Split(text string, limit int) []string {
 	if limit <= 0 {
 		return []string{text}

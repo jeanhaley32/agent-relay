@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -120,8 +119,16 @@ func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a
 // WithPollTimeout sets the long-poll timeout in seconds (default 30).
 func WithPollTimeout(sec int) Option { return func(f *Frontend) { f.pollTimeout = sec } }
 
-// WithLogger sets a logger (default: discard).
-func WithLogger(l *log.Logger) Option { return func(f *Frontend) { f.logger = l } }
+// WithLogger sets a logger (default: discard). A nil logger is treated as
+// discard so every other f.logger.Printf call site can assume non-nil.
+func WithLogger(l *log.Logger) Option {
+	return func(f *Frontend) {
+		if l == nil {
+			l = log.New(io.Discard, "", 0)
+		}
+		f.logger = l
+	}
+}
 
 // New builds a Telegram frontend and starts polling. Close stops it.
 func New(token string, opts ...Option) *Frontend {
@@ -375,14 +382,10 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 		// message that will never be delivered, not just the ones that went
 		// through the retry queue first.
 		f.permanentDrops.Add(1)
-		if f.logger != nil {
-			f.logger.Printf("telegram send permanently failed (not retrying): %v", err)
-		}
+		f.logger.Printf("telegram send permanently failed (not retrying): %v", err)
 		return err
 	}
-	if f.logger != nil {
-		f.logger.Printf("telegram send failed, queuing for background retry: %v", err)
-	}
+	f.logger.Printf("telegram send failed, queuing for background retry: %v", err)
 	f.enqueueRetry(m)
 	return err
 }
@@ -394,10 +397,6 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	}
 	if chatID == "" {
 		return permanentSendError{Err: fmt.Errorf("telegram send: no chat_id")}
-	}
-	if n := utf8.RuneCountInString(m.Text); n > maxMessageLen {
-		return permanentSendError{Err: fmt.Errorf(
-			"message too long (%d chars, Telegram's limit is %d) - split it into multiple replies", n, maxMessageLen)}
 	}
 	body, _ := json.Marshal(map[string]any{"chat_id": chatID, "text": m.Text})
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", f.base, f.token)
