@@ -278,7 +278,7 @@ func main() {
 	// boot (tailscaled racing relayd) - retry with backoff instead of
 	// silently running with a broken gate, which would permanently lock the
 	// admin out of Telegram control (the re-auth link would 404 forever).
-	appListener, err := listenWithRetry("tcp", "100.99.212.119:9212", 30*time.Second, logger)
+	appListener, err := listenWithRetry("tcp", "100.99.212.119:9212", 2*time.Minute, logger)
 	if err != nil {
 		logger.Fatalf("approval page listener: %v", err)
 	}
