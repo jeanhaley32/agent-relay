@@ -189,9 +189,9 @@ func TestGroupChatDropped(t *testing.T) {
 }
 
 // TestSendRetryQueue verifies a failed Send is retried in the background and
-// eventually delivered once the endpoint recovers - the real gap found
-// 2026-07-10 (a ~1h Telegram outage silently dropped a message with zero
-// retry and zero trace, since every caller does `_ = frontend.Send(...)`).
+// eventually delivered once the endpoint recovers, since every caller
+// discards Send's error (`_ = frontend.Send(...)`) and relies on this
+// background path to keep a transient failure from silently vanishing.
 func TestSendRetryQueue(t *testing.T) {
 	sent := make(chan map[string]any, 4)
 	var failFirst atomic.Bool
@@ -250,12 +250,10 @@ func TestSendRetryQueue(t *testing.T) {
 	}
 }
 
-// TestOversizedMessageSplitAndDelivered locks in the fix for the real
-// 2026-07-14 incident: a message over Telegram's 4096-char limit used to be
-// permanently dropped with no message ever reaching the user (the
-// 2026-07-11 fix only made the failure visible as an error, it didn't
-// deliver anything). Send now splits it via senderr.Split and delivers every
-// chunk in order instead.
+// TestOversizedMessageSplitAndDelivered verifies that a message over
+// Telegram's 4096-char limit is split via senderr.Split and every chunk is
+// delivered in order, rather than being dropped or merely reported as an
+// error with nothing reaching the user.
 func TestOversizedMessageSplitAndDelivered(t *testing.T) {
 	var sendMessageCalls atomic.Int64
 	mux := http.NewServeMux()

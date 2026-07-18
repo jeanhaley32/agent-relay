@@ -39,9 +39,9 @@ const maxMessageLen = 4096
 // message, a missing chat_id), as opposed to a transient failure (network
 // blip, Telegram outage) that background retry can legitimately fix.
 //
-// This is the shared senderr.Permanent type (extracted once Discord needed
-// the identical semantics) rather than a package-local definition, so the
-// two frontends' retry-classification logic can't silently drift apart.
+// This is the shared senderr.Permanent type rather than a package-local
+// definition, so retry-classification logic can't silently drift apart
+// between frontends that need the same semantics.
 type permanentSendError = senderr.Permanent
 
 // Authorizer decides whether a sender may use the relay and records requests
@@ -77,7 +77,7 @@ type Frontend struct {
 	// unchanged), but a failed send is also queued here for a background
 	// worker to keep retrying with backoff, instead of just vanishing.
 	retryQueue     chan retryItem
-	sendFailures   atomic.Int64 // every failed immediate attempt (retries included)
+	sendFailures   atomic.Int64 // failed immediate attempts only, not background retries
 	permanentDrops atomic.Int64 // gave up after maxRetryAttempts
 	queueDepth     atomic.Int64
 
@@ -333,23 +333,32 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 // dropped - the old behavior silently lost the whole reply on anything over
 // 4096 chars with no error surfaced to the sender. Every chunk is attempted
 // regardless of an earlier chunk's outcome, since a transient failure is
-// already queued by sendChunk and skipping the rest would just strand them;
-// only the first permanent failure is returned to the caller.
+// already queued by sendChunk and skipping the rest would just strand them.
+// The first permanent failure is returned if any chunk hit one; otherwise the
+// first transient failure is returned, matching the single-message path
+// (sendChunk/sendOnce) which always reports its error to the caller instead
+// of swallowing it.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
-		var permErr error
+		var permErr, firstErr error
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
 			if err := f.sendChunk(ctx, cm); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
 				var perm permanentSendError
 				if errors.As(err, &perm) && permErr == nil {
 					permErr = err
 				}
 			}
 		}
-		return permErr
+		if permErr != nil {
+			return permErr
+		}
+		return firstErr
 	}
 	return f.sendChunk(ctx, m)
 }
@@ -416,9 +425,6 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 		}
 		return sendErr
 	}
-	// Log Telegram's own assigned message_id on success, so a "the daemon
-	// said success" claim can be cross-checked directly against the
-	// platform afterward rather than trusting the ack alone.
 	var parsed struct {
 		Result struct {
 			MessageID int64 `json:"message_id"`
