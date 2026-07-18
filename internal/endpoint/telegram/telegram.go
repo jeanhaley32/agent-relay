@@ -319,13 +319,10 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 }
 
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
-// to m.ConversationID). Messages over Telegram's real limit are split (see
-// senderr.Split) rather than dropped. Chunks are sent in order, and on a
-// transient failure the remaining chunks are queued for background retry in
-// the same order rather than attempted immediately, to preserve sequence as
-// far as possible. That said, ordering is still only best-effort: once
-// chunks are in the retry queue, each is retried independently, so a later
-// chunk's retry can still land before an earlier one's.
+// to m.ConversationID), splitting it via senderr.Split if over Telegram's
+// limit. Ordering across chunks is best-effort only: once a chunk is queued
+// for background retry, it's retried independently, so a later chunk can
+// still land before an earlier one.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
@@ -427,15 +424,6 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 		}
 		return sendErr
 	}
-	var parsed struct {
-		Result struct {
-			MessageID int64 `json:"message_id"`
-		} `json:"result"`
-	}
-	b, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(b, &parsed); err == nil && f.logger != nil {
-		f.logger.Printf("telegram send ok: chat=%s message_id=%d", chatID, parsed.Result.MessageID)
-	}
 	return nil
 }
 
@@ -452,7 +440,7 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 	case f.retryQueue <- item:
 		f.queueDepth.Add(1)
 	default:
-		f.logger.Printf("telegram retry queue full (%d), dropping oldest to make room", retryQueueCapacity)
+		f.logger.Printf("telegram retry queue full (%d), dropping oldest queued item to make room", retryQueueCapacity)
 		select {
 		case <-f.retryQueue:
 			f.queueDepth.Add(-1)

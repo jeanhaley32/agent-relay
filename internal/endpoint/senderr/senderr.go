@@ -16,15 +16,9 @@ type Permanent struct{ Err error }
 func (e Permanent) Error() string { return e.Err.Error() }
 func (e Permanent) Unwrap() error { return e.Err }
 
-// Split breaks text into chunks no longer than limit runes, so a frontend
-// can deliver an oversized reply as multiple messages instead of permanently
-// dropping it — a long reply silently failing against a platform's
-// per-message length limit leaves the sender with no error and no message.
-//
-// Prefers breaking on paragraph boundaries ("\n\n"), then single newlines,
-// then spaces, so chunks read naturally rather than splitting mid-word; only
-// falls back to a hard rune-count cut for a single "word" longer than limit
-// on its own (rare, but must never infinite-loop or drop a rune).
+// Split breaks text into chunks no longer than limit runes, so an oversized
+// reply can be delivered as multiple messages instead of silently dropped
+// against a platform's per-message length limit.
 func Split(text string, limit int) []string {
 	if limit <= 0 {
 		return []string{text}
@@ -39,12 +33,9 @@ func Split(text string, limit int) []string {
 		cut, onSeparator := bestBreak(remaining, limit)
 		chunks = append(chunks, remaining[:cut])
 		remaining = remaining[cut:]
-		// bestBreak cuts past the separator it broke on, but a repeated
-		// separator (e.g. "\n\n\n") can still leave a lone separator
-		// dangling at the new start; drop it so chunks don't accumulate
-		// leading whitespace. Only do this when the cut actually landed on
-		// a separator — a hard rune-count fallback cut carries no such
-		// guarantee, and trimming there would silently eat real content.
+		// Only trim when the cut landed on a separator: a hard rune-count
+		// fallback cut has no such guarantee, and trimming there would
+		// silently eat real content.
 		if onSeparator {
 			remaining = trimOneLeadingSeparator(remaining)
 		}
