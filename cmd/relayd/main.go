@@ -352,15 +352,8 @@ func main() {
 	// the model was legitimately talking in, while still failing closed for
 	// anything never seen inbound.
 	b.OutboundAllowed = func(chatID string) bool {
-		if id, err := strconv.ParseInt(chatID, 10, 64); err == nil && acc.Allowed(id) {
-			return true
-		}
-		if discordAcc != nil {
-			if id, err := snowflake.Parse(chatID); err == nil && discordAcc.Allowed(int64(id)) {
-				return true
-			}
-		}
-		if discordFront != nil && discordFront.KnownConversation(chatID) {
+		known := func(id string) bool { return discordFront != nil && discordFront.KnownConversation(id) }
+		if outboundAllowed(chatID, acc, discordAcc, known) {
 			return true
 		}
 		logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
@@ -684,8 +677,8 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 	// same as every other endpoint on this mux - this process's threat model
 	// already assumes localhost is trusted. Just increments a counter; see
 	// replyDriftTotal's doc comment for why this stays observability-only
-	// rather than auto-forwarding the orphaned text (Jean's call, 2026-07-14:
-	// auto-forward risks sending unintended draft/mid-thought text).
+	// rather than auto-forwarding the orphaned text: auto-forward risks
+	// sending unintended draft/mid-thought text.
 	mux.HandleFunc("/webhook/reply-drift", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -875,6 +868,34 @@ func describeSchedule(sched *scheduler.Scheduler, sc *scheduler.Schedule) string
 		return fmt.Sprintf("recurring %q, next %s", sc.Cron, next.Format("Mon 2006-01-02 15:04 MST"))
 	}
 	return "once at " + next.Format("Mon 2006-01-02 15:04 MST")
+}
+
+// outboundAllowed implements the outbound gate: the model can only reply to
+// allowlisted chats. The inbound allowlist gates who reaches Claude; this
+// stops Claude messaging strangers. Checks both the Telegram (int64) and,
+// when enabled, Discord (snowflake) allowlists — chatID is a Telegram chat
+// id (== user id) or, for Discord, gate()'s convID (== user id for DMs, ==
+// channel id for guild messages). Guild channels are inherently multi-party
+// so acc-style single-id allowlisting doesn't apply there; instead known
+// reports whether the Discord frontend has already seen and gated this
+// chatID inbound — i.e. a guild channel from an allowed guild, or a DM user
+// id. That covers scheduled reminders / relayd-originated replies into a
+// channel the model was legitimately talking in, while still failing closed
+// for anything never seen inbound. discordAcc and known may be nil/absent
+// when the Discord frontend is disabled.
+func outboundAllowed(chatID string, acc *access.Manager, discordAcc *access.Manager, known func(string) bool) bool {
+	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil && acc.Allowed(id) {
+		return true
+	}
+	if discordAcc != nil {
+		if id, err := snowflake.Parse(chatID); err == nil && discordAcc.Allowed(int64(id)) {
+			return true
+		}
+	}
+	if known != nil && known(chatID) {
+		return true
+	}
+	return false
 }
 
 // verdict returns an /allow or /deny handler that answers a pending tool-approval
