@@ -165,7 +165,6 @@ func main() {
 	// Frontend slot via relay.MultiFrontend alongside Telegram.
 	frontendEndpoint := relay.Endpoint(front)
 	var discordFront *discord.Frontend
-	// Assign into discordAcc (declared earlier); don't redeclare it here.
 	if cfg.Discord.Enabled {
 		discordFront, discordAcc = mustStartDiscord(cfg, logger)
 		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
