@@ -236,3 +236,49 @@ func TestReadErrorClosesSocket(t *testing.T) {
 		t.Fatal("shim read timed out: daemon did not close the socket - half-open leak (regression)")
 	}
 }
+
+// TestCloseUnblocksReadReplies guards the 2026-07-18 shutdown hang: Close()
+// must terminate the LIVE connection, not just the listener. acceptLoop is
+// almost always parked inside readReplies on c.Recv(), which a listener close
+// does not interrupt - so without this, acceptLoop never returns, its
+// `defer close(e.recv)` never runs, the broker's outbound pump blocks forever
+// on `range Backend.Recv()`, and Broker.Run hangs in wg.Wait() until systemd
+// SIGKILLs it.
+func TestCloseUnblocksReadReplies(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	e, err := New(sock)
+	if err != nil {
+		t.Fatalf("new endpoint: %v", err)
+	}
+
+	// Establish a connection and leave it idle, so acceptLoop is parked inside
+	// readReplies blocked on c.Recv() - exactly the real shutdown situation.
+	shim, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer shim.Close()
+	if err := ipc.NewConn(shim).Send(ipc.Frame{Kind: ipc.KindReply, ChatID: "1", Text: "hi"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case <-e.Recv():
+	case <-time.After(2 * time.Second):
+		t.Fatal("endpoint never received the reply")
+	}
+
+	// Close() must cause Recv() to drain and close, the way Broker.Run's
+	// shutdown depends on. If it hangs, shutdown would hang in production.
+	_ = e.Close()
+	drained := make(chan struct{})
+	go func() {
+		for range e.Recv() { // ranges until the channel is closed
+		}
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Recv() never closed after Close(): acceptLoop still stuck in readReplies - shutdown would hang (regression)")
+	}
+}
