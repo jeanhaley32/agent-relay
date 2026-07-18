@@ -54,8 +54,9 @@ func newTestTracker(t *testing.T, h *trackerHarness) (*Tracker, *time.Time) {
 	path := filepath.Join(t.TempDir(), "events.json")
 	now := time.Now()
 	clock := &now
-	// Inject the clock via config (not by mutating tr.now after the loop has
-	// started) so the reconciliation goroutine never races the field write.
+	// Inject the clock via cfg.Now (a closure over *clock) rather than
+	// mutating a Tracker field after construction, so the reconciliation
+	// goroutine never races a field write.
 	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{
 		NudgeAfter:     5 * time.Minute,
 		EscalateAfter:  12 * time.Minute,
