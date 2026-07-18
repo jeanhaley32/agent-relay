@@ -374,7 +374,6 @@ func (t *Tracker) OldestOpenAge() time.Duration {
 	return oldest
 }
 
-// Close stops the reconciliation loop.
 func (t *Tracker) Close() {
 	t.mu.Lock()
 	if t.closed {
@@ -565,12 +564,13 @@ func (t *Tracker) persist() error {
 		t.logger.Printf("warning: marshal pending events: %v", err)
 		return err
 	}
-	tmp := t.path + ".tmp"
+	cleanPath := filepath.Clean(t.path)
+	tmp := cleanPath + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		t.logger.Printf("warning: persist pending events: %v", err)
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Clean(t.path)); err != nil {
+	if err := os.Rename(tmp, cleanPath); err != nil {
 		t.logger.Printf("warning: rename pending events: %v", err)
 		return err
 	}
