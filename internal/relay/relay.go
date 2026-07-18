@@ -19,6 +19,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
+	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/session"
 )
 
@@ -83,6 +84,12 @@ const FrontendSendTimeout = 12 * time.Second
 type Broker struct {
 	Frontend Endpoint
 	Backend  Endpoint
+	// Events, if set, receives one structured record per lifecycle step of
+	// every message (received -> gated/injected -> reply -> sent/failed), keyed
+	// by the msg_id stamped at ingress. This is the audit trail that makes a
+	// lost message answerable: `grep <msg_id> relay-events.jsonl` shows exactly
+	// how far it got and where it stopped. nil ⇒ no event logging.
+	Events   *eventlog.Logger
 	Commands *command.Registry
 	Meter    *budget.Meter
 	Estimate Estimator
@@ -310,6 +317,25 @@ func (b *Broker) SetConversationUsage(chatID string, tokens int64) {
 // LockdownMessage is sent to any non-admin sender while lockdown is active.
 const LockdownMessage = "This assistant is currently in lockdown - only admins can send messages right now. Try again later."
 
+// logEvent records one lifecycle step for a message on the audit trail. It
+// pulls the identity fields straight out of Meta so callers stay one-liners,
+// and never logs message bodies — only a byte count — so the trail can be kept
+// and shared without leaking conversation content.
+func (b *Broker) logEvent(m Message, event, detail, errText string) {
+	if b.Events == nil {
+		return
+	}
+	b.Events.Log(eventlog.Record{
+		MsgID:  m.Meta["msg_id"],
+		Event:  event,
+		ChatID: m.Meta["chat_id"],
+		FromID: m.Meta["from_id"],
+		Bytes:  len(m.Text),
+		Detail: detail,
+		Err:    errText,
+	})
+}
+
 // challengeSession sends a fresh tailnet re-auth link to the conversation
 // and, in the background, activates userID's session once approved. A no-op
 // if a challenge for userID is already in flight, so a gated user sending
@@ -396,7 +422,9 @@ func (b *Broker) Run(ctx context.Context) error {
 			b.Meter.Record(estimate)
 			// Outbound gate: the model may target any chat via its reply tool;
 			// only deliver to allowed chats.
+			b.logEvent(m, eventlog.Reply, "", "")
 			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
+				b.logEvent(m, eventlog.Dropped, "outbound chat not allowlisted", "")
 				if b.AckBackendReply != nil {
 					b.AckBackendReply(m, senderr.Permanent{Err: fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"])})
 				}
@@ -406,6 +434,11 @@ func (b *Broker) Run(ctx context.Context) error {
 			sendCtx, cancel := context.WithTimeout(ctx, FrontendSendTimeout)
 			sendErr := b.Frontend.Send(sendCtx, m)
 			cancel()
+			if sendErr != nil {
+				b.logEvent(m, eventlog.SendFailed, "", sendErr.Error())
+			} else {
+				b.logEvent(m, eventlog.SendOK, "", "")
+			}
 			if b.AckBackendReply != nil {
 				b.AckBackendReply(m, sendErr)
 			}
@@ -427,6 +460,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		if m.Role != User {
 			continue
 		}
+		b.logEvent(m, eventlog.Received, "", "")
 		// Identity-pair invariant tripwire: for 1:1 chats chat_id == from_id
 		// by construction, so a mismatch means an upstream assumption broke.
 		// Guild-tagged messages are exempt: multi-party chat_id is
@@ -439,6 +473,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		if b.Lockdown.Load() {
 			isAdmin := b.Commands != nil && b.Commands.IsAdmin != nil && b.Commands.IsAdmin(m.Meta["from_id"])
 			if !isAdmin {
+				b.logEvent(m, eventlog.GateBlocked, "lockdown", "")
 				_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, LockdownMessage))
 				continue
 			}
@@ -448,6 +483,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		// Keyed on from_id (see SessionGatedUsers doc comment above).
 		if b.Session != nil && b.Approval != nil && b.SessionGatedUsers[m.Meta["from_id"]] {
 			if !b.Session.Active(m.Meta["from_id"]) {
+				b.logEvent(m, eventlog.GateBlocked, "session expired - re-auth required, message discarded", "")
 				b.challengeSession(ctx, m.ConversationID, m.Meta["from_id"])
 				continue
 			}
@@ -468,6 +504,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 		// 2. Budget / circuit gate.
 		if ok, why := b.Meter.Allow(b.Estimate(m.Text)); !ok {
+			b.logEvent(m, eventlog.GateBlocked, "budget: "+why, "")
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, why))
 			continue
 		}
@@ -486,6 +523,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 		// 3. Admitted: forward to the backend (which replies via its Recv).
 		if err := b.Backend.Send(ctx, m); err != nil {
+			b.logEvent(m, eventlog.Dropped, "backend send failed", err.Error())
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, "backend error: "+err.Error()))
 		}
 	}
