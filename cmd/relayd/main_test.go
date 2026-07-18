@@ -1,17 +1,26 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/jeanhaley32/agent-relay/internal/access"
+	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
+	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 )
 
@@ -201,5 +210,140 @@ func TestHandleEventListAndAck(t *testing.T) {
 
 	if _, errText := handleEvent(tr, claudebk.SchedRequest{Op: "bogus"}); errText == "" {
 		t.Error("unknown op: expected an error, got none")
+	}
+}
+
+// newTestMux builds a relayd webhook mux with minimal live dependencies
+// (a claude backend endpoint on a temp socket, an in-memory budget meter,
+// and the shared test tracker) - enough to drive the method-guard and
+// payload-decode branches of each /webhook/* handler without a real relayd
+// process.
+func newTestMux(t *testing.T, adminChatID string) (*http.ServeMux, *relay.Broker) {
+	t.Helper()
+	back, err := claudebk.New(filepath.Join(t.TempDir(), "shim.sock"))
+	if err != nil {
+		t.Fatalf("claudebk.New: %v", err)
+	}
+	t.Cleanup(func() { _ = back.Close() })
+
+	meter := budget.New("free", nil)
+	tr := newTestTracker(t)
+	logger := log.New(io.Discard, "", 0)
+	b := &relay.Broker{Meter: meter}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"budget":{"tier":"free"},"telegram":{"admins":[1]}}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	mux := newRelaydMux(back, adminChatID, nil, meter, nil, nil, tr, logger, b, cfgPath)
+	return mux, b
+}
+
+func TestWebhookReplyDriftHandler(t *testing.T) {
+	mux, _ := newTestMux(t, "")
+
+	// Wrong method is rejected.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook/reply-drift", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: got status %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+
+	before := replyDriftTotal.Load()
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/reply-drift", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("POST: got status %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := replyDriftTotal.Load(); got != before+1 {
+		t.Errorf("replyDriftTotal: got %d, want %d", got, before+1)
+	}
+}
+
+func TestWebhookTokenUsageHandler(t *testing.T) {
+	mux, b := newTestMux(t, "")
+	b.SetCaps(map[string]int64{"chat1": 1000}, 0)
+
+	// Wrong method is rejected.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook/token-usage", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: got status %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+
+	// Bad payload is rejected.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/token-usage", bytes.NewBufferString("not json")))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("bad payload: got status %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+
+	// Valid payload applies usage.
+	body, _ := json.Marshal(map[string]any{"usage": map[string]int64{"chat1": 500}})
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/token-usage", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Errorf("valid payload: got status %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestWebhookReloadCapsHandler(t *testing.T) {
+	mux, _ := newTestMux(t, "")
+
+	// Wrong method is rejected.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook/reload-caps", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: got status %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/reload-caps", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("POST: got status %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+// TestWebhookGrafanaHandler covers the method guard and the adminChatID gate
+// that replaced the old whole-mux early-return: with no admin chat configured
+// the handler itself now refuses the alert (503) instead of every other
+// endpoint on the mux silently never existing.
+func TestWebhookGrafanaHandler(t *testing.T) {
+	muxNoAdmin, _ := newTestMux(t, "")
+	rec := httptest.NewRecorder()
+	body, _ := json.Marshal(map[string]any{"alerts": []any{}})
+	muxNoAdmin.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/grafana", bytes.NewReader(body)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("no admin chat: got status %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	muxAdmin, _ := newTestMux(t, "12345")
+
+	rec = httptest.NewRecorder()
+	muxAdmin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook/grafana", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: got status %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+
+	rec = httptest.NewRecorder()
+	muxAdmin.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/grafana", bytes.NewBufferString("not json")))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("bad payload: got status %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"alerts": []map[string]any{
+			{
+				"status":      "firing",
+				"labels":      map[string]string{"alertname": "TestAlert", "severity": "critical"},
+				"annotations": map[string]string{"summary": "something broke"},
+			},
+		},
+	})
+	rec = httptest.NewRecorder()
+	muxAdmin.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/grafana", bytes.NewReader(payload)))
+	if rec.Code != http.StatusOK {
+		t.Errorf("valid payload: got status %d, want %d", rec.Code, http.StatusOK)
 	}
 }
