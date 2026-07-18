@@ -62,15 +62,14 @@ type Frontend struct {
 	recv   chan relay.Message
 	cancel context.CancelFunc
 
-	// Every caller discards Send()'s error (`_ = frontend.Send(...)`), so a
-	// transient Telegram outage would otherwise drop a reply forever with no
-	// trace of the failure anywhere. retryQueue is a bounded background
-	// retry path: Send() still returns immediately (callers' behavior is
-	// unchanged), but a failed send is also queued here for a background
-	// worker to keep retrying with backoff, instead of just vanishing.
+	// Send() returns immediately without waiting on delivery, so a transient
+	// Telegram outage would otherwise drop a reply forever with no trace of
+	// the failure anywhere. retryQueue is a bounded background retry path: a
+	// failed send is also queued here for a background worker to keep
+	// retrying with backoff, instead of just vanishing.
 	retryQueue     chan retryItem
 	sendFailures   atomic.Int64 // failed immediate attempts only, not background retries
-	permanentDrops atomic.Int64 // count of drops: an immediate send hit a permanent error, retry queue full, a permanent failure hit during background retry, or retry attempts exhausted
+	permanentDrops atomic.Int64 // count of drops across all give-up paths (see increment sites)
 	queueDepth     atomic.Int64
 
 	// getUpdatesFailures/lastPollSuccess are the real signal for an outage:
@@ -391,8 +390,6 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	return err
 }
 
-// sendOnce is the actual single HTTP attempt - both Send() and the retry
-// worker call this, so there's exactly one code path that talks to Telegram.
 func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	chatID := m.Meta["chat_id"]
 	if chatID == "" {

@@ -36,14 +36,18 @@ func Split(text string, limit int) []string {
 	var chunks []string
 	remaining := text
 	for utf8.RuneCountInString(remaining) > limit {
-		cut := bestBreak(remaining, limit)
+		cut, onSeparator := bestBreak(remaining, limit)
 		chunks = append(chunks, remaining[:cut])
 		remaining = remaining[cut:]
 		// bestBreak cuts past the separator it broke on, but a repeated
-		// separator (e.g. "\n\n\n") or a hard rune-count fallback landing
-		// right before one can still leave a lone separator dangling at the
-		// new start; drop it so chunks don't accumulate leading whitespace.
-		remaining = trimOneLeadingSeparator(remaining)
+		// separator (e.g. "\n\n\n") can still leave a lone separator
+		// dangling at the new start; drop it so chunks don't accumulate
+		// leading whitespace. Only do this when the cut actually landed on
+		// a separator — a hard rune-count fallback cut carries no such
+		// guarantee, and trimming there would silently eat real content.
+		if onSeparator {
+			remaining = trimOneLeadingSeparator(remaining)
+		}
 	}
 	if remaining != "" {
 		chunks = append(chunks, remaining)
@@ -55,20 +59,21 @@ func Split(text string, limit int) []string {
 // boundary, preferring the latest paragraph/newline/space break so chunks
 // don't split mid-word. Falls back to a hard rune-count cut (always valid,
 // since it's counted in runes not bytes) if no separator exists in range.
-func bestBreak(s string, limit int) int {
+// The second return value reports whether the cut landed on a separator.
+func bestBreak(s string, limit int) (int, bool) {
 	limitByte := runeLimitByteOffset(s, limit)
 	window := s[:limitByte]
 
 	if i := lastIndexFrom(window, "\n\n"); i > 0 {
-		return i + len("\n\n")
+		return i + len("\n\n"), true
 	}
 	if i := lastIndexFrom(window, "\n"); i > 0 {
-		return i + len("\n")
+		return i + len("\n"), true
 	}
 	if i := lastIndexFrom(window, " "); i > 0 {
-		return i + len(" ")
+		return i + len(" "), true
 	}
-	return limitByte
+	return limitByte, false
 }
 
 // runeLimitByteOffset returns the byte offset of the limit-th rune in s (or
