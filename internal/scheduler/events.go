@@ -35,7 +35,7 @@ const (
 // so the process can restart at any point without losing track of it.
 type PendingEvent struct {
 	ID          string    `json:"id"`
-	ScheduleID  string    `json:"schedule_id,omitempty"` // which schedule fired this (empty for non-schedule sources)
+	ScheduleID  string    `json:"schedule_id,omitempty"`
 	ChatID      string    `json:"chat_id"`
 	Text        string    `json:"text"`
 	FiredAt     time.Time `json:"fired_at"`
@@ -179,7 +179,6 @@ func NewTracker(path string, inject InjectFunc, fallback FallbackFunc, receipt R
 // Reconcile mutates events concurrently.
 func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 	t.mu.Lock()
-	// Coalesce onto an existing open event from the same schedule.
 	if scheduleID != "" {
 		if ex := t.openBySchedule(scheduleID); ex != nil {
 			ex.FireCount++

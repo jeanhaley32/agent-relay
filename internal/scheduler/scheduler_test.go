@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -175,5 +176,64 @@ func TestMissedOneShotFiresOnLoad(t *testing.T) {
 	case <-c2.fire:
 	case <-time.After(2 * time.Second):
 		t.Fatal("missed one-shot did not fire on load")
+	}
+}
+
+// failingCollector's deliver always errors, simulating a durable-persist
+// failure so fire() must keep the one-shot schedule intact for retry instead
+// of deleting it.
+type failingCollector struct {
+	mu    sync.Mutex
+	calls int
+	fire  chan struct{}
+}
+
+func newFailingCollector() *failingCollector {
+	return &failingCollector{fire: make(chan struct{}, 8)}
+}
+
+func (c *failingCollector) deliver(scheduleID, chatID, text string) error {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	c.fire <- struct{}{}
+	return errors.New("simulated deliver failure")
+}
+
+func (c *failingCollector) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestFireKeepsScheduleOnDeliverError: when deliver returns an error, the
+// one-shot schedule must survive (not be deleted) so the next tick retries
+// it, rather than silently losing the event.
+func TestFireKeepsScheduleOnDeliverError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newFailingCollector()
+	s, err := New(path, time.UTC, c.deliver, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	sc, err := s.Create("do pushups", "", 40*time.Millisecond, "42")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	select {
+	case <-c.fire:
+	case <-time.After(2 * time.Second):
+		t.Fatal("one-shot never attempted delivery")
+	}
+
+	// Give fire() a moment to finish its post-deliver bookkeeping.
+	time.Sleep(50 * time.Millisecond)
+
+	list := s.List()
+	if len(list) != 1 || list[0].ID != sc.ID {
+		t.Fatalf("schedule was removed despite deliver error: %+v", list)
 	}
 }
