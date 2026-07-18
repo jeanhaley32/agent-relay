@@ -470,6 +470,99 @@ func TestOnMessageCreateRecvFullDrop(t *testing.T) {
 	}
 }
 
+// TestOnMessageCreateMentionAndReplyExtraction drives onMessageCreate with a
+// real events.MessageCreate (populated Mentions/ReferencedMessage, matching
+// what disgo hands us off the gateway) rather than setting mentionsBot /
+// isReplyToBot directly on an inboundMessage, so a regression in the
+// extraction logic in onMessageCreate itself (not just in gate()) would fail
+// this test.
+func TestOnMessageCreateMentionAndReplyExtraction(t *testing.T) {
+	selfID := snowflake.ID(777)
+	allowedGuild := snowflake.ID(500)
+
+	newFrontend := func() *Frontend {
+		return &Frontend{
+			auth:                  &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+			logger:                testLogger(t),
+			selfID:                selfID,
+			allowGuildMessages:    true,
+			allowedGuildIDs:       map[snowflake.ID]bool{allowedGuild: true},
+			requireMentionInGuild: true,
+			recv:                  make(chan relay.Message, 1),
+		}
+	}
+
+	// A guild message that @-mentions the bot (via Mentions, not a direct
+	// mentionsBot flag) must satisfy requireMentionInGuild and be relayed.
+	t.Run("mention", func(t *testing.T) {
+		f := newFrontend()
+		f.onMessageCreate(&events.MessageCreate{GenericMessage: &events.GenericMessage{
+			Message: discord.Message{
+				ID:        1,
+				ChannelID: 42,
+				GuildID:   &allowedGuild,
+				Author:    discord.User{ID: 111, Username: "jean"},
+				Content:   "@bot hi",
+				Mentions:  []discord.User{{ID: selfID}},
+			},
+		}})
+		select {
+		case msg := <-f.recv:
+			if msg.Text != "@bot hi" {
+				t.Fatalf("unexpected message text: %+v", msg)
+			}
+		default:
+			t.Fatalf("expected mentioned guild message to be relayed")
+		}
+	})
+
+	// A reply to the bot's own message (via ReferencedMessage) must also
+	// satisfy requireMentionInGuild, without any explicit mention.
+	t.Run("reply-to-bot", func(t *testing.T) {
+		f := newFrontend()
+		f.onMessageCreate(&events.MessageCreate{GenericMessage: &events.GenericMessage{
+			Message: discord.Message{
+				ID:        2,
+				ChannelID: 42,
+				GuildID:   &allowedGuild,
+				Author:    discord.User{ID: 111, Username: "jean"},
+				Content:   "yes",
+				ReferencedMessage: &discord.Message{
+					Author: discord.User{ID: selfID},
+				},
+			},
+		}})
+		select {
+		case msg := <-f.recv:
+			if msg.Text != "yes" {
+				t.Fatalf("unexpected message text: %+v", msg)
+			}
+		default:
+			t.Fatalf("expected reply-to-bot guild message to be relayed")
+		}
+	})
+
+	// Unaddressed guild chatter (no mention, no reply-to-bot) must still be
+	// dropped when driven through the real extraction path.
+	t.Run("unaddressed", func(t *testing.T) {
+		f := newFrontend()
+		f.onMessageCreate(&events.MessageCreate{GenericMessage: &events.GenericMessage{
+			Message: discord.Message{
+				ID:        3,
+				ChannelID: 42,
+				GuildID:   &allowedGuild,
+				Author:    discord.User{ID: 111, Username: "jean"},
+				Content:   "ambient chatter",
+			},
+		}})
+		select {
+		case msg := <-f.recv:
+			t.Fatalf("expected unaddressed guild message to be dropped, got %+v", msg)
+		default:
+		}
+	})
+}
+
 // TestEnqueueRetryQueueFullEviction covers the queue-full eviction path: when
 // the retry queue is at capacity, enqueueRetry must drop the oldest item
 // (counting it in permanentDrops and decrementing queueDepth) rather than

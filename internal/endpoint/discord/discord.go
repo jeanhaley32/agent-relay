@@ -719,8 +719,6 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	create := discord.MessageCreate{Content: m.Text}
 	sent, err := f.channels.CreateMessage(channelID, create, rest.WithCtx(ctx))
 	if err == nil {
-		// Log Discord's own message id so a later ack can be cross-checked
-		// against the platform, not just trusted at face value.
 		f.logger.Printf("discord send ok: channel=%s message=%s", channelID, sent.ID)
 		return nil
 	}
