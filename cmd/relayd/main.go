@@ -51,9 +51,10 @@ import (
 // replyDriftTotal counts turns where the model produced assistant text in
 // response to a relay channel event but never called the reply tool - an
 // answer composed entirely in the terminal, never sent, invisible to every
-// existing metric since no send was ever attempted. Incremented by
-// detect-reply-drift.py, a Claude Code Stop hook that scans the session
-// transcript for exactly this pattern; see scripts/detect-reply-drift.py.
+// existing metric since no send was ever attempted. Incremented by the
+// /webhook/reply-drift handler below, which scripts/detect-reply-drift.py (a
+// Claude Code Stop hook) POSTs to after scanning the session transcript for
+// exactly this pattern.
 var replyDriftTotal atomic.Int64
 
 func main() {
@@ -561,10 +562,18 @@ type grafanaWebhookPayload struct {
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
 func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) {
-	if adminChatID == "" {
-		logger.Printf("grafana webhook: no admin chat configured, not starting listener")
-		return
+	mux := newRelaydMux(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, cfgPath)
+	addr := "127.0.0.1:9210"
+	logger.Printf("grafana webhook listening on %s/webhook/grafana", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		logger.Printf("grafana webhook server stopped: %v", err)
 	}
+}
+
+// newRelaydMux builds the loopback-only observability/webhook mux served by
+// serveGrafanaWebhook. Split out so tests can exercise each handler directly
+// via httptest without starting a real listener.
+func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) *http.ServeMux {
 	mux := http.NewServeMux()
 	// Exposes two things the admin dashboard/alert rule needs: unauthorized
 	// senders queued internally by access.Manager.Record (otherwise only
@@ -754,6 +763,11 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		if adminChatID == "" {
+			logger.Printf("grafana webhook: no admin chat configured, dropping alert")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -785,11 +799,7 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 		}
 		w.WriteHeader(http.StatusOK)
 	})
-	addr := "127.0.0.1:9210"
-	logger.Printf("grafana webhook listening on %s/webhook/grafana", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		logger.Printf("grafana webhook server stopped: %v", err)
-	}
+	return mux
 }
 
 // serveSchedules answers schedule-tool calls from the model: create/list/cancel
