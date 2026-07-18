@@ -229,7 +229,7 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 			// chat. BotFather is also configured to disallow group invites,
 			// but this is the code-level backstop in case that setting is
 			// ever changed or reset.
-			if m.Chat.Type != "" && m.Chat.Type != "private" {
+			if m.Chat.Type != "private" {
 				f.logger.Printf("dropped message from non-private chat id=%d type=%q sender=%d", m.Chat.ID, m.Chat.Type, m.From.ID)
 				continue
 			}
@@ -324,18 +324,11 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 }
 
 // Send delivers a message to the chat named by m.Meta["chat_id"] (falling back
-// to m.ConversationID) via sendMessage. A message over Telegram's real limit
-// is split into multiple messages (see senderr.Split) rather than permanently
-// dropped, with an error surfaced to the caller if any chunk fails outright.
-// On a transient failure mid-split, remaining chunks are queued for
-// background retry (not sent immediately) rather than attempted out of
-// turn; this keeps ordering in the common case, but is not a hard
-// guarantee — retries run on their own schedule, so if an earlier chunk's
-// retry is deferred while a later chunk's retry succeeds, delivery order
-// can still be violated. A permanent failure on one chunk still lets
-// later, independent chunks attempt delivery. The
-// first permanent failure is returned if any chunk hit one; otherwise the
-// first transient failure is returned.
+// to m.ConversationID). Messages over Telegram's real limit are split (see
+// senderr.Split) rather than dropped. Ordering across chunks is best-effort
+// only: a transient failure queues the remaining chunks for background
+// retry instead of blocking, so a later chunk's retry can still land before
+// an earlier one's.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
@@ -375,8 +368,6 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	return f.sendChunk(ctx, m)
 }
 
-// sendChunk is Send's single-message path, doing the retry/permanent-failure
-// classification for one already-within-limit message.
 func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 	err := f.sendOnce(ctx, m)
 	if err == nil {

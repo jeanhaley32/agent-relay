@@ -63,8 +63,8 @@ func TestPollGateAndSend(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Query().Get("offset") == "" {
 			fmt.Fprint(w, `{"ok":true,"result":[
-				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"jean"},"chat":{"id":222},"text":"hello"}},
-				{"update_id":11,"message":{"message_id":2,"from":{"id":999,"username":"stranger"},"chat":{"id":333},"text":"spam"}}
+				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"jean"},"chat":{"id":222,"type":"private"},"text":"hello"}},
+				{"update_id":11,"message":{"message_id":2,"from":{"id":999,"username":"stranger"},"chat":{"id":333,"type":"private"},"text":"spam"}}
 			]}`)
 			return
 		}
