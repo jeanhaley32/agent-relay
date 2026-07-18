@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -357,6 +358,53 @@ func TestFirePersistFailureIsSurfaced(t *testing.T) {
 	}
 	if len(tr.ListPending()) != 0 {
 		t.Fatal("an unpersisted event must not linger in memory")
+	}
+}
+
+// TestFireCoalescePersistFailureRollsBack: if persisting a coalesced re-fire
+// fails, Fire must return an error and the in-memory event must be rolled
+// back to its pre-mutation state, so memory doesn't diverge from what's on
+// disk (mirrors the new-event branch's persist-failure guarantee).
+func TestFireCoalescePersistFailureRollsBack(t *testing.T) {
+	h := &trackerHarness{connected: true}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.json")
+	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{TickEvery: time.Hour}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	t.Cleanup(tr.Close)
+
+	first, err := tr.Fire("s", "42", "first text")
+	if err != nil {
+		t.Fatalf("first Fire: %v", err)
+	}
+
+	// Make the directory unwritable so the next persist (atomic tmp-file
+	// write) fails, without disturbing the file already written above.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	_, err = tr.Fire("s", "42", "second text")
+	if err == nil {
+		t.Fatal("coalesced Fire should return an error when persist fails")
+	}
+
+	pending := tr.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("expected exactly one pending event, got %d", len(pending))
+	}
+	got := pending[0]
+	if got.ID != first.ID {
+		t.Fatalf("event ID changed: got %s want %s", got.ID, first.ID)
+	}
+	if got.FireCount != first.FireCount {
+		t.Fatalf("FireCount not rolled back: got %d want %d", got.FireCount, first.FireCount)
+	}
+	if got.Text != first.Text {
+		t.Fatalf("Text not rolled back: got %q want %q", got.Text, first.Text)
 	}
 }
 
