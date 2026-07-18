@@ -565,12 +565,10 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 		return
 	}
 	mux := http.NewServeMux()
-	// Real gaps closed 2026-07-09, both requested directly by Jean: (1)
-	// unauthorized Telegram senders were already queued internally
-	// (access.Manager.Record, surfaced only via the /handshake admin
-	// command) but nothing alerted proactively; (2) there was no admin
-	// visibility into relayd's own budget/circuit-breaker state at all -
-	// both now exposed here for the admin dashboard + alert rule.
+	// Exposes two things the admin dashboard/alert rule needs: unauthorized
+	// senders queued internally by access.Manager.Record (otherwise only
+	// visible via the /handshake admin command), and relayd's own
+	// budget/circuit-breaker state, which had no external visibility before.
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		snap := meter.Snapshot()
 		stateNum := 0
@@ -701,8 +699,7 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 	// Code Stop hook) with real per-conversation token usage computed from
 	// the session transcript's own Claude-API usage data - replacing the
 	// interim chars/4 text-length estimate the Broker uses live between hook
-	// runs. Jean's explicit request, 2026-07-14: the estimate was found to
-	// undercount real usage by roughly 2-3x for a capped conversation. Body:
+	// runs, which undercounts real usage. Body:
 	// {"usage": {"<chat_id>": <int64 tokens>, ...}} - a batch of every
 	// currently-capped conversation's real usage in one call, since the hook
 	// recomputes attribution for the whole transcript each run anyway.
@@ -729,13 +726,11 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 	})
 	// /webhook/reload-caps: re-reads config.json's budget.conversation_caps
 	// and budget.default_conversation_cap from disk and applies them to the
-	// live Broker via SetCaps, without a relayd process restart - Jean's
-	// explicit request, 2026-07-14: cap tuning was happening often enough
-	// during live testing that a full binary restart each time was real
-	// friction. Only the budget caps are hot-reloaded, not the rest of
-	// config.json (token env vars, allowlists, etc. still require a real
-	// restart) - deliberately narrow rather than a general config-reload
-	// mechanism, which would be a much bigger surface to get right.
+	// live Broker via SetCaps, without a relayd process restart. Only the
+	// budget caps are hot-reloaded, not the rest of config.json (token env
+	// vars, allowlists, etc. still require a real restart) - deliberately
+	// narrow rather than a general config-reload mechanism, which would be
+	// a much bigger surface to get right.
 	mux.HandleFunc("/webhook/reload-caps", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)

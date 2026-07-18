@@ -147,10 +147,9 @@ type BudgetConfig struct {
 	ConversationCaps map[string]int64 `json:"conversation_caps,omitempty"`
 
 	// DefaultConversationCap, if > 0, applies to any conversation NOT
-	// explicitly listed in ConversationCaps and not an admin (Jean's
-	// explicit request, 2026-07-14: "set our default cap to 300k per every
-	// three hours" - a blanket per-individual cap for arbitrary allowlisted
-	// contacts, rather than requiring every one to be added by hand).
+	// explicitly listed in ConversationCaps and not an admin - a blanket
+	// per-individual cap for arbitrary allowlisted, non-admin contacts,
+	// rather than requiring every one to be added by hand.
 	DefaultConversationCap int64 `json:"default_conversation_cap,omitempty"`
 }
 
