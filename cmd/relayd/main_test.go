@@ -2,13 +2,17 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/jeanhaley32/agent-relay/internal/access"
 	"github.com/jeanhaley32/agent-relay/internal/command"
+	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
+	"github.com/jeanhaley32/agent-relay/internal/ipc"
+	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 )
 
 // TestAckErrTextClassification exercises the permanent-vs-transient
@@ -140,3 +144,62 @@ func TestHandshakeMergesManagers(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// newTestTracker builds a Tracker backed by a temp-dir persistence file, with
+// inject/fallback/receipt stubbed out — enough to drive handleEvent's
+// ack/list ops without a live session or frontend.
+func newTestTracker(t *testing.T) *scheduler.Tracker {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "events.json")
+	tr, err := scheduler.NewTracker(path,
+		func(chatID, text string) bool { return true },
+		func(text string) error { return nil },
+		func(note string) {},
+		scheduler.TrackerConfig{},
+		nil)
+	if err != nil {
+		t.Fatalf("NewTracker: %v", err)
+	}
+	t.Cleanup(tr.Close)
+	return tr
+}
+
+// TestHandleEventListAndAck exercises handleEvent's OpEventList/OpEventAck
+// dispatch (also reachable via serveSchedules' switch), covering the empty
+// list, a populated list, a successful ack, and the unknown-op error path.
+func TestHandleEventListAndAck(t *testing.T) {
+	tr := newTestTracker(t)
+
+	if got, errText := handleEvent(tr, claudebk.SchedRequest{Op: ipc.OpEventList}); errText != "" || got != "no open pending events" {
+		t.Errorf("empty list: got (%q, %q)", got, errText)
+	}
+
+	ev, err := tr.Fire("", "chat1", "reminder text")
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+
+	got, errText := handleEvent(tr, claudebk.SchedRequest{Op: ipc.OpEventList})
+	if errText != "" {
+		t.Fatalf("list after fire: errText=%q", errText)
+	}
+	if !contains(got, ev.ID) || !contains(got, "reminder text") {
+		t.Errorf("list after fire: got %q, want it to mention %q and the reminder text", got, ev.ID)
+	}
+
+	got, errText = handleEvent(tr, claudebk.SchedRequest{Op: ipc.OpEventAck, SchedID: ev.ID, Text: "done"})
+	if errText != "" {
+		t.Fatalf("ack: errText=%q", errText)
+	}
+	if !contains(got, "acknowledged "+ev.ID) {
+		t.Errorf("ack: got %q", got)
+	}
+
+	if got, errText := handleEvent(tr, claudebk.SchedRequest{Op: ipc.OpEventList}); errText != "" || got != "no open pending events" {
+		t.Errorf("list after ack: got (%q, %q)", got, errText)
+	}
+
+	if _, errText := handleEvent(tr, claudebk.SchedRequest{Op: "bogus"}); errText == "" {
+		t.Error("unknown op: expected an error, got none")
+	}
+}
