@@ -1,15 +1,15 @@
 # agent-relay
 
-**Text a Telegram bot, get answered by Claude Code running on your own machine.**
+**Text a Telegram or Discord bot, get answered by Claude Code running on your own machine.**
 
-`agent-relay` is a small Go daemon that routes Telegram messages to a Claude Code session,
-with a control plane in between: an allowlist, per-account rate limiting, a circuit breaker,
-and tool-approval prompts you answer from chat.
+`agent-relay` is a small Go daemon that routes Telegram and/or Discord messages to a Claude
+Code session, with a control plane in between: an allowlist, per-account rate limiting, a
+circuit breaker, and tool-approval prompts you answer from chat.
 
-That's the scope today — **a Telegram router for a Claude Code backend.** Nothing else is
-supported: no other chat platforms, no other model backends. (Internally the pieces are
-factored so more could be added later — see [`DESIGN.md`](./DESIGN.md) — but none are built,
-so don't pick this up expecting a general-purpose, provider-agnostic relay.)
+That's the scope today — **a Telegram/Discord router for a Claude Code backend.** No other
+model backends are supported. (Internally the pieces are factored so more frontends could be
+added later — see [`DESIGN.md`](./DESIGN.md) — but don't pick this up expecting a
+general-purpose, provider-agnostic relay.)
 
 > ⚠️ **Experimental (`v0.x`).** This relies on Claude Code **channels**, a *research-preview*
 > feature that can change or break with Claude Code updates. It also hands chat users a
@@ -18,9 +18,9 @@ so don't pick this up expecting a general-purpose, provider-agnostic relay.)
 > subscription is your responsibility under Anthropic's usage policies.
 
 ```
-  Telegram DM ──▶ relayd ──▶ [ commands? · budget/rate gate ] ──▶ Claude Code (Sonnet)
-       ▲                                                                │
-       └───────────────────────── reply ───────────────────────────────┘
+  Telegram DM  ──┐                                                       ┌── reply
+                 ├─▶ relayd ──▶ [ commands? · budget/rate gate ] ──▶ Claude Code (Sonnet)
+  Discord DM   ──┘                                                       └── reply
 ```
 
 - **Runs on your box.** Claude uses your Claude Code session and files; nothing is hosted.
@@ -36,8 +36,11 @@ so don't pick this up expecting a general-purpose, provider-agnostic relay.)
 |---|---|
 | **Go** | 1.24 or newer (to build) |
 | **Claude Code** | v2.1.80+, signed in with a **first-party Anthropic account** — a claude.ai **Pro/Max** subscription or an Anthropic **Console API key**. *Not* supported on Bedrock / Vertex / Foundry. Channels are a research-preview feature. |
-| **Telegram** | A bot token from [@BotFather](https://t.me/BotFather) and your numeric user id (get it from [@userinfobot](https://t.me/userinfobot)). |
+| **Telegram** | A bot token from [@BotFather](https://t.me/BotFather) and your numeric user id (get it from [@userinfobot](https://t.me/userinfobot)). Optional — you can run Discord-only. |
+| **Discord** | A bot application + token from the [Developer Portal](https://discord.com/developers/applications), and your numeric Discord user id (Settings → Advanced → enable Developer Mode, then right-click yourself → Copy User ID). Optional — you can run Telegram-only. |
 | **tmux** | Hosts the interactive Claude session that the launcher starts. |
+
+At least one of Telegram or Discord must be configured; both can run at once.
 
 ---
 
@@ -49,13 +52,18 @@ git clone https://github.com/jeanhaley32/agent-relay.git
 cd agent-relay
 go build ./...
 
-# 2. Create a Telegram bot (talk to @BotFather → /newbot) and save the token.
-#    .env is gitignored — your token never gets committed.
+# 2. Create a bot and save its token. .env is gitignored — tokens never get committed.
+#    Telegram: talk to @BotFather → /newbot
 echo 'TELEGRAM_BOT_TOKEN=123456:paste-your-bot-token-here' > .env
+#    Discord (optional, can run alongside or instead of Telegram):
+#    discord.com/developers/applications → New Application → Bot → Reset Token
+echo 'DISCORD_BOT_TOKEN=paste-your-bot-token-here' >> .env
 
-# 3. Configure. Copy the example and set YOUR Telegram user id as an admin.
+# 3. Configure. Copy the example and set YOUR user id(s) as admin.
 cp config.example.json config.json
 $EDITOR config.json          # set "admins": [ <your-telegram-user-id> ]
+                              # and/or discord.admins: [ "<your-discord-user-id>" ]
+                              # (set discord.enabled: true to turn Discord on)
 
 # 4. Launch everything (builds, starts the daemon, opens Claude in tmux on Sonnet)
 bash scripts/run.sh
@@ -64,7 +72,8 @@ bash scripts/run.sh
 tmux attach -t relay         # press Enter at the prompt; then Ctrl-b, d to detach
 ```
 
-Now open Telegram and message your bot — it should reply within a few seconds. 🎉
+Now open Telegram (or DM your Discord bot, once you've shared a server with it) and message it —
+it should reply within a few seconds. 🎉
 
 To stop everything:
 
@@ -87,13 +96,29 @@ tmux kill-session -t relay && pkill -x relayd
     "allowlist_file": "allowlist.json",  // where /handshake approvals are persisted
     "poll_timeout": 30
   },
+  "discord": {
+    "enabled": false,                    // set true to turn Discord on (off by default)
+    "token_env": "DISCORD_BOT_TOKEN",
+    "admins": ["123456789012345678"],    // your Discord user id(s), as strings (snowflake precision)
+    "allowlist": [],
+    "allowlist_file": "discord_allowlist.json",
+    "allow_guild_messages": false,       // false = DM-only, no server/guild access at all
+    "allowed_guild_ids": [],             // only used if allow_guild_messages is true
+    "require_mention_in_guild": true     // in guild mode, only respond when @mentioned
+  },
   "claude": { "socket": "/tmp/agent-relay.sock" },
   "budget": { "tier": "max5" }           // free | pro | max5 | max20 (local rate-limit estimate)
 }
 ```
 
-- The **bot token lives in `.env`**, never in `config.json`.
-- `admins`, `allowlist`, and `allowlist.json` are yours — all gitignored.
+- **Bot tokens live in `.env`**, never in `config.json`.
+- `admins`, `allowlist`, and `allowlist.json`/`discord_allowlist.json` are yours — all gitignored.
+- Discord defaults to **DM-only** with zero privileged Gateway intents — the narrowest posture.
+  Discord itself won't let a bot DM you until you share a server with it once (invite it via the
+  Developer Portal's OAuth2 URL Generator, "bot" scope, no permissions needed for DM-only), then
+  DM it — after that it can reply.
+- Sender gating is always on the platform's own user id, never on a chat/channel/guild id — an
+  ungated channel is a prompt-injection vector. Both frontends share this rule.
 - Use a different default model: `MODEL=opus bash scripts/run.sh`.
 
 ---
@@ -159,10 +184,11 @@ printf '/tier pro\n/rate\nhello\n/status\n' | go run ./cmd/broker-demo
 | Symptom | Fix |
 |---|---|
 | `claude: command not found` in tmux | The launcher uses an absolute path, but if you run Claude manually, ensure `~/.local/bin` is on `PATH`. |
-| Bot never replies | Make sure your user id is in `admins`/`allowlist`, and that you approved the tmux "development channels" prompt (step 5). |
+| Bot never replies | Make sure your user id is in `admins`/`allowlist` (Discord ids go in the `discord` block, Telegram ids in `telegram`), and that you approved the tmux "development channels" prompt (step 5). |
 | "blocked by org policy" at startup | On a Team/Enterprise plan an admin must enable channels; personal Pro/Max works out of the box. |
 | Claude keeps asking to approve the `reply` tool | Approve with *"don't ask again"* once, or the prompt is forwarded to you via `/allow`. |
 | Restarted `relayd` and the bot went quiet | It auto-reconnects within ~1s and buffers replies; give it a moment. Re-launch Claude only if you also killed its tmux session. |
+| Discord bot won't DM me: `403 Cannot send messages to this user` | Discord blocks bots from DMing anyone with no mutual server. Invite it to a server you're in (Developer Portal → OAuth2 URL Generator → "bot" scope), then DM it from there. |
 
 ---
 

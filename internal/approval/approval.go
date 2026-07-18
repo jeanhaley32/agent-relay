@@ -4,8 +4,7 @@
 // approve page is bound to the tailnet interface, being able to load it is
 // itself proof the caller is on the tailnet - a stronger identity signal
 // than a Telegram chat_id alone, which is spoofable if that account is ever
-// compromised. See 2026-07-10 relay conversation with Jean for the design
-// rationale.
+// compromised.
 package approval
 
 import (
@@ -29,10 +28,12 @@ const (
 )
 
 type request struct {
-	desc    string
-	created time.Time
-	expires time.Time
-	status  status
+	desc       string
+	actionHash string // binds the token to a specific action; empty = unbound (legacy callers)
+	created    time.Time
+	expires    time.Time
+	status     status
+	consumed   bool // true once a caller has successfully Consume()'d an approved decision
 }
 
 // Manager tracks in-flight approval requests. Safe for concurrent use.
@@ -48,7 +49,11 @@ func NewManager(approveBase string) *Manager {
 
 func newToken() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read failing means the platform's CSPRNG is broken;
+		// never hand out a predictable token for a security-critical approval.
+		panic(fmt.Sprintf("approval: crypto/rand.Read failed: %v", err))
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -68,12 +73,27 @@ func (m *Manager) gc() {
 
 // Create makes a new pending request and returns its token and approval
 // link, for callers that want to drive the approve/poll cycle directly
-// in-process (rather than via the loopback HTTP API).
+// in-process (rather than via the loopback HTTP API). The token is not bound
+// to any specific action - use CreateBound for anything Consume() will later
+// gate a real effect on (delete, send, etc).
 func (m *Manager) Create(desc string, ttl time.Duration) (token, link string) {
-	return m.create(desc, ttl)
+	return m.create(desc, "", ttl)
 }
 
-// Status returns the current status of a token, or false if unknown.
+// CreateBound makes a new pending request whose approval can only be
+// consumed by a caller presenting the same actionHash - e.g. a hash of the
+// exact action being authorized (message id + operation), so an approved
+// token can't be replayed against a different or later-substituted action.
+func (m *Manager) CreateBound(desc, actionHash string, ttl time.Duration) (token, link string) {
+	return m.create(desc, actionHash, ttl)
+}
+
+// Status returns the current status of a token, or false if unknown. This is
+// a read-only peek for display/polling purposes - it does not consume the
+// decision, so a still-approved token remains valid until either Consume()'d
+// or it expires. Callers that will perform a real effect based on the result
+// must use Consume, not Status, or the same approval can be replayed for the
+// whole TTL window.
 func (m *Manager) Status(token string) (status, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -88,13 +108,41 @@ func (m *Manager) Status(token string) (status, bool) {
 	return req.status, true
 }
 
-// create makes a new pending request and returns its token and approval link.
-func (m *Manager) create(desc string, ttl time.Duration) (token, link string) {
+// Consume atomically checks that token is approved, unconsumed, and (if the
+// token was created with CreateBound) that actionHash matches the hash it
+// was bound to, then marks it consumed so no later call can succeed for the
+// same token - one approval authorizes exactly one action, once. Pass "" for
+// actionHash for a token created via the unbound Create.
+func (m *Manager) Consume(token, actionHash string) (status, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gc()
+	req, ok := m.pending[token]
+	if !ok {
+		return "", false
+	}
+	if req.status == StatusPending && time.Now().After(req.expires) {
+		req.status = StatusExpired
+	}
+	if req.status != StatusApproved {
+		return req.status, true
+	}
+	if req.consumed {
+		return StatusExpired, true // already spent; treat as no-longer-valid to callers
+	}
+	if req.actionHash != "" && req.actionHash != actionHash {
+		return StatusDenied, true // approved, but not for this action
+	}
+	req.consumed = true
+	return StatusApproved, true
+}
+
+func (m *Manager) create(desc, actionHash string, ttl time.Duration) (token, link string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.gc()
 	token = newToken()
-	m.pending[token] = &request{desc: desc, created: time.Now(), expires: time.Now().Add(ttl), status: StatusPending}
+	m.pending[token] = &request{desc: desc, actionHash: actionHash, created: time.Now(), expires: time.Now().Add(ttl), status: StatusPending}
 	link = fmt.Sprintf("%s/approve/%s", m.approveBase, token)
 	return token, link
 }
@@ -126,7 +174,7 @@ func (m *Manager) RequestHandler() http.Handler {
 			return
 		}
 		ttl := 10 * time.Minute
-		token, link := m.create(desc, ttl)
+		token, link := m.create(desc, r.FormValue("action_hash"), ttl)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"token": token, "link": link})
 	})
@@ -198,6 +246,7 @@ func (m *Manager) ApproveHandler() http.Handler {
 			}
 			decided := req.status
 			m.mu.Unlock()
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			fmt.Fprintf(w, resultPage, html.EscapeString(string(decided)))
 			return
 		}
@@ -210,6 +259,7 @@ func (m *Manager) ApproveHandler() http.Handler {
 		m.mu.Lock()
 		st, desc := req.status, req.desc
 		m.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if st != StatusPending {
 			fmt.Fprintf(w, resultPage, html.EscapeString(string(st)))
 			return

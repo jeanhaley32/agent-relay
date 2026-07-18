@@ -23,6 +23,7 @@ type Kind string
 const (
 	KindInject      Kind = "inject"       // daemon -> shim: push a message into the session
 	KindReply       Kind = "reply"        // shim -> daemon: Claude called the reply tool
+	KindReplyAck    Kind = "reply_ack"    // daemon -> shim: outcome of a reply frame (delivered or not)
 	KindPermRequest Kind = "perm_request" // shim -> daemon: Claude wants a tool approved
 	KindPermVerdict Kind = "perm_verdict" // daemon -> shim: allow/deny a pending tool request
 	KindSchedReq    Kind = "sched_req"    // shim -> daemon: a schedule tool was called

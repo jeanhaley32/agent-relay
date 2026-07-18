@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -54,8 +56,9 @@ func newTestTracker(t *testing.T, h *trackerHarness) (*Tracker, *time.Time) {
 	path := filepath.Join(t.TempDir(), "events.json")
 	now := time.Now()
 	clock := &now
-	// Inject the clock via config (not by mutating tr.now after the loop has
-	// started) so the reconciliation goroutine never races the field write.
+	// Inject the clock via cfg.Now (a closure over *clock) rather than
+	// mutating a Tracker field after construction, so the reconciliation
+	// goroutine never races a field write.
 	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{
 		NudgeAfter:     5 * time.Minute,
 		EscalateAfter:  12 * time.Minute,
@@ -118,6 +121,51 @@ func TestCoalescing(t *testing.T) {
 	}
 }
 
+// TestStuckReFireResetsAndReinjects: once an open event has been through the
+// full escalation ladder (fallback sent) without being acked, a re-fire of the
+// same schedule must not silently coalesce — it should reset the ladder
+// timestamps and re-inject the prompt, restarting the nudge/escalate cycle.
+func TestStuckReFireResetsAndReinjects(t *testing.T) {
+	h := &trackerHarness{connected: true}
+	tr, clock := newTestTracker(t, h)
+	ev1, _ := tr.Fire("sched1", "42", "first")
+	*clock = clock.Add(13 * time.Minute) // past EscalateAfter (12m)
+	tr.Reconcile(*clock)
+	if got := tr.ListPending()[0]; got.FallbackSentAt.IsZero() {
+		t.Fatal("expected FallbackSentAt set after escalation reconcile")
+	}
+	if _, fb, _ := h.counts(); fb != 1 {
+		t.Fatalf("expected 1 fallback sent before re-fire, got %d", fb)
+	}
+
+	ev2, err := tr.Fire("sched1", "42", "second")
+	if err != nil {
+		t.Fatalf("re-fire: %v", err)
+	}
+	if ev1.ID != ev2.ID {
+		t.Fatalf("re-fire of same schedule should still coalesce onto same event id: %s vs %s", ev1.ID, ev2.ID)
+	}
+	got := tr.ListPending()[0]
+	if got.FallbackSentAt.IsZero() == false {
+		t.Fatal("expected FallbackSentAt reset on stuck re-fire")
+	}
+	if got.LastNudgeAt.IsZero() == false {
+		t.Fatal("expected LastNudgeAt reset on stuck re-fire")
+	}
+	if !got.FiredAt.Equal(*clock) {
+		t.Fatalf("expected FiredAt reset to the re-fire time %v, got %v", *clock, got.FiredAt)
+	}
+	if got.DeliveredAt.IsZero() {
+		t.Fatal("expected DeliveredAt set again after re-inject (harness reports connected)")
+	}
+	if got.FireCount != 2 {
+		t.Fatalf("expected FireCount bumped to 2, got %d", got.FireCount)
+	}
+	if inj, _, _ := h.counts(); inj != 2 {
+		t.Fatalf("stuck re-fire should re-inject the prompt, expected 2 injects, got %d", inj)
+	}
+}
+
 func TestExplicitAck(t *testing.T) {
 	h := &trackerHarness{connected: true}
 	tr, _ := newTestTracker(t, h)
@@ -154,6 +202,12 @@ func TestReplyInferredAck(t *testing.T) {
 	tr.NoteReply("42", *clock)
 	if len(tr.ListPending()) != 0 {
 		t.Fatal("reply after fire should auto-resolve the event")
+	}
+	h.mu.Lock()
+	receipts := append([]string(nil), h.receipts...)
+	h.mu.Unlock()
+	if len(receipts) != 1 || !strings.HasPrefix(receipts[0], "✓ auto-resolved (reply): ") {
+		t.Fatalf("expected one auto-resolved receipt, got %v", receipts)
 	}
 }
 
@@ -299,11 +353,58 @@ func TestFirePersistFailureIsSurfaced(t *testing.T) {
 	if err == nil {
 		t.Fatal("Fire should return an error when persist fails")
 	}
-	if ev != nil {
-		t.Fatalf("Fire should return a nil event on persist failure, got %+v", ev)
+	if ev.ID != "" {
+		t.Fatalf("Fire should return a zero-value event on persist failure, got %+v", ev)
 	}
 	if len(tr.ListPending()) != 0 {
 		t.Fatal("an unpersisted event must not linger in memory")
+	}
+}
+
+// TestFireCoalescePersistFailureRollsBack: if persisting a coalesced re-fire
+// fails, Fire must return an error and the in-memory event must be rolled
+// back to its pre-mutation state, so memory doesn't diverge from what's on
+// disk (mirrors the new-event branch's persist-failure guarantee).
+func TestFireCoalescePersistFailureRollsBack(t *testing.T) {
+	h := &trackerHarness{connected: true}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.json")
+	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{TickEvery: time.Hour}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	t.Cleanup(tr.Close)
+
+	first, err := tr.Fire("s", "42", "first text")
+	if err != nil {
+		t.Fatalf("first Fire: %v", err)
+	}
+
+	// Make the directory unwritable so the next persist (atomic tmp-file
+	// write) fails, without disturbing the file already written above.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	_, err = tr.Fire("s", "42", "second text")
+	if err == nil {
+		t.Fatal("coalesced Fire should return an error when persist fails")
+	}
+
+	pending := tr.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("expected exactly one pending event, got %d", len(pending))
+	}
+	got := pending[0]
+	if got.ID != first.ID {
+		t.Fatalf("event ID changed: got %s want %s", got.ID, first.ID)
+	}
+	if got.FireCount != first.FireCount {
+		t.Fatalf("FireCount not rolled back: got %d want %d", got.FireCount, first.FireCount)
+	}
+	if got.Text != first.Text {
+		t.Fatalf("Text not rolled back: got %q want %q", got.Text, first.Text)
 	}
 }
 
@@ -355,6 +456,57 @@ func TestPersistReloadEvents(t *testing.T) {
 	if len(got) != 1 || got[0].ID != ev.ID {
 		t.Fatalf("event did not survive reload: %+v", got)
 	}
+}
+
+// TestRetentionPruning confirms an acknowledged event is kept until
+// cfg.Retention has elapsed since AckedAt, then pruned on the next Reconcile,
+// exactly once.
+func TestRetentionPruning(t *testing.T) {
+	h := &trackerHarness{connected: true}
+	path := filepath.Join(t.TempDir(), "events.json")
+	now := time.Now()
+	clock := &now
+	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{
+		NudgeAfter:     5 * time.Minute,
+		EscalateAfter:  12 * time.Minute,
+		Retention:      10 * time.Minute,
+		TickEvery:      time.Hour,
+		ReplyAckWindow: 2 * time.Minute,
+		Now:            func() time.Time { return *clock },
+	}, nil)
+	if err != nil {
+		t.Fatalf("new tracker: %v", err)
+	}
+	t.Cleanup(tr.Close)
+
+	ev, _ := tr.Fire("s", "42", "text")
+	if err := tr.Ack(ev.ID, "handled"); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+
+	// Just before the retention window elapses: still present.
+	*clock = clock.Add(9 * time.Minute)
+	tr.Reconcile(*clock)
+	tr.mu.Lock()
+	_, stillThere := tr.events[ev.ID]
+	tr.mu.Unlock()
+	if !stillThere {
+		t.Fatal("acknowledged event pruned before retention window elapsed")
+	}
+
+	// Past the retention window: pruned on the next reconcile.
+	*clock = clock.Add(2 * time.Minute)
+	tr.Reconcile(*clock)
+	tr.mu.Lock()
+	_, stillThere = tr.events[ev.ID]
+	tr.mu.Unlock()
+	if stillThere {
+		t.Fatal("acknowledged event should be pruned once retention window elapses")
+	}
+
+	// A further reconcile is a no-op (nothing left to prune, no panic/error).
+	*clock = clock.Add(time.Hour)
+	tr.Reconcile(*clock)
 }
 
 func TestMetricsAccessors(t *testing.T) {

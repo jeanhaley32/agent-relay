@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -23,10 +24,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/jeanhaley32/agent-relay/internal/access"
 	"github.com/jeanhaley32/agent-relay/internal/approval"
@@ -34,12 +39,23 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	"github.com/jeanhaley32/agent-relay/internal/config"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 	"github.com/jeanhaley32/agent-relay/internal/session"
 )
+
+// replyDriftTotal counts turns where the model produced assistant text in
+// response to a relay channel event but never called the reply tool - an
+// answer composed entirely in the terminal, never sent, invisible to every
+// existing metric since no send was ever attempted. Incremented by the
+// /webhook/reply-drift handler below, which scripts/detect-reply-drift.py (a
+// Claude Code Stop hook) POSTs to after scanning the session transcript for
+// exactly this pattern.
+var replyDriftTotal atomic.Int64
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to JSON config file")
@@ -62,19 +78,42 @@ func main() {
 	// Access manager: allowlist + admins + pending-request queue (persisted).
 	acc := access.New(cfg.Telegram.Admins, cfg.Telegram.Allowlist, cfg.Telegram.AllowlistFile, logger)
 
+	// discordAcc is the Discord frontend's own access manager (own id
+	// namespace: Discord snowflakes, not Telegram user ids). It is declared
+	// here — ahead of the Discord frontend actually being started below — so
+	// the admin gate and /handshake closures below can capture it by
+	// reference: mustStartDiscord() assigns into it later, once
+	// cfg.Discord.Enabled is known, but both admin commands need to consult
+	// whichever access manager(s) are actually live.
+	var discordAcc *access.Manager
+
 	// Budget + shared control-plane commands + the admin /handshake command.
 	meter := budget.New(cfg.Budget.Tier, nil)
 	cmds := relay.StandardCommands(meter)
-	// Central admin gating for all Admin-flagged commands.
+	// Central admin gating for all Admin-flagged commands. Consults both the
+	// Telegram and (if enabled) Discord access managers — each frontend's
+	// admin ids live in its own manager, so a Discord admin's id is only
+	// ever found in discordAcc, and would otherwise never satisfy IsAdmin.
 	cmds.IsAdmin = func(senderID string) bool {
 		id, err := strconv.ParseInt(senderID, 10, 64)
-		return err == nil && acc.IsAdmin(id)
+		if err != nil {
+			return false
+		}
+		if acc.IsAdmin(id) {
+			return true
+		}
+		return discordAcc != nil && discordAcc.IsAdmin(id)
 	}
 	cmds.Register(command.Command{
 		Name:  "handshake",
 		Help:  "admin: list/approve/deny access requests",
 		Admin: true,
-		Run:   handshake(acc),
+		Run: handshake(func() []*access.Manager {
+			if discordAcc != nil {
+				return []*access.Manager{acc, discordAcc}
+			}
+			return []*access.Manager{acc}
+		}),
 	})
 
 	// Claude backend: listen on the socket for the shim.
@@ -119,6 +158,17 @@ func main() {
 		}
 	}
 	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
+
+	// Discord frontend (optional, per DESIGN.md's wiring/startup design):
+	// Discord has its own snowflake id namespace and access manager, so it
+	// gets its own New/Connect handshake, then fans into the Broker's single
+	// Frontend slot via relay.MultiFrontend alongside Telegram.
+	frontendEndpoint := relay.Endpoint(front)
+	var discordFront *discord.Frontend
+	if cfg.Discord.Enabled {
+		discordFront, discordAcc = mustStartDiscord(cfg, logger)
+		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
+	}
 
 	// Permission relay: admins approve tool-use prompts via /allow and /deny.
 	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Admin: true, Run: verdict(back, true)})
@@ -171,11 +221,18 @@ func main() {
 		})
 		return back.Connected()
 	}
+	// errNoAdminConfigured signals that an admin escalation could not be
+	// delivered because no admin chat ID is configured, not that the send
+	// itself failed.
+	errNoAdminConfigured := errors.New("relayd: no admin chat id configured")
 	// sendToAdmin returns the send error so the tracker's fallback path can
 	// avoid marking a failed last-line-of-defense escalation as delivered.
+	// With no admin configured there's nobody to escalate to, but that's
+	// still a failure to deliver - report it as one rather than silently
+	// claiming success, so callers don't mistake "delivered" for "no admin".
 	sendToAdmin := func(text string) error {
 		if adminChatID == "" {
-			return nil
+			return errNoAdminConfigured
 		}
 		return front.Send(context.Background(), relay.Message{
 			ConversationID: adminChatID, Text: text,
@@ -207,20 +264,12 @@ func main() {
 	}
 	defer sched.Close()
 
-	// Grafana alert webhook: alerts are routed through the model backend
-	// (same injection path as scheduled triggers), not straight to Telegram -
-	// so alerts get judgment/context applied before they reach the user,
-	// instead of Grafana paging directly. Loopback-only: Grafana runs on
-	// this same host, no need to expose it beyond localhost.
-	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, tracker, logger)
-
 	// Tailnet-bound approval flow for high-risk actions: a loopback-only
 	// /request+/status API this agent calls (via curl) to ask for a human
 	// decision, and a Tailscale-interface-only /approve page the request
 	// link points at. Being able to load the approve page at all is proof
 	// of tailnet membership - stronger than trusting a Telegram chat_id
-	// alone, which is spoofable if that account is ever compromised. See
-	// 2026-07-10 relay conversation with Jean for the design rationale.
+	// alone, which is spoofable if that account is ever compromised.
 	appr := approval.NewManager("http://100.99.212.119:9212")
 	reqListener, err := net.Listen("tcp", "127.0.0.1:9211")
 	if err != nil {
@@ -235,7 +284,7 @@ func main() {
 	// boot (tailscaled racing relayd) - retry with backoff instead of
 	// silently running with a broken gate, which would permanently lock the
 	// admin out of Telegram control (the re-auth link would 404 forever).
-	appListener, err := listenWithRetry("tcp", "100.99.212.119:9212", 30*time.Second, logger)
+	appListener, err := listenWithRetry("tcp", "100.99.212.119:9212", 2*time.Minute, logger)
 	if err != nil {
 		logger.Fatalf("approval page listener: %v", err)
 	}
@@ -248,7 +297,27 @@ func main() {
 	// Service schedule-tool and event-tool calls coming from the model (via the shim).
 	go serveSchedules(back, sched, tracker, logger)
 
-	b := &relay.Broker{Frontend: front, Backend: back, Commands: cmds, Meter: meter}
+	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter,
+		ConversationCaps:       cfg.Budget.ConversationCaps,
+		DefaultConversationCap: cfg.Budget.DefaultConversationCap,
+		// Admins are exempt from DefaultConversationCap - the blanket cap is
+		// for arbitrary allowlisted contacts, not the operator. Reuses
+		// cmds.IsAdmin directly: chat_id == from_id for any private 1:1
+		// conversation (the only kind a per-conversation cap makes sense
+		// for), so the same admin check already used for slash commands
+		// applies unchanged here.
+		ConversationCapExempt: cmds.IsAdmin,
+	}
+
+	// Grafana alert webhook: alerts are routed through the model backend
+	// (same injection path as scheduled triggers), not straight to Telegram -
+	// so alerts get judgment/context applied before they reach the user,
+	// instead of Grafana paging directly. Loopback-only: Grafana runs on
+	// this same host, no need to expose it beyond localhost. Also hosts
+	// /webhook/reply-drift and /webhook/token-usage, hence needing b now
+	// that it exists.
+	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, *cfgPath)
+
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
 	// auto-resolve any still-open events for that chat. Supplements ack_event.
@@ -261,15 +330,27 @@ func main() {
 			tracker.NoteReply(chatID, time.Now())
 		}
 	}
-	// Outbound gate: the model can only reply to allowlisted chats. The inbound
-	// allowlist gates who reaches Claude; this stops Claude messaging strangers.
-	b.OutboundAllowed = func(chatID string) bool {
-		id, err := strconv.ParseInt(chatID, 10, 64)
-		if err != nil || !acc.Allowed(id) {
-			logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
-			return false
+	// Surface the real Send outcome back to the reply tool call that
+	// originated it (by RequestID, carried in Meta["reply_id"]), instead of
+	// the tool call always returning "sent" regardless of what actually
+	// happened. Classification lives in ackErrText.
+	b.AckBackendReply = func(m relay.Message, sendErr error) {
+		reqID := m.Meta["reply_id"]
+		if reqID == "" {
+			return // reply carries no correlation id (e.g. an internal/system reply) - nothing waiting
 		}
-		return true
+		if err := back.ReplyRespond(reqID, ackErrText(sendErr)); err != nil {
+			logger.Printf("reply ack for %s: %v", reqID, err)
+		}
+	}
+	// Outbound gate: see outboundAllowed's doc comment for the full rationale.
+	b.OutboundAllowed = func(chatID string) bool {
+		known := func(id string) bool { return discordFront != nil && discordFront.KnownConversation(id) }
+		if outboundAllowed(chatID, acc, discordAcc, known) {
+			return true
+		}
+		logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
+		return false
 	}
 
 	cmds.Register(command.Command{
@@ -298,14 +379,23 @@ func main() {
 
 	// Admin session gate: every admin user_id (from_id) must re-prove
 	// tailnet presence (via the approval page) after 30 min idle, closing
-	// the gap where a compromised Telegram account alone would otherwise be
+	// the gap where a compromised messenger account alone would otherwise be
 	// trusted. Keyed on user_id, not chat_id - see SessionGatedUsers doc
 	// comment in internal/relay/relay.go. Tracked independently per admin.
-	// Currently just Jean, but generalized since the admin list can grow.
-	if len(cfg.Telegram.Admins) > 0 {
-		gated := make(map[string]bool, len(cfg.Telegram.Admins))
+	// Covers both Telegram admins (int64 ids) and, when enabled, Discord
+	// admins (snowflake ids) - the gate is the guard against a compromised
+	// admin account on EITHER frontend, so both id spaces must feed it or a
+	// Discord admin could run /handshake approve, /allow, /lockdown etc
+	// indefinitely with zero tailnet proof.
+	if len(cfg.Telegram.Admins) > 0 || len(cfg.Discord.Admins) > 0 {
+		gated := make(map[string]bool, len(cfg.Telegram.Admins)+len(cfg.Discord.Admins))
 		for _, admin := range cfg.Telegram.Admins {
 			gated[strconv.FormatInt(admin, 10)] = true
+		}
+		if discordAdminIDs, err := cfg.Discord.AdminIDs(); err == nil {
+			for _, admin := range discordAdminIDs {
+				gated[admin.String()] = true
+			}
 		}
 		b.Session = session.NewManager(30 * time.Minute)
 		b.Approval = appr
@@ -336,7 +426,7 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		logger.Printf("shutting down")
-		_ = front.Close() // closes the frontend Recv -> Broker.Run returns
+		_ = frontendEndpoint.Close() // closes the frontend Recv -> Broker.Run returns
 		cancel()
 	}()
 
@@ -346,11 +436,105 @@ func main() {
 	logger.Printf("stopped")
 }
 
+// ackErrText classifies a Send outcome for AckBackendReply: only a permanent
+// failure (senderr.Permanent) is surfaced as an error string - Frontend.Send
+// also returns an error for transient failures that it has already queued
+// for background retry, and reporting those to the model would invite a
+// resend that duplicates delivery once the retry lands. Returns "" for a nil
+// or transient error.
+func ackErrText(sendErr error) string {
+	var perm senderr.Permanent
+	if sendErr != nil && errors.As(sendErr, &perm) {
+		return sendErr.Error()
+	}
+	return ""
+}
+
+// mustStartDiscord builds the Discord frontend from cfg.Discord, connects
+// its gateway, and returns it along with the access.Manager backing its
+// allowlist (so the caller can also consult it for outbound gating).
+// Config validation errors are fatal immediately; the gateway connect itself
+// retries with a bounded timeout for ~2m (mirroring the Telegram handshake)
+// before Fatalf, so a transient boot-time DNS race doesn't kill relayd (and
+// the already-connected Telegram frontend with it) - an operator who set
+// discord.enabled=true with a genuinely bad token/config still gets a clear
+// startup failure, just not on the very first attempt (the exact gap this
+// function exists to close - see DESIGN.md's wiring/startup design).
+func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend, *access.Manager) {
+	token, err := cfg.DiscordToken()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+	adminIDs, err := cfg.Discord.AdminIDs()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+	allowIDs, err := cfg.Discord.AllowlistIDs()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+	guildIDs, err := cfg.Discord.AllowedGuildSnowflakes()
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+
+	// access.Manager is int64-keyed and platform-agnostic by design; Discord
+	// snowflakes are uint64 but real values are time-based and well under
+	// math.MaxInt64, so the conversion is lossless in practice (same
+	// reasoning as discord.Int64Authorizer's doc comment).
+	toInt64 := func(ids []snowflake.ID) []int64 {
+		out := make([]int64, len(ids))
+		for i, id := range ids {
+			out[i] = int64(id)
+		}
+		return out
+	}
+	discordAcc := access.New(toInt64(adminIDs), toInt64(allowIDs), cfg.Discord.AllowlistFile, logger)
+
+	front, err := discord.New(token,
+		discord.WithAuthorizer(discord.Int64Authorizer(discordAcc)),
+		discord.WithLogger(logger),
+		discord.WithAllowGuildMessages(cfg.Discord.AllowGuildMessages),
+		discord.WithAllowedGuildIDs(guildIDs...),
+		discord.WithRequireMentionInGuild(cfg.Discord.RequireMentionInGuild()),
+	)
+	if err != nil {
+		logger.Fatalf("discord: %v", err)
+	}
+
+	// Bounded retry loop mirroring the Telegram handshake above: a transient
+	// boot-time DNS/network race or a wedged OpenGateway shouldn't Fatalf
+	// relayd (which would also tear down the already-connected Telegram
+	// frontend) before Broker.Run even starts. Still fails fast with a clear
+	// message for a genuinely bad token/config - just not on the first attempt.
+	connectDeadline := time.Now().Add(2 * time.Minute)
+	backoff := time.Second
+	for {
+		cctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err = front.Connect(cctx)
+		ccancel()
+		if err == nil {
+			break
+		}
+		if time.Now().After(connectDeadline) {
+			logger.Fatalf("discord: connect failed after retrying for 2m: %v", err)
+		}
+		logger.Printf("discord connect failed, retrying in %s: %v", backoff, err)
+		time.Sleep(backoff)
+		if backoff < 15*time.Second {
+			backoff *= 2
+		}
+	}
+	logger.Printf("connected to Discord (admins=%d, allowlist=%d, guild_messages=%v)",
+		len(adminIDs), len(allowIDs), cfg.Discord.AllowGuildMessages)
+	return front, discordAcc
+}
+
 // listenWithRetry binds addr, retrying with a fixed 1s backoff until
 // deadline elapses. Used for listeners bound to an interface address (like
 // the Tailscale IP) that may not exist yet this early at boot.
-func listenWithRetry(network, addr string, deadline time.Duration, logger *log.Logger) (net.Listener, error) {
-	giveUp := time.Now().Add(deadline)
+func listenWithRetry(network, addr string, timeout time.Duration, logger *log.Logger) (net.Listener, error) {
+	giveUp := time.Now().Add(timeout)
 	var lastErr error
 	for {
 		l, err := net.Listen(network, addr)
@@ -383,18 +567,32 @@ type grafanaWebhookPayload struct {
 // path the scheduler uses (back.Send), rather than notifying Telegram
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
-func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, tracker *scheduler.Tracker, logger *log.Logger) {
-	if adminChatID == "" {
-		logger.Printf("grafana webhook: no admin chat configured, not starting listener")
-		return
+func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) {
+	mux := newRelaydMux(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, cfgPath)
+	addr := "127.0.0.1:9210"
+	// Fatalf on bind failure, matching the approval listeners above: a silent
+	// failure here would leave /metrics, /webhook/token-usage,
+	// /webhook/reload-caps and /webhook/grafana all unreachable with nothing
+	// but a single startup log line to show for it.
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		logger.Fatalf("grafana webhook listener: %v", err)
 	}
+	logger.Printf("grafana webhook listening on %s/webhook/grafana", addr)
+	if err := http.Serve(l, mux); err != nil {
+		logger.Printf("grafana webhook server stopped: %v", err)
+	}
+}
+
+// newRelaydMux builds the loopback-only observability/webhook mux served by
+// serveGrafanaWebhook. Split out so tests can exercise each handler directly
+// via httptest without starting a real listener.
+func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) *http.ServeMux {
 	mux := http.NewServeMux()
-	// Real gaps closed 2026-07-09, both requested directly by Jean: (1)
-	// unauthorized Telegram senders were already queued internally
-	// (access.Manager.Record, surfaced only via the /handshake admin
-	// command) but nothing alerted proactively; (2) there was no admin
-	// visibility into relayd's own budget/circuit-breaker state at all -
-	// both now exposed here for the admin dashboard + alert rule.
+	// Exposes two things the admin dashboard/alert rule needs: unauthorized
+	// senders queued internally by access.Manager.Record (otherwise only
+	// visible via the /handshake admin command), and relayd's own
+	// budget/circuit-breaker state, which had no external visibility before.
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		snap := meter.Snapshot()
 		stateNum := 0
@@ -407,6 +605,31 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 		pausedNum := 0
 		if snap.Paused {
 			pausedNum = 1
+		}
+		// Discord frontend is optional (cfg.Discord.Enabled) - report zeros
+		// rather than omitting the series when it's off, so alert rules
+		// that reference these metrics don't need conditional queries.
+		var discordSendFailures, discordPermanentDrops, discordQueueDepth int64
+		var discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt int64
+		if discordFront != nil {
+			discordSendFailures = discordFront.SendFailures()
+			discordPermanentDrops = discordFront.PermanentDrops()
+			discordQueueDepth = discordFront.QueueDepth()
+			discordRecvDrops = discordFront.RecvDrops()
+			discordGatewayReconnects = discordFront.GatewayReconnects()
+			discordLastGatewayEventAt = discordFront.LastGatewayEventAt()
+		}
+		// Telegram frontend is always non-nil in production (unlike the
+		// optional Discord one) but newRelaydMux is also used directly by
+		// tests with front=nil, so guard the same way rather than assume.
+		var telegramSendFailures, telegramPermanentDrops, telegramQueueDepth int64
+		var telegramGetUpdatesFailures, telegramLastPollSuccess int64
+		if front != nil {
+			telegramSendFailures = front.SendFailures()
+			telegramPermanentDrops = front.PermanentDrops()
+			telegramQueueDepth = front.QueueDepth()
+			telegramGetUpdatesFailures = front.GetUpdatesFailures()
+			telegramLastPollSuccess = front.LastPollSuccess()
 		}
 		body := fmt.Sprintf(
 			"# HELP relayd_unrecognized_access_attempts_total Distinct non-allowlisted Telegram senders who have messaged the bot since relayd started.\n"+
@@ -456,20 +679,119 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 				"relayd_pending_events_open %d\n"+
 				"# HELP relayd_pending_events_oldest_age_seconds Age of the oldest still-open pending event in seconds (0 if none open).\n"+
 				"# TYPE relayd_pending_events_oldest_age_seconds gauge\n"+
-				"relayd_pending_events_oldest_age_seconds %f\n",
+				"relayd_pending_events_oldest_age_seconds %f\n"+
+				"# HELP relayd_discord_send_failures_total Failed Discord message-send attempts since relayd started (includes retries). 0 if the Discord frontend is disabled.\n"+
+				"# TYPE relayd_discord_send_failures_total counter\n"+
+				"relayd_discord_send_failures_total %d\n"+
+				"# HELP relayd_discord_permanent_drops_total Discord messages that exhausted all retry attempts and were permanently dropped.\n"+
+				"# TYPE relayd_discord_permanent_drops_total counter\n"+
+				"relayd_discord_permanent_drops_total %d\n"+
+				"# HELP relayd_discord_retry_queue_depth Discord messages currently queued for background retry.\n"+
+				"# TYPE relayd_discord_retry_queue_depth gauge\n"+
+				"relayd_discord_retry_queue_depth %d\n"+
+				"# HELP relayd_discord_recv_drops_total Inbound Discord gateway events dropped without being relayed since relayd started - the Discord analogue of a getUpdates outage.\n"+
+				"# TYPE relayd_discord_recv_drops_total counter\n"+
+				"relayd_discord_recv_drops_total %d\n"+
+				"# HELP relayd_discord_gateway_reconnects_total Discord gateway reconnects since relayd started.\n"+
+				"# TYPE relayd_discord_gateway_reconnects_total counter\n"+
+				"relayd_discord_gateway_reconnects_total %d\n"+
+				"# HELP relayd_discord_last_gateway_event_seconds Unix timestamp of the last event received from the Discord gateway (0 if the Discord frontend is disabled or has seen no events yet).\n"+
+				"# TYPE relayd_discord_last_gateway_event_seconds gauge\n"+
+				"relayd_discord_last_gateway_event_seconds %d\n"+
+				"# HELP relayd_reply_drift_total Turns where the model answered a relay event in plain terminal text without calling the reply tool, so nothing was ever sent - detected by a Stop hook scanning the transcript, see scripts/detect-reply-drift.py.\n"+
+				"# TYPE relayd_reply_drift_total counter\n"+
+				"relayd_reply_drift_total %d\n",
 			acc.TotalRecorded(), len(acc.Pending()), len(acc.Allowlist()),
 			snap.PercentUsed, snap.Used, snap.Limit, snap.WindowLeft.Seconds(),
 			stateNum, pausedNum,
-			front.SendFailures(), front.PermanentDrops(), front.QueueDepth(),
-			front.GetUpdatesFailures(), front.LastPollSuccess(),
+			telegramSendFailures, telegramPermanentDrops, telegramQueueDepth,
+			telegramGetUpdatesFailures, telegramLastPollSuccess,
 			tracker.OpenCount(), tracker.OldestOpenAge().Seconds(),
+			discordSendFailures, discordPermanentDrops, discordQueueDepth,
+			discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt,
+			replyDriftTotal.Load(),
 		)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(body))
 	})
+	// /webhook/reply-drift: called by scripts/detect-reply-drift.py (a Claude
+	// Code Stop hook) when it finds a turn that answered a relay event in
+	// plain terminal text without ever calling the reply tool. Loopback-only,
+	// same as every other endpoint on this mux - this process's threat model
+	// already assumes localhost is trusted. Just increments a counter; see
+	// replyDriftTotal's doc comment for why this stays observability-only
+	// rather than auto-forwarding the orphaned text: auto-forward risks
+	// sending unintended draft/mid-thought text.
+	mux.HandleFunc("/webhook/reply-drift", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		replyDriftTotal.Add(1)
+		logger.Printf("reply drift detected: model answered a relay event in terminal text without calling the reply tool")
+		w.WriteHeader(http.StatusOK)
+	})
+	// /webhook/token-usage: called by scripts/token-usage-hook.py (a Claude
+	// Code Stop hook) with real per-conversation token usage computed from
+	// the session transcript's own Claude-API usage data - replacing the
+	// interim chars/4 text-length estimate the Broker uses live between hook
+	// runs, which undercounts real usage. Body:
+	// {"usage": {"<chat_id>": <int64 tokens>, ...}} - a batch of every
+	// currently-capped conversation's real usage in one call, since the hook
+	// recomputes attribution for the whole transcript each run anyway.
+	// SetConversationUsage is a no-op for any chat_id without a configured
+	// cap, so this endpoint can't be used to inject usage for an uncapped
+	// conversation.
+	mux.HandleFunc("/webhook/token-usage", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var payload struct {
+			Usage map[string]int64 `json:"usage"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			logger.Printf("token-usage webhook: bad payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		for chatID, tokens := range payload.Usage {
+			b.SetConversationUsage(chatID, tokens)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	// /webhook/reload-caps: re-reads config.json's budget.conversation_caps
+	// and budget.default_conversation_cap from disk and applies them to the
+	// live Broker via SetCaps, without a relayd process restart. Only the
+	// budget caps are hot-reloaded, not the rest of config.json (token env
+	// vars, allowlists, etc. still require a real restart) - deliberately
+	// narrow rather than a general config-reload mechanism, which would be
+	// a much bigger surface to get right.
+	mux.HandleFunc("/webhook/reload-caps", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		fresh, err := config.Load(cfgPath)
+		if err != nil {
+			logger.Printf("reload-caps: failed to reload %s: %v", cfgPath, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(err.Error()))
+			return
+		}
+		b.SetCaps(fresh.Budget.ConversationCaps, fresh.Budget.DefaultConversationCap)
+		logger.Printf("reload-caps: applied %d explicit cap(s), default=%d",
+			len(fresh.Budget.ConversationCaps), fresh.Budget.DefaultConversationCap)
+		w.WriteHeader(http.StatusOK)
+	})
 	mux.HandleFunc("/webhook/grafana", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if adminChatID == "" {
+			logger.Printf("grafana webhook: no admin chat configured, dropping alert")
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
 		body, err := io.ReadAll(r.Body)
@@ -503,11 +825,7 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 		}
 		w.WriteHeader(http.StatusOK)
 	})
-	addr := "127.0.0.1:9210"
-	logger.Printf("grafana webhook listening on %s/webhook/grafana", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		logger.Printf("grafana webhook server stopped: %v", err)
-	}
+	return mux
 }
 
 // serveSchedules answers schedule-tool calls from the model: create/list/cancel
@@ -596,6 +914,34 @@ func describeSchedule(sched *scheduler.Scheduler, sc *scheduler.Schedule) string
 	return "once at " + next.Format("Mon 2006-01-02 15:04 MST")
 }
 
+// outboundAllowed implements the outbound gate: the model can only reply to
+// allowlisted chats. The inbound allowlist gates who reaches Claude; this
+// stops Claude messaging strangers. Checks both the Telegram (int64) and,
+// when enabled, Discord (snowflake) allowlists — chatID is a Telegram chat
+// id (== user id) or, for Discord, gate()'s convID (== user id for DMs, ==
+// channel id for guild messages). Guild channels are inherently multi-party
+// so acc-style single-id allowlisting doesn't apply there; instead known
+// reports whether the Discord frontend has already seen and gated this
+// chatID inbound — i.e. a guild channel from an allowed guild, or a DM user
+// id. That covers scheduled reminders / relayd-originated replies into a
+// channel the model was legitimately talking in, while still failing closed
+// for anything never seen inbound. discordAcc and known may be nil/absent
+// when the Discord frontend is disabled.
+func outboundAllowed(chatID string, acc *access.Manager, discordAcc *access.Manager, known func(string) bool) bool {
+	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil && acc.Allowed(id) {
+		return true
+	}
+	if discordAcc != nil {
+		if id, err := snowflake.Parse(chatID); err == nil && discordAcc.Allowed(int64(id)) {
+			return true
+		}
+	}
+	if known != nil && known(chatID) {
+		return true
+	}
+	return false
+}
+
 // verdict returns an /allow or /deny handler that answers a pending tool-approval
 // request by its id. Admin gating is enforced centrally by the registry.
 func verdict(back *claudebk.Endpoint, allow bool) command.Handler {
@@ -618,14 +964,26 @@ func verdict(back *claudebk.Endpoint, allow bool) command.Handler {
 //	/handshake              list pending access requests
 //	/handshake approve <id> grant access to a pending id
 //	/handshake deny <id>    drop a pending request
-func handshake(acc *access.Manager) command.Handler {
+//
+// managers() returns every access manager currently in play (Telegram, plus
+// Discord's own if that frontend is enabled) — each frontend has its own id
+// namespace and its own pending queue, so a request recorded by one manager
+// is otherwise invisible to (and unapprovable from) the other. Listing merges
+// all of them; approve/deny try each manager in turn and act on whichever one
+// actually has the id pending/denied, so an admin on either frontend can
+// resolve any request without knowing which frontend it came from.
+func handshake(managers func() []*access.Manager) command.Handler {
 	const maxList = 20 // cap the listing so it stays under Telegram's message limit
 	return func(_ command.Context, args []string) string {
 		if len(args) == 0 {
-			pend := acc.Pending()
+			var pend []access.Request
+			for _, acc := range managers() {
+				pend = append(pend, acc.Pending()...)
+			}
 			if len(pend) == 0 {
 				return "no pending requests"
 			}
+			sort.Slice(pend, func(i, j int) bool { return pend[i].FirstSeen.Before(pend[j].FirstSeen) })
 			var b strings.Builder
 			b.WriteString("pending requests:\n")
 			for i, r := range pend {
@@ -647,13 +1005,17 @@ func handshake(acc *access.Manager) command.Handler {
 		}
 		switch args[0] {
 		case "approve":
-			if acc.Approve(id) {
-				return fmt.Sprintf("✅ approved %d", id)
+			for _, acc := range managers() {
+				if acc.Approve(id) {
+					return fmt.Sprintf("✅ approved %d", id)
+				}
 			}
 			return fmt.Sprintf("%d is not pending or denied — not approved (use an id from /handshake)", id)
 		case "deny":
-			if acc.Deny(id) {
-				return fmt.Sprintf("denied %d", id)
+			for _, acc := range managers() {
+				if acc.Deny(id) {
+					return fmt.Sprintf("denied %d", id)
+				}
 			}
 			return fmt.Sprintf("%d was not pending", id)
 		default:

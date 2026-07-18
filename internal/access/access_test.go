@@ -41,6 +41,30 @@ func TestAllowAdminAndApproveFlow(t *testing.T) {
 	}
 }
 
+func TestTotalRecordedCountsOnlyGenuinelyNewPending(t *testing.T) {
+	m := New(nil, nil, "", nil)
+
+	m.Record(99, "stranger")
+	m.Record(99, "stranger") // re-attempt while still pending: must not count again
+	m.Record(99, "stranger")
+	if got := m.TotalRecorded(); got != 1 {
+		t.Fatalf("TotalRecorded after repeated pending record = %d, want 1", got)
+	}
+
+	m.Record(100, "another")
+	if got := m.TotalRecorded(); got != 2 {
+		t.Fatalf("TotalRecorded after distinct id = %d, want 2", got)
+	}
+
+	if !m.Approve(99) {
+		t.Fatal("approve should report it was pending")
+	}
+	m.Record(99, "stranger") // now allowed: re-recording must not count
+	if got := m.TotalRecorded(); got != 2 {
+		t.Fatalf("TotalRecorded after re-record of allowed id = %d, want 2", got)
+	}
+}
+
 func TestRejectsNonPositiveIDs(t *testing.T) {
 	m := New([]int64{0, -5, 1}, []int64{-1, 2}, "", nil)
 	if m.Allowed(0) || m.IsAdmin(0) || m.Allowed(-5) || m.Allowed(-1) {

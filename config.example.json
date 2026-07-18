@@ -6,10 +6,21 @@
     "allowlist_file": "allowlist.json",
     "poll_timeout": 30
   },
+  "discord": {
+    "enabled": false,
+    "token_env": "DISCORD_BOT_TOKEN",
+    "admins": ["123456789012345678"],
+    "allowlist": [],
+    "allowlist_file": "discord_allowlist.json",
+    "allow_guild_messages": false,
+    "allowed_guild_ids": [],
+    "require_mention_in_guild": true
+  },
   "claude": {
     "socket": "/tmp/agent-relay.sock"
   },
   "budget": {
-    "tier": "max5"
+    "tier": "max5",
+    "conversation_caps": {}
   }
 }
