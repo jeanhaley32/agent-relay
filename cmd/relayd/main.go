@@ -164,10 +164,7 @@ func main() {
 	// Frontend slot via relay.MultiFrontend alongside Telegram.
 	frontendEndpoint := relay.Endpoint(front)
 	var discordFront *discord.Frontend
-	// discordAcc itself is declared earlier (near cmds.IsAdmin) so the admin
-	// gate and /handshake closures can capture it by reference; assign into
-	// it here rather than redeclaring, or those closures would keep seeing
-	// the original nil.
+	// Assign into discordAcc (declared earlier); don't redeclare it here.
 	if cfg.Discord.Enabled {
 		discordFront, discordAcc = mustStartDiscord(cfg, logger)
 		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
