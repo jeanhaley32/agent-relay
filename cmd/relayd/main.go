@@ -446,10 +446,13 @@ func ackErrText(sendErr error) string {
 // mustStartDiscord builds the Discord frontend from cfg.Discord, connects
 // its gateway, and returns it along with the access.Manager backing its
 // allowlist (so the caller can also consult it for outbound gating).
-// Fatal on error, mirroring the Telegram handshake's posture: an operator
-// who set discord.enabled=true with a bad token/config wants a clear
-// startup failure, not a frontend that silently never came up (the exact
-// gap this function exists to close - see DESIGN.md's wiring/startup design).
+// Config validation errors are fatal immediately; the gateway connect itself
+// retries with a bounded timeout for ~2m (mirroring the Telegram handshake)
+// before Fatalf, so a transient boot-time DNS race doesn't kill relayd (and
+// the already-connected Telegram frontend with it) - an operator who set
+// discord.enabled=true with a genuinely bad token/config still gets a clear
+// startup failure, just not on the very first attempt (the exact gap this
+// function exists to close - see DESIGN.md's wiring/startup design).
 func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend, *access.Manager) {
 	token, err := cfg.DiscordToken()
 	if err != nil {
@@ -492,9 +495,28 @@ func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend
 		logger.Fatalf("discord: %v", err)
 	}
 
-	ctx := context.Background()
-	if err := front.Connect(ctx); err != nil {
-		logger.Fatalf("discord: connect: %v", err)
+	// Bounded retry loop mirroring the Telegram handshake above: a transient
+	// boot-time DNS/network race or a wedged OpenGateway shouldn't Fatalf
+	// relayd (which would also tear down the already-connected Telegram
+	// frontend) before Broker.Run even starts. Still fails fast with a clear
+	// message for a genuinely bad token/config - just not on the first attempt.
+	connectDeadline := time.Now().Add(2 * time.Minute)
+	backoff := time.Second
+	for {
+		cctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err = front.Connect(cctx)
+		ccancel()
+		if err == nil {
+			break
+		}
+		if time.Now().After(connectDeadline) {
+			logger.Fatalf("discord: connect failed after retrying for 2m: %v", err)
+		}
+		logger.Printf("discord connect failed, retrying in %s: %v", backoff, err)
+		time.Sleep(backoff)
+		if backoff < 15*time.Second {
+			backoff *= 2
+		}
 	}
 	logger.Printf("connected to Discord (admins=%d, allowlist=%d, guild_messages=%v)",
 		len(adminIDs), len(allowIDs), cfg.Discord.AllowGuildMessages)
