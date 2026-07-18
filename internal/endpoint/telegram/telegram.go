@@ -34,14 +34,10 @@ const defaultBaseURL = "https://api.telegram.org"
 // just repeats the same guaranteed failure.
 const maxMessageLen = 4096
 
-// permanentSendError marks a Send failure as non-retryable: the same input
-// will fail identically no matter how many times it's resent (an oversized
-// message, a missing chat_id), as opposed to a transient failure (network
-// blip, Telegram outage) that background retry can legitimately fix.
-//
-// This is the shared senderr.Permanent type rather than a package-local
-// definition, so retry-classification logic can't silently drift apart
-// between frontends that need the same semantics.
+// permanentSendError is an alias for the shared senderr.Permanent type (see
+// its doc comment for the permanent-vs-transient taxonomy), kept as a single
+// definition so retry-classification logic can't drift apart between
+// frontends that need the same semantics.
 type permanentSendError = senderr.Permanent
 
 // Authorizer decides whether a sender may use the relay and records requests
@@ -78,7 +74,7 @@ type Frontend struct {
 	// worker to keep retrying with backoff, instead of just vanishing.
 	retryQueue     chan retryItem
 	sendFailures   atomic.Int64 // failed immediate attempts only, not background retries
-	permanentDrops atomic.Int64 // gave up after maxRetryAttempts
+	permanentDrops atomic.Int64 // count of drops: retry queue full, a permanent failure hit during background retry, or retry attempts exhausted
 	queueDepth     atomic.Int64
 
 	// getUpdatesFailures/lastPollSuccess are the real signal for an outage:
@@ -332,9 +328,12 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 // is split into multiple messages (see senderr.Split) rather than permanently
 // dropped, with an error surfaced to the caller if any chunk fails outright.
 // On a transient failure mid-split, remaining chunks are queued for
-// background retry (not sent immediately) so the reply reaches the chat in
-// order even when delivery is interleaved with retries; a permanent failure
-// on one chunk still lets later, independent chunks attempt delivery. The
+// background retry (not sent immediately) rather than attempted out of
+// turn; this keeps ordering in the common case, but is not a hard
+// guarantee — retries run on their own schedule, so if an earlier chunk's
+// retry is deferred while a later chunk's retry succeeds, delivery order
+// can still be violated. A permanent failure on one chunk still lets
+// later, independent chunks attempt delivery. The
 // first permanent failure is returned if any chunk hit one; otherwise the
 // first transient failure is returned.
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
