@@ -12,6 +12,7 @@ require (
 	github.com/disgoorg/json/v2 v2.0.0 // indirect
 	github.com/disgoorg/omit v1.0.0 // indirect
 	github.com/disgoorg/snowflake/v2 v2.0.3 // indirect
+	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/sasha-s/go-csync v0.0.0-20240107134140-fcbab37b09ad // indirect

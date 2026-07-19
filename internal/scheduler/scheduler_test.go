@@ -53,7 +53,7 @@ func (c *collector) count() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c
 func newTestSched(t *testing.T, c *collector) *Scheduler {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "sched.json")
-	s, err := New(path, time.UTC, c.deliver, nil)
+	s, err := New(path, time.UTC, c.deliver, nil, nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestCancel(t *testing.T) {
 func TestPersistReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sched.json")
 	c1 := newCollector()
-	s1, err := New(path, time.UTC, c1.deliver, nil)
+	s1, err := New(path, time.UTC, c1.deliver, nil, nil)
 	if err != nil {
 		t.Fatalf("new1: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestPersistReload(t *testing.T) {
 	s1.Close()
 
 	c2 := newCollector()
-	s2, err := New(path, time.UTC, c2.deliver, nil)
+	s2, err := New(path, time.UTC, c2.deliver, nil, nil)
 	if err != nil {
 		t.Fatalf("new2: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestPersistReload(t *testing.T) {
 func TestMissedOneShotFiresOnLoad(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sched.json")
 	c1 := newCollector()
-	s1, err := New(path, time.UTC, c1.deliver, nil)
+	s1, err := New(path, time.UTC, c1.deliver, nil, nil)
 	if err != nil {
 		t.Fatalf("new1: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestMissedOneShotFiresOnLoad(t *testing.T) {
 	rewriteFireAt(t, path, sc.ID, time.Now().Add(-time.Minute))
 
 	c2 := newCollector()
-	s2, err := New(path, time.UTC, c2.deliver, nil)
+	s2, err := New(path, time.UTC, c2.deliver, nil, nil)
 	if err != nil {
 		t.Fatalf("new2: %v", err)
 	}
@@ -215,7 +215,7 @@ func (c *failingCollector) count() int {
 func TestFireKeepsScheduleOnDeliverError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sched.json")
 	c := newFailingCollector()
-	s, err := New(path, time.UTC, c.deliver, nil)
+	s, err := New(path, time.UTC, c.deliver, nil, nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -238,5 +238,139 @@ func TestFireKeepsScheduleOnDeliverError(t *testing.T) {
 	list := s.List()
 	if len(list) != 1 || list[0].ID != sc.ID {
 		t.Fatalf("schedule was removed despite deliver error: %+v", list)
+	}
+}
+
+// externalCollector records ExternalFunc calls (file-watch-detected schedules).
+type externalCollector struct {
+	mu  sync.Mutex
+	got []struct {
+		sc   Schedule
+		kind string
+	}
+	seen chan struct{}
+}
+
+func newExternalCollector() *externalCollector {
+	return &externalCollector{seen: make(chan struct{}, 8)}
+}
+func (e *externalCollector) onExternal(sc *Schedule, kind string) {
+	e.mu.Lock()
+	e.got = append(e.got, struct {
+		sc   Schedule
+		kind string
+	}{*sc, kind})
+	e.mu.Unlock()
+	e.seen <- struct{}{}
+}
+func (e *externalCollector) last() (Schedule, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n := len(e.got)
+	return e.got[n-1].sc, e.got[n-1].kind
+}
+
+// TestFileWatchArmsExternallyAddedSchedule: a schedule hand-appended to
+// schedules.json while the process is running gets armed and tagged
+// Source=file, and the ExternalFunc hook fires with kind="added" — without
+// any restart.
+func TestFileWatchArmsExternallyAddedSchedule(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newCollector()
+	ext := newExternalCollector()
+	s, err := New(path, time.UTC, c.deliver, ext.onExternal, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	// Seed the file with one schedule the running process never created.
+	hand := []*Schedule{{
+		ID:     "hand-added-1",
+		Text:   "hand-added reminder",
+		FireAt: time.Now().Add(time.Hour), // far enough out it won't fire mid-test
+		ChatID: "99",
+	}}
+	b, _ := json.MarshalIndent(hand, "", "  ")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	select {
+	case <-ext.seen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("file watch never detected the hand-added schedule")
+	}
+
+	sc, kind := ext.last()
+	if kind != "added" {
+		t.Fatalf("kind = %q, want added", kind)
+	}
+	if sc.Source != SourceFile {
+		t.Fatalf("Source = %q, want %q", sc.Source, SourceFile)
+	}
+
+	list := s.List()
+	if len(list) != 1 || list[0].ID != "hand-added-1" {
+		t.Fatalf("hand-added schedule not armed in memory: %+v", list)
+	}
+	if got := s.OutOfBandCount(); got != 1 {
+		t.Fatalf("OutOfBandCount() = %d, want 1", got)
+	}
+}
+
+// TestFileWatchIgnoresOwnSaves: Create() (which calls save() internally)
+// must not trigger a spurious ExternalFunc call — the watcher's diff should
+// find nothing new, since the file it re-reads matches what's already armed.
+func TestFileWatchIgnoresOwnSaves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newCollector()
+	ext := newExternalCollector()
+	s, err := New(path, time.UTC, c.deliver, ext.onExternal, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := s.Create("normal reminder", "", time.Hour, "1"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	select {
+	case <-ext.seen:
+		t.Fatal("ExternalFunc fired for a tool-created schedule's own save()")
+	case <-time.After(600 * time.Millisecond):
+		// expected: no external notification for our own write
+	}
+}
+
+// TestFileWatchDoesNotDisarmOnExternalRemoval: an id present in memory but
+// missing from a hand-edited file must stay armed — a hand-edit must never
+// be able to silently kill a running schedule.
+func TestFileWatchDoesNotDisarmOnExternalRemoval(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newCollector()
+	ext := newExternalCollector()
+	s, err := New(path, time.UTC, c.deliver, ext.onExternal, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	sc, err := s.Create("do not lose me", "", time.Hour, "1")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Hand-edit the file down to an empty array, simulating an external wipe.
+	if err := os.WriteFile(path, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Give the debounced watcher time to react (or not).
+	time.Sleep(600 * time.Millisecond)
+
+	list := s.List()
+	if len(list) != 1 || list[0].ID != sc.ID {
+		t.Fatalf("schedule was disarmed by an external file edit: %+v", list)
 	}
 }
