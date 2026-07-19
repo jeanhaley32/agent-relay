@@ -22,10 +22,23 @@ Respects stop_hook_active to avoid ever blocking/looping - this hook never
 blocks the stop at all, it only reports after the fact.
 """
 import json
+import os
 import sys
 import urllib.request
 
-DRIFT_WEBHOOK = "http://127.0.0.1:9210/webhook/reply-drift"
+# Shared port convention: relayd and this hook both read RELAY_WEBHOOK_ADDR and
+# both fall back to the same default, so changing the port in one place moves
+# both. (Previously each hardcoded 127.0.0.1:9210 independently, which silently
+# breaks the hook the moment relayd is moved to another port.)
+WEBHOOK_ADDR = os.environ.get("RELAY_WEBHOOK_ADDR", "127.0.0.1:9210")
+DRIFT_WEBHOOK = f"http://{WEBHOOK_ADDR}/webhook/reply-drift"
+
+# Only the tail of the transcript is needed: we care about the LAST relay event
+# and the turns after it. Reading the whole file cost 1.7s per turn on a 104MB
+# session transcript - and this hook runs after EVERY turn, on a file that only
+# grows. Read a tail window instead, and fall back to the full file if the
+# window happens not to contain a relay event (very long turns).
+TAIL_BYTES = 4 * 1024 * 1024
 CHANNEL_MARKER = '<channel source="relay"'
 REPLY_TOOL_NAME = "mcp__relay__reply"
 MIN_TEXT_LEN = 20  # ignore trivial/whitespace-only assistant text blocks
@@ -36,6 +49,7 @@ def message_text(content):
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
+        print(f"message_text: unexpected content type {type(content)!r}", file=sys.stderr)
         return ""
     parts = []
     for block in content:
@@ -66,30 +80,50 @@ def main():
     if not transcript_path:
         return
 
-    try:
-        with open(transcript_path) as f:
-            lines = f.readlines()
-    except OSError:
-        return
-
-    records = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    def load(tail_only):
+        """Parse transcript records, optionally only the tail window."""
         try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+            with open(transcript_path, "rb") as f:
+                if tail_only:
+                    size = os.fstat(f.fileno()).st_size
+                    if size > TAIL_BYTES:
+                        f.seek(size - TAIL_BYTES)
+                        f.readline()  # discard the partial first line
+                raw = f.read()
+        except OSError:
+            return None
+        out = []
+        for line in raw.split(b"\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        return out
 
-    # Find the last user turn carrying a relay channel event.
-    last_channel_idx = None
-    for i, rec in enumerate(records):
-        if rec.get("type") != "user":
-            continue
-        text = message_text(rec.get("message", {}).get("content"))
-        if CHANNEL_MARKER in text:
-            last_channel_idx = i
+    def last_channel(records):
+        idx = None
+        for i, rec in enumerate(records):
+            if rec.get("type") != "user":
+                continue
+            if CHANNEL_MARKER in message_text(rec.get("message", {}).get("content")):
+                idx = i
+        return idx
+
+    records = load(tail_only=True)
+    if records is None:
+        return
+    last_channel_idx = last_channel(records)
+    if last_channel_idx is None:
+        # No relay event in the tail window - re-read the whole file before
+        # concluding this session has never seen one, so correctness never
+        # depends on the window size.
+        records = load(tail_only=False)
+        if records is None:
+            return
+        last_channel_idx = last_channel(records)
 
     if last_channel_idx is None:
         return  # this session has never seen a relay event - nothing to check
