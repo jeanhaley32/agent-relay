@@ -35,6 +35,7 @@ block/continue cycle.
 """
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -153,6 +154,14 @@ def main():
         if len(text.strip()) >= MIN_TEXT_LEN:
             produced_text = True
 
+    # Pull chat_id out of the channel tag so the feedback can name the exact
+    # destination instead of making the model go re-find it.
+    chat_id = ""
+    m = re.search(r'chat_id="([^"]+)"',
+                  message_text(records[last_channel_idx].get("message", {}).get("content")))
+    if m:
+        chat_id = m.group(1)
+
     if produced_text and not reply_sent:
         # Observability half: count it even if the feedback below is ignored.
         try:
@@ -167,14 +176,25 @@ def main():
         print(json.dumps({
             "decision": "block",
             "reason": (
-                "Your last answer was written as plain terminal text and was NEVER DELIVERED "
-                "to the user - you did not call mcp__relay__reply, so nothing was sent and no "
-                "error was raised. The user is still waiting and has seen nothing. "
-                "Send that answer now by calling mcp__relay__reply with the chat_id from the "
-                "channel tag. Do not describe what you would send - actually call the tool. "
-                "If the text was only internal narration and not meant for the user, call the "
-                "reply tool with whatever the real answer is instead."
-            ),
+                "DELIVERY FAILURE - your last answer never reached the user.\n\n"
+                "What happened: you wrote the answer as plain assistant text instead of "
+                "calling mcp__relay__reply.\n\n"
+                "Why that means it was not delivered: this session runs headless on a "
+                "remote box. Text you emit is only rendered into a terminal that the user "
+                "cannot see - it is not a slow send or a failed send, it is not a transport "
+                "at all. mcp__relay__reply is the ONLY thing that transmits to the user's "
+                "Telegram/Discord. Anything not passed to that tool is discarded.\n\n"
+                "Why you saw no error: no send was ever attempted, so there was nothing to "
+                "fail. No tool call means no tool result, no error, and no metric. Do NOT "
+                "treat clean logs or an absence of errors as evidence that a message was "
+                "delivered - for this failure mode they look identical to success.\n\n"
+                "This is a known recurring pattern, not a one-off. Guard against it: an "
+                "answer is only sent once mcp__relay__reply has actually been called.\n\n"
+                "Do this now: call mcp__relay__reply%s with the answer you just wrote. "
+                "Actually call the tool - do not describe what you would send. If that text "
+                "was internal narration rather than the user's answer, call the tool with "
+                "the real answer instead."
+            ) % (' with chat_id="%s"' % chat_id if chat_id else ""),
         }))
 
 
