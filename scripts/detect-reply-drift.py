@@ -141,18 +141,27 @@ def main():
     if last_channel_idx is None:
         return  # this session has never seen a relay event - nothing to check
 
-    reply_sent = False
-    produced_text = False
+    # Drift is "the turn ENDED with text that was never sent", not "no reply
+    # ever happened". Scanning for any reply and stopping there was wrong: the
+    # model routinely replies first and then writes more text (a status note, a
+    # test message), and that trailing text is exactly the drift we care about.
+    # Breaking on the first reply masked every one of those - 4 real tests in a
+    # row reported clean while the user got nothing (2026-07-19).
+    #
+    # So: walk forward and track whether there is text still outstanding. Text
+    # sets it; a reply clears it (that text was superseded by an actual send).
+    # Whatever the state is when the turn ends is the verdict.
+    pending_text = False
     for rec in records[last_channel_idx + 1:]:
         if rec.get("type") != "assistant":
             continue
         content = rec.get("message", {}).get("content")
         if has_reply_tool_call(content):
-            reply_sent = True
-            break  # satisfied for the rest of this window, no need to scan further
-        text = message_text(content)
-        if len(text.strip()) >= MIN_TEXT_LEN:
-            produced_text = True
+            pending_text = False
+            continue
+        if len(message_text(content).strip()) >= MIN_TEXT_LEN:
+            pending_text = True
+    produced_text, reply_sent = pending_text, not pending_text
 
     # Pull chat_id out of the channel tag so the feedback can name the exact
     # destination instead of making the model go re-find it.
