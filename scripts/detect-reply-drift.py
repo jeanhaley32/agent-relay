@@ -14,12 +14,24 @@ produced non-trivial text (a real answer, not just tool-call chatter) but no
 mcp__relay__reply tool_use appears anywhere after the channel event, this is
 drift - report it to relayd, which counts it as relayd_reply_drift_total.
 
-Deliberately observability-only, not auto-forwarding: the orphaned text
-could be a draft or mid-thought fragment, not necessarily what the model
-would send if it noticed the miss itself (Jean's explicit call, 2026-07-14).
+On detection it does two things:
 
-Respects stop_hook_active to avoid ever blocking/looping - this hook never
-blocks the stop at all, it only reports after the fact.
+  1. Reports to relayd (relayd_reply_drift_total) - the observability half.
+  2. Returns decision:"block" with a reason, which for a Stop hook means "do
+     not end the turn": the reason is fed back to the model, so it learns that
+     the answer it just wrote never reached the user and can resend properly.
+
+Returning the miss to the model - rather than auto-forwarding the orphaned
+text - is deliberate. The text could be a draft or mid-thought fragment, so
+the model, not the relay, decides what is actually fit to send (Jean's call,
+2026-07-14). This closes the loop that made drift self-perpetuating: writing
+terminal text produces NO tool result, no error, no signal of any kind, so
+without this the model has no way to know it failed and reports success in
+good faith.
+
+Loop safety: stop_hook_active short-circuits the whole check, so the model is
+nudged at most once per drift episode and can never be trapped in a
+block/continue cycle.
 """
 import json
 import os
@@ -142,11 +154,28 @@ def main():
             produced_text = True
 
     if produced_text and not reply_sent:
+        # Observability half: count it even if the feedback below is ignored.
         try:
             req = urllib.request.Request(DRIFT_WEBHOOK, method="POST", data=b"")
             urllib.request.urlopen(req, timeout=2)
         except Exception:
             pass  # relayd may not be running (e.g. dev/test session) - never block on this
+
+        # Feedback half: hand the miss back to the model. For a Stop hook,
+        # decision:"block" means "don't end the turn" - reason is delivered to
+        # the model, which can then send the answer properly.
+        print(json.dumps({
+            "decision": "block",
+            "reason": (
+                "Your last answer was written as plain terminal text and was NEVER DELIVERED "
+                "to the user - you did not call mcp__relay__reply, so nothing was sent and no "
+                "error was raised. The user is still waiting and has seen nothing. "
+                "Send that answer now by calling mcp__relay__reply with the chat_id from the "
+                "channel tag. Do not describe what you would send - actually call the tool. "
+                "If the text was only internal narration and not meant for the user, call the "
+                "reply tool with whatever the real answer is instead."
+            ),
+        }))
 
 
 if __name__ == "__main__":
