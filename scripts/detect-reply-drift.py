@@ -37,6 +37,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 
 # Shared port convention: relayd and this hook both read RELAY_WEBHOOK_ADDR and
@@ -125,9 +126,51 @@ def main():
                 idx = i
         return idx
 
+    # The Stop hook fires before the just-finished assistant turn is flushed to
+    # the transcript: at firing time the tail's last record is still the USER
+    # message. Reading immediately therefore analyses a stale view and can never
+    # see the turn being judged - which is exactly why live drift tests came
+    # back clean while manual runs on the settled file detected it correctly.
+    # Wait (briefly, bounded) for an assistant record to appear after the last
+    # user record before deciding.
+    def last_kinds(recs):
+        last_user = last_assistant = -1
+        for i, r in enumerate(recs):
+            if r.get("type") == "user":
+                last_user = i
+            elif r.get("type") == "assistant":
+                last_assistant = i
+        return last_user, last_assistant
+
     records = load(tail_only=True)
     if records is None:
         return
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        lu, la = last_kinds(records)
+        if la > lu:
+            break  # the assistant turn has landed; safe to judge
+        time.sleep(0.25)
+        fresh = load(tail_only=True)
+        if fresh is not None:
+            records = fresh
+    if os.environ.get("DRIFT_DEBUG"):
+        try:
+            tail = records[-3:]
+            with open("/tmp/drift-debug.log", "a") as dbg:
+                dbg.write("--- fired %s size=%d\n" % (
+                    __import__("datetime").datetime.now().strftime("%H:%M:%S"),
+                    os.path.getsize(transcript_path)))
+                for r in tail:
+                    c = r.get("message", {}).get("content")
+                    kind = "text" if isinstance(c, list) and any(
+                        isinstance(x, dict) and x.get("type") == "text" for x in c) else "other"
+                    if isinstance(c, list) and any(isinstance(x, dict) and x.get("type") == "tool_use"
+                                                   and x.get("name") == REPLY_TOOL_NAME for x in c):
+                        kind = "REPLY"
+                    dbg.write("    %s %s %s\n" % (r.get("timestamp", "")[11:19], r.get("type"), kind))
+        except Exception:
+            pass
     last_channel_idx = last_channel(records)
     if last_channel_idx is None:
         # No relay event in the tail window - re-read the whole file before
