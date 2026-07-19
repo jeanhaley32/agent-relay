@@ -21,7 +21,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/robfig/cron/v3"
+)
+
+// Provenance values for Schedule.Source. SourceTool is stamped by Create();
+// SourceFile is stamped when the file watcher finds a schedule that appeared
+// in the persisted file without going through Create() — e.g. a hand-edit.
+// Legacy records persisted before this field existed load with Source == ""
+// and are treated as SourceTool (List/metrics normalize the empty case).
+const (
+	SourceTool = "tool"
+	SourceFile = "file"
 )
 
 // Schedule is one reminder. Exactly one of Cron or FireAt is set: Cron ⇒
@@ -33,6 +44,21 @@ type Schedule struct {
 	FireAt    time.Time `json:"fire_at,omitempty"`
 	ChatID    string    `json:"chat_id"`
 	CreatedAt time.Time `json:"created_at"`
+	// Source records how this schedule entered the running process:
+	// SourceTool (via Create()) or SourceFile (found in schedules.json by the
+	// watcher without a matching Create() call — e.g. a hand-edit while
+	// relayd was running). Purely informational; file-sourced schedules are
+	// armed exactly like any other, never gated on this field.
+	Source string `json:"source,omitempty"`
+}
+
+// EffectiveSource returns Source, normalizing legacy empty values (schedules
+// persisted before this field existed) to SourceTool.
+func (s *Schedule) EffectiveSource() string {
+	if s.Source == "" {
+		return SourceTool
+	}
+	return s.Source
 }
 
 // Recurring reports whether this is a cron schedule (vs a one-shot).
@@ -46,25 +72,40 @@ func (s *Schedule) Recurring() bool { return s.Cron != "" }
 // can skip deleting a one-shot schedule and leave it for a retry.
 type DeliverFunc func(scheduleID, chatID, text string) error
 
+// ExternalFunc is invoked when the file watcher finds a schedule that entered
+// schedules.json without going through Create() (a hand-edit while relayd was
+// running). kind is "added" or "modified". It must not block for long — the
+// daemon's implementation just injects a heads-up into the agent's session.
+type ExternalFunc func(sc *Schedule, kind string)
+
 // Scheduler owns the cron runner, one-shot timers, and the persisted set.
 type Scheduler struct {
-	path    string
-	loc     *time.Location
-	deliver DeliverFunc
-	logger  *log.Logger
+	path     string
+	loc      *time.Location
+	deliver  DeliverFunc
+	external ExternalFunc // optional; nil ⇒ no notification on file-detected changes
+	logger   *log.Logger
 
 	mu      sync.Mutex
 	cron    *cron.Cron
 	items   map[string]*Schedule
 	entries map[string]cron.EntryID // recurring: schedule id -> cron entry
 	timers  map[string]*time.Timer  // one-shot: schedule id -> timer
+
+	watcher   *fsnotify.Watcher
+	watchDone chan struct{}
 }
 
 // New builds a Scheduler, loads any persisted schedules from path, re-arms them,
 // and starts the cron runner. loc is the timezone cron specs are interpreted in
 // (nil ⇒ time.Local). Missed one-shots (FireAt already past) fire once shortly
 // after load so a restart during downtime doesn't silently eat a reminder.
-func New(path string, loc *time.Location, deliver DeliverFunc, logger *log.Logger) (*Scheduler, error) {
+// external, if non-nil, is called whenever the file watcher detects a schedule
+// that was added or modified directly in schedules.json rather than via
+// Create() — see ExternalFunc. A nil external disables the watcher entirely
+// (kept optional so tests that don't care about it don't need a temp-dir
+// watch and its inherent event latency).
+func New(path string, loc *time.Location, deliver DeliverFunc, external ExternalFunc, logger *log.Logger) (*Scheduler, error) {
 	if deliver == nil {
 		return nil, errors.New("scheduler: nil deliver")
 	}
@@ -75,19 +116,28 @@ func New(path string, loc *time.Location, deliver DeliverFunc, logger *log.Logge
 		logger = log.New(os.Stderr, "[scheduler] ", log.LstdFlags)
 	}
 	s := &Scheduler{
-		path:    path,
-		loc:     loc,
-		deliver: deliver,
-		logger:  logger,
-		cron:    cron.New(cron.WithLocation(loc)),
-		items:   map[string]*Schedule{},
-		entries: map[string]cron.EntryID{},
-		timers:  map[string]*time.Timer{},
+		path:     path,
+		loc:      loc,
+		deliver:  deliver,
+		external: external,
+		logger:   logger,
+		cron:     cron.New(cron.WithLocation(loc)),
+		items:    map[string]*Schedule{},
+		entries:  map[string]cron.EntryID{},
+		timers:   map[string]*time.Timer{},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
 	s.cron.Start()
+	if external != nil && path != "" {
+		if err := s.startWatch(); err != nil {
+			// Non-fatal: the scheduler is fully functional without the
+			// watcher, it just loses live detection of hand-edits until
+			// the next restart. Don't fail startup over it.
+			s.logger.Printf("warning: file watch disabled: %v", err)
+		}
+	}
 	return s, nil
 }
 
@@ -112,6 +162,7 @@ func (s *Scheduler) Create(text, cronSpec string, in time.Duration, chatID strin
 		ChatID:    chatID,
 		Cron:      cronSpec,
 		CreatedAt: time.Now().In(s.loc),
+		Source:    SourceTool,
 	}
 	if cronSpec == "" {
 		sc.FireAt = time.Now().In(s.loc).Add(in)
@@ -166,14 +217,37 @@ func (s *Scheduler) Next(sc *Schedule) time.Time {
 	return s.next(sc)
 }
 
-// Close stops the cron runner and all one-shot timers.
-func (s *Scheduler) Close() {
+// OutOfBandCount reports how many currently-armed schedules were last
+// detected as file-sourced (SourceFile) by the watcher rather than created
+// via Create(). For dashboard visibility, not an alerting signal on its own.
+func (s *Scheduler) OutOfBandCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	n := 0
+	for _, sc := range s.items {
+		if sc.Source == SourceFile {
+			n++
+		}
+	}
+	return n
+}
+
+// Close stops the cron runner, all one-shot timers, and the file watcher.
+func (s *Scheduler) Close() {
+	s.mu.Lock()
 	for _, t := range s.timers {
 		t.Stop()
 	}
 	s.cron.Stop()
+	w := s.watcher
+	done := s.watchDone
+	s.mu.Unlock()
+	if w != nil {
+		_ = w.Close()
+	}
+	if done != nil {
+		<-done
+	}
 }
 
 // --- internals (callers hold s.mu unless noted) ---
@@ -305,6 +379,146 @@ func (s *Scheduler) save() error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Clean(s.path))
+}
+
+// startWatch arms an fsnotify watch on the directory containing s.path (not
+// the file itself — save()'s tmp+rename replaces the inode on every write, so
+// a watch on the file alone would be silently dropped after the first save).
+// Events for other files in the same directory are filtered out.
+func (s *Scheduler) startWatch() error {
+	dir := filepath.Dir(s.path)
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("create watcher: %w", err)
+	}
+	if err := w.Add(dir); err != nil {
+		_ = w.Close()
+		return fmt.Errorf("watch %s: %w", dir, err)
+	}
+	s.watcher = w
+	s.watchDone = make(chan struct{})
+	go s.watchLoop(w)
+	s.logger.Printf("watching %s for external edits", s.path)
+	return nil
+}
+
+// watchLoop debounces bursts of fsnotify events (a single save() can produce
+// more than one, e.g. the tmp-file write plus the rename) into one
+// reconcileFromFile call ~300ms after the last relevant event.
+func (s *Scheduler) watchLoop(w *fsnotify.Watcher) {
+	defer close(s.watchDone)
+	target := filepath.Clean(s.path)
+	var debounce *time.Timer
+	defer func() {
+		if debounce != nil {
+			debounce.Stop()
+		}
+	}()
+	for {
+		select {
+		case ev, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if filepath.Clean(ev.Name) != target {
+				continue
+			}
+			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
+				continue
+			}
+			if debounce != nil {
+				debounce.Stop()
+			}
+			debounce = time.AfterFunc(300*time.Millisecond, s.reconcileFromFile)
+		case err, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			s.logger.Printf("warning: file watch error: %v", err)
+		}
+	}
+}
+
+// reconcileFromFile re-reads schedules.json and diffs it against the live,
+// in-memory set. This is what makes hand-edits to the file take effect
+// without a restart:
+//   - an id present in the file but not in memory is armed and tagged
+//     SourceFile (unless the file entry already carries an explicit Source);
+//   - an id present in both, whose content differs, is re-armed from the new
+//     definition and tagged SourceFile (a hand-edit overriding a tool-created
+//     schedule still counts as external provenance going forward);
+//   - an id present in memory but missing from the file is left alone —
+//     deliberately NOT disarmed, so an external edit can never silently kill
+//     a running schedule; it's simply re-persisted on the next Create/Cancel.
+//
+// Re-firing this on the scheduler's own save() writes is expected and
+// harmless: at that point the file matches s.items exactly, so the diff finds
+// nothing to do and returns without notifying or re-saving.
+func (s *Scheduler) reconcileFromFile() {
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			s.logger.Printf("warning: file watch: read failed: %v", err)
+		}
+		return
+	}
+	var fileItems []*Schedule
+	if err := json.Unmarshal(b, &fileItems); err != nil {
+		s.logger.Printf("warning: file watch: parse failed: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	var notify []*Schedule
+	var kinds []string
+	changed := false
+	for _, fsc := range fileItems {
+		if fsc.ID == "" {
+			continue
+		}
+		cur, exists := s.items[fsc.ID]
+		var kind string
+		switch {
+		case !exists:
+			kind = "added"
+		case cur.Text != fsc.Text || cur.Cron != fsc.Cron || !cur.FireAt.Equal(fsc.FireAt) || cur.ChatID != fsc.ChatID:
+			kind = "modified"
+			fsc.CreatedAt = cur.CreatedAt // preserve original creation time
+		default:
+			continue // identical to what's already armed — likely our own save()
+		}
+		if fsc.Source == "" {
+			fsc.Source = SourceFile
+		}
+		if exists {
+			s.disarm(fsc.ID)
+		}
+		if err := s.arm(fsc); err != nil {
+			s.logger.Printf("warning: file watch: dropping unarmable schedule %s: %v", fsc.ID, err)
+			if exists {
+				delete(s.items, fsc.ID) // it was armed a moment ago; now genuinely gone
+			}
+			continue
+		}
+		s.items[fsc.ID] = fsc
+		changed = true
+		notify = append(notify, fsc)
+		kinds = append(kinds, kind)
+	}
+	if changed {
+		if err := s.save(); err != nil {
+			s.logger.Printf("warning: file watch: persist after reconcile failed: %v", err)
+		}
+	}
+	ext := s.external
+	s.mu.Unlock()
+
+	for i, sc := range notify {
+		s.logger.Printf("external schedule %s (%s): id=%s cron=%q chat=%s", kinds[i], SourceFile, sc.ID, sc.Cron, sc.ChatID)
+		if ext != nil {
+			ext(sc, kinds[i])
+		}
+	}
 }
 
 // newID returns a short random hex id, stable across restarts (unlike a counter).
