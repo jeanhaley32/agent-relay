@@ -20,6 +20,10 @@ On detection it does two things:
   2. Returns decision:"block" with a reason, which for a Stop hook means "do
      not end the turn": the reason is fed back to the model, so it learns that
      the answer it just wrote never reached the user and can resend properly.
+     Kept deliberately terse - the mechanism ("a plain-text answer stays in the
+     terminal and is NOT delivered") is already appended to every injected
+     message, so restating it here only burns context on every detection. The
+     only genuinely new information is that THIS answer was not delivered.
 
 Returning the miss to the model - rather than auto-forwarding the orphaned
 text - is deliberate. The text could be a draft or mid-thought fragment, so
@@ -228,24 +232,9 @@ def main():
         print(json.dumps({
             "decision": "block",
             "reason": (
-                "DELIVERY FAILURE - your last answer never reached the user.\n\n"
-                "What happened: you wrote the answer as plain assistant text instead of "
-                "calling mcp__relay__reply.\n\n"
-                "Why that means it was not delivered: this session runs headless on a "
-                "remote box. Text you emit is only rendered into a terminal that the user "
-                "cannot see - it is not a slow send or a failed send, it is not a transport "
-                "at all. mcp__relay__reply is the ONLY thing that transmits to the user's "
-                "Telegram/Discord. Anything not passed to that tool is discarded.\n\n"
-                "Why you saw no error: no send was ever attempted, so there was nothing to "
-                "fail. No tool call means no tool result, no error, and no metric. Do NOT "
-                "treat clean logs or an absence of errors as evidence that a message was "
-                "delivered - for this failure mode they look identical to success.\n\n"
-                "This is a known recurring pattern, not a one-off. Guard against it: an "
-                "answer is only sent once mcp__relay__reply has actually been called.\n\n"
-                "Do this now: call mcp__relay__reply%s with the answer you just wrote. "
-                "Actually call the tool - do not describe what you would send. If that text "
-                "was internal narration rather than the user's answer, call the tool with "
-                "the real answer instead."
+                "Your last answer was NOT delivered: you wrote it as terminal text "
+                "without calling mcp__relay__reply, so no send was attempted and no "
+                "error was raised. Send it now via mcp__relay__reply%s."
             ) % (' with chat_id="%s"' % chat_id if chat_id else ""),
         }))
 
