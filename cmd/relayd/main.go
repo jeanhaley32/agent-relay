@@ -249,6 +249,25 @@ func main() {
 	}
 	defer tracker.Close()
 
+	// externalSchedule notifies the live session the moment the scheduler's
+	// file watcher finds a schedule in schedules.json that didn't arrive via
+	// a schedule_message tool call (e.g. a hand-edit while relayd is
+	// running). It's informational only — no pending event, no ack_event
+	// required, and the schedule stays armed either way; this just keeps
+	// provenance visible in real time instead of only via list_schedules.
+	externalSchedule := func(sc *scheduler.Schedule, kind string) {
+		text := fmt.Sprintf(
+			"[schedule %s via file edit — provenance: file] id=%s cron=%q chat_id=%s\ntext: %q\n\n"+
+				"This schedule was found in schedules.json without a matching schedule_message tool call. "+
+				"It is already armed and will fire normally — no action required unless you want to review or cancel it.",
+			kind, sc.ID, sc.Cron, sc.ChatID, sc.Text,
+		)
+		_ = back.Send(context.Background(), relay.Message{
+			ConversationID: sc.ChatID, Role: relay.User, Text: text,
+			Meta: map[string]string{"chat_id": sc.ChatID, "external_schedule": "1"},
+		})
+	}
+
 	sched, err := scheduler.New(cfg.Scheduler.File, loc, func(scheduleID, chatID, text string) error {
 		// Record a pending event (persisted first) and inject it; the tracker
 		// follows it to acknowledgment and escalates if it is ignored. An error
@@ -259,7 +278,7 @@ func main() {
 			return err
 		}
 		return nil
-	}, logger)
+	}, externalSchedule, logger)
 	if err != nil {
 		logger.Fatalf("scheduler: %v", err)
 	}
@@ -331,7 +350,7 @@ func main() {
 	// this same host, no need to expose it beyond localhost. Also hosts
 	// /webhook/reply-drift and /webhook/token-usage, hence needing b now
 	// that it exists.
-	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, *cfgPath)
+	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, sched, logger, b, *cfgPath)
 
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
@@ -582,9 +601,16 @@ type grafanaWebhookPayload struct {
 // path the scheduler uses (back.Send), rather than notifying Telegram
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
-func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) {
-	mux := newRelaydMux(back, adminChatID, acc, meter, front, discordFront, tracker, logger, b, cfgPath)
-	addr := "127.0.0.1:9210"
+func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, sched *scheduler.Scheduler, logger *log.Logger, b *relay.Broker, cfgPath string) {
+	mux := newRelaydMux(back, adminChatID, acc, meter, front, discordFront, tracker, sched, logger, b, cfgPath)
+	// Shared with scripts/detect-reply-drift.py (and any other hook that calls
+	// back into relayd): both read RELAY_WEBHOOK_ADDR and fall back to the same
+	// default, so moving the port moves both instead of silently breaking the
+	// hooks that hardcoded it.
+	addr := os.Getenv("RELAY_WEBHOOK_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:9210"
+	}
 	// Fatalf on bind failure, matching the approval listeners above: a silent
 	// failure here would leave /metrics, /webhook/token-usage,
 	// /webhook/reload-caps and /webhook/grafana all unreachable with nothing
@@ -602,7 +628,7 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 // newRelaydMux builds the loopback-only observability/webhook mux served by
 // serveGrafanaWebhook. Split out so tests can exercise each handler directly
 // via httptest without starting a real listener.
-func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, logger *log.Logger, b *relay.Broker, cfgPath string) *http.ServeMux {
+func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, sched *scheduler.Scheduler, logger *log.Logger, b *relay.Broker, cfgPath string) *http.ServeMux {
 	mux := http.NewServeMux()
 	// Exposes two things the admin dashboard/alert rule needs: unauthorized
 	// senders queued internally by access.Manager.Record (otherwise only
@@ -620,6 +646,11 @@ func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manag
 		pausedNum := 0
 		if snap.Paused {
 			pausedNum = 1
+		}
+		// sched is nil in some tests that don't exercise scheduling.
+		var outOfBandCount int
+		if sched != nil {
+			outOfBandCount = sched.OutOfBandCount()
 		}
 		// Discord frontend is optional (cfg.Discord.Enabled) - report zeros
 		// rather than omitting the series when it's off, so alert rules
@@ -715,7 +746,10 @@ func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manag
 				"relayd_discord_last_gateway_event_seconds %d\n"+
 				"# HELP relayd_reply_drift_total Turns where the model answered a relay event in plain terminal text without calling the reply tool, so nothing was ever sent - detected by a Stop hook scanning the transcript, see scripts/detect-reply-drift.py.\n"+
 				"# TYPE relayd_reply_drift_total counter\n"+
-				"relayd_reply_drift_total %d\n",
+				"relayd_reply_drift_total %d\n"+
+				"# HELP relayd_schedules_out_of_band Currently-armed schedules last detected as added/modified via a direct schedules.json edit rather than the schedule_message tool (Source=file).\n"+
+				"# TYPE relayd_schedules_out_of_band gauge\n"+
+				"relayd_schedules_out_of_band %d\n",
 			acc.TotalRecorded(), len(acc.Pending()), len(acc.Allowlist()),
 			snap.PercentUsed, snap.Used, snap.Limit, snap.WindowLeft.Seconds(),
 			stateNum, pausedNum,
@@ -725,6 +759,7 @@ func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manag
 			discordSendFailures, discordPermanentDrops, discordQueueDepth,
 			discordRecvDrops, discordGatewayReconnects, discordLastGatewayEventAt,
 			replyDriftTotal.Load(),
+			outOfBandCount,
 		)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(body))
@@ -907,7 +942,13 @@ func handleSchedule(sched *scheduler.Scheduler, req claudebk.SchedRequest) (stri
 		var b strings.Builder
 		fmt.Fprintf(&b, "%d active schedule(s):\n", len(list))
 		for _, sc := range list {
-			fmt.Fprintf(&b, "  %s — %s — %q\n", sc.ID, describeSchedule(sched, sc), sc.Text)
+			// Provenance only called out when it's not the default (tool) —
+			// keeps normal listings uncluttered, still surfaces the exception.
+			src := ""
+			if sc.EffectiveSource() != scheduler.SourceTool {
+				src = fmt.Sprintf(" [source: %s]", sc.EffectiveSource())
+			}
+			fmt.Fprintf(&b, "  %s — %s%s — %q\n", sc.ID, describeSchedule(sched, sc), src, sc.Text)
 		}
 		return strings.TrimRight(b.String(), "\n"), ""
 	case ipc.OpScheduleCancel:
