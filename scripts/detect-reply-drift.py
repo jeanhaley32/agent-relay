@@ -14,18 +14,44 @@ produced non-trivial text (a real answer, not just tool-call chatter) but no
 mcp__relay__reply tool_use appears anywhere after the channel event, this is
 drift - report it to relayd, which counts it as relayd_reply_drift_total.
 
-Deliberately observability-only, not auto-forwarding: the orphaned text
-could be a draft or mid-thought fragment, not necessarily what the model
-would send if it noticed the miss itself (Jean's explicit call, 2026-07-14).
+On detection it does two things:
 
-Respects stop_hook_active to avoid ever blocking/looping - this hook never
-blocks the stop at all, it only reports after the fact.
+  1. Reports to relayd (relayd_reply_drift_total) - the observability half.
+  2. Returns decision:"block" with a reason, which for a Stop hook means "do
+     not end the turn": the reason is fed back to the model, so it learns that
+     the answer it just wrote never reached the user and can resend properly.
+
+Returning the miss to the model - rather than auto-forwarding the orphaned
+text - is deliberate. The text could be a draft or mid-thought fragment, so
+the model, not the relay, decides what is actually fit to send (Jean's call,
+2026-07-14). This closes the loop that made drift self-perpetuating: writing
+terminal text produces NO tool result, no error, no signal of any kind, so
+without this the model has no way to know it failed and reports success in
+good faith.
+
+Loop safety: stop_hook_active short-circuits the whole check, so the model is
+nudged at most once per drift episode and can never be trapped in a
+block/continue cycle.
 """
 import json
+import os
+import re
 import sys
 import urllib.request
 
-DRIFT_WEBHOOK = "http://127.0.0.1:9210/webhook/reply-drift"
+# Shared port convention: relayd and this hook both read RELAY_WEBHOOK_ADDR and
+# both fall back to the same default, so changing the port in one place moves
+# both. (Previously each hardcoded 127.0.0.1:9210 independently, which silently
+# breaks the hook the moment relayd is moved to another port.)
+WEBHOOK_ADDR = os.environ.get("RELAY_WEBHOOK_ADDR", "127.0.0.1:9210")
+DRIFT_WEBHOOK = f"http://{WEBHOOK_ADDR}/webhook/reply-drift"
+
+# Only the tail of the transcript is needed: we care about the LAST relay event
+# and the turns after it. Reading the whole file cost 1.7s per turn on a 104MB
+# session transcript - and this hook runs after EVERY turn, on a file that only
+# grows. Read a tail window instead, and fall back to the full file if the
+# window happens not to contain a relay event (very long turns).
+TAIL_BYTES = 4 * 1024 * 1024
 CHANNEL_MARKER = '<channel source="relay"'
 REPLY_TOOL_NAME = "mcp__relay__reply"
 MIN_TEXT_LEN = 20  # ignore trivial/whitespace-only assistant text blocks
@@ -36,6 +62,7 @@ def message_text(content):
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
+        print(f"message_text: unexpected content type {type(content)!r}", file=sys.stderr)
         return ""
     parts = []
     for block in content:
@@ -66,30 +93,50 @@ def main():
     if not transcript_path:
         return
 
-    try:
-        with open(transcript_path) as f:
-            lines = f.readlines()
-    except OSError:
-        return
-
-    records = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    def load(tail_only):
+        """Parse transcript records, optionally only the tail window."""
         try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+            with open(transcript_path, "rb") as f:
+                if tail_only:
+                    size = os.fstat(f.fileno()).st_size
+                    if size > TAIL_BYTES:
+                        f.seek(size - TAIL_BYTES)
+                        f.readline()  # discard the partial first line
+                raw = f.read()
+        except OSError:
+            return None
+        out = []
+        for line in raw.split(b"\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        return out
 
-    # Find the last user turn carrying a relay channel event.
-    last_channel_idx = None
-    for i, rec in enumerate(records):
-        if rec.get("type") != "user":
-            continue
-        text = message_text(rec.get("message", {}).get("content"))
-        if CHANNEL_MARKER in text:
-            last_channel_idx = i
+    def last_channel(records):
+        idx = None
+        for i, rec in enumerate(records):
+            if rec.get("type") != "user":
+                continue
+            if CHANNEL_MARKER in message_text(rec.get("message", {}).get("content")):
+                idx = i
+        return idx
+
+    records = load(tail_only=True)
+    if records is None:
+        return
+    last_channel_idx = last_channel(records)
+    if last_channel_idx is None:
+        # No relay event in the tail window - re-read the whole file before
+        # concluding this session has never seen one, so correctness never
+        # depends on the window size.
+        records = load(tail_only=False)
+        if records is None:
+            return
+        last_channel_idx = last_channel(records)
 
     if last_channel_idx is None:
         return  # this session has never seen a relay event - nothing to check
@@ -107,12 +154,48 @@ def main():
         if len(text.strip()) >= MIN_TEXT_LEN:
             produced_text = True
 
+    # Pull chat_id out of the channel tag so the feedback can name the exact
+    # destination instead of making the model go re-find it.
+    chat_id = ""
+    m = re.search(r'chat_id="([^"]+)"',
+                  message_text(records[last_channel_idx].get("message", {}).get("content")))
+    if m:
+        chat_id = m.group(1)
+
     if produced_text and not reply_sent:
+        # Observability half: count it even if the feedback below is ignored.
         try:
             req = urllib.request.Request(DRIFT_WEBHOOK, method="POST", data=b"")
             urllib.request.urlopen(req, timeout=2)
         except Exception:
             pass  # relayd may not be running (e.g. dev/test session) - never block on this
+
+        # Feedback half: hand the miss back to the model. For a Stop hook,
+        # decision:"block" means "don't end the turn" - reason is delivered to
+        # the model, which can then send the answer properly.
+        print(json.dumps({
+            "decision": "block",
+            "reason": (
+                "DELIVERY FAILURE - your last answer never reached the user.\n\n"
+                "What happened: you wrote the answer as plain assistant text instead of "
+                "calling mcp__relay__reply.\n\n"
+                "Why that means it was not delivered: this session runs headless on a "
+                "remote box. Text you emit is only rendered into a terminal that the user "
+                "cannot see - it is not a slow send or a failed send, it is not a transport "
+                "at all. mcp__relay__reply is the ONLY thing that transmits to the user's "
+                "Telegram/Discord. Anything not passed to that tool is discarded.\n\n"
+                "Why you saw no error: no send was ever attempted, so there was nothing to "
+                "fail. No tool call means no tool result, no error, and no metric. Do NOT "
+                "treat clean logs or an absence of errors as evidence that a message was "
+                "delivered - for this failure mode they look identical to success.\n\n"
+                "This is a known recurring pattern, not a one-off. Guard against it: an "
+                "answer is only sent once mcp__relay__reply has actually been called.\n\n"
+                "Do this now: call mcp__relay__reply%s with the answer you just wrote. "
+                "Actually call the tool - do not describe what you would send. If that text "
+                "was internal narration rather than the user's answer, call the tool with "
+                "the real answer instead."
+            ) % (' with chat_id="%s"' % chat_id if chat_id else ""),
+        }))
 
 
 if __name__ == "__main__":

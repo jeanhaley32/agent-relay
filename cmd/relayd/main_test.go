@@ -237,7 +237,7 @@ func newTestMux(t *testing.T, adminChatID string) (*http.ServeMux, *relay.Broker
 	}
 
 	acc := access.New(nil, nil, "", logger)
-	mux := newRelaydMux(back, adminChatID, acc, meter, nil, nil, tr, logger, b, cfgPath)
+	mux := newRelaydMux(back, adminChatID, acc, meter, nil, nil, tr, nil, logger, b, cfgPath)
 	return mux, b
 }
 
