@@ -15,7 +15,12 @@ import (
 // back to terminal-only answers over a long session.
 func TestReplyReminder(t *testing.T) {
 	r := replyReminder("6369276467")
-	for _, want := range []string{"reply tool", `chat_id="6369276467"`, "NOT delivered"} {
+	// Assert the contract, not its phrasing: name the tool, name the exact
+	// destination, say terminal text is not delivered, and say the "[to: ...]"
+	// label is not itself a send - the model read the label as a delivery and
+	// stopped calling the tool (2026-07-20).
+	for _, want := range []string{"reply tool", `chat_id="6369276467"`,
+		"never delivered", "does not send it", "[to: terminal]"} {
 		if !strings.Contains(r, want) {
 			t.Fatalf("reminder missing %q: %s", want, r)
 		}
