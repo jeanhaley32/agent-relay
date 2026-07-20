@@ -12,6 +12,13 @@ CHANNEL = {"type": "user", "timestamp": "2026-07-19T21:00:00Z", "message": {"con
     {"type": "text", "text": '<channel source="relay" chat_id="6369276467">question</channel>'}]}}
 TEXT = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"content": [
     {"type": "text", "text": "A substantive answer that was only written to the terminal."}]}}
+# Declared outputs. Every model output must name its recipient: "terminal" for
+# internal notes, a chat_id for a person. The declaration is what lets the hook
+# tell narration apart from an answer the user never received.
+NOTE = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"content": [
+    {"type": "text", "text": "[to: terminal] Checking the log before I answer this one."}]}}
+ADDRESSED = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"content": [
+    {"type": "text", "text": "[to: 6369276467] Here is the answer you asked for, at length."}]}}
 REPLY = {"type": "assistant", "timestamp": "2026-07-19T21:00:06Z", "message": {"content": [
     {"type": "tool_use", "name": "mcp__relay__reply",
      "input": {"chat_id": "6369276467", "text": "sent"}}]}}
@@ -44,12 +51,18 @@ results = []
 results.append(check("text only -> block", run([CHANNEL, TEXT]), True))
 # Answered properly.
 results.append(check("reply only -> silent", run([CHANNEL, REPLY]), False))
-# Thinking aloud, then actually sending: not drift.
-results.append(check("text then reply -> silent", run([CHANNEL, TEXT, REPLY]), False))
+# Thinking aloud (declared to the terminal), then actually sending: not drift.
+results.append(check("terminal note then reply -> silent", run([CHANNEL, NOTE, REPLY]), False))
+# Addressed to a person AND put through the reply tool: the correct pattern.
+results.append(check("addressed + reply -> silent", run([CHANNEL, ADDRESSED, REPLY]), False))
+# Addressed to a person but never sent: the exact failure this exists to catch.
+results.append(check("addressed, never sent -> block", run([CHANNEL, ADDRESSED]), True))
+# No recipient declared at all: kicked back so the model states its intent.
+results.append(check("undeclared text -> block", run([CHANNEL, TEXT, REPLY]), True))
 # Trailing narration after a real send is NOT drift. Treating it as drift made
 # the model re-send already-delivered messages, so the user got everything
 # twice (73 false detections, 2026-07-19). Only "user got nothing" counts.
-results.append(check("REPLY then text -> silent (no duplicate resends)", run([CHANNEL, REPLY, TEXT]), False))
+results.append(check("REPLY then terminal note -> silent (no duplicate resends)", run([CHANNEL, REPLY, NOTE]), False))
 # Loop guard: never nudge twice, or the model can be trapped block/continue.
 results.append(check("stop_hook_active -> silent", run([CHANNEL, TEXT], stop_hook_active=True), False))
 # No relay traffic in this session at all: nothing to judge.

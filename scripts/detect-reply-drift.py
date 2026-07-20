@@ -76,6 +76,20 @@ def message_text(content):
     return "\n".join(parts)
 
 
+# Every output must declare who it is for: "[to: terminal]" for internal
+# reasoning, "[to: <chat_id>]" for a person. Declaring intent is what makes this
+# decidable - without it, "narration" and "an answer the user never got" are
+# indistinguishable in the transcript, which is what produced both missed drift
+# and 73 duplicate resends.
+DECLARATION = re.compile(r"^\s*\[to:\s*([^\]]{1,64})\]", re.I)
+
+
+def declaration(text):
+    """Return the declared recipient, or None if the text declares none."""
+    m = DECLARATION.match(text.strip())
+    return m.group(1).strip().lower() if m else None
+
+
 def has_reply_tool_call(content):
     if not isinstance(content, list):
         return False
@@ -188,25 +202,28 @@ def main():
     if last_channel_idx is None:
         return  # this session has never seen a relay event - nothing to check
 
-    # Drift means the user got NOTHING: text after the last relay event with no
-    # reply at all. Do NOT treat "replied, then wrote more text" as drift - that
-    # trailing text is almost always narration about the send ("Folded into the
-    # existing report", "Sent - brief note"), not undelivered content. Flagging
-    # it made the model re-send messages it had already delivered, so the user
-    # received everything twice (73 false detections, 2026-07-19). The
-    # ambiguous case costs a duplicate; the unambiguous one costs silence, so
-    # only the unambiguous one is worth acting on.
+    # Walk the turn and classify each substantial output by its declaration.
     reply_sent = False
-    produced_text = False
+    undeclared = False        # output with no recipient at all
+    addressed_unsent = False  # addressed to a person but never put through reply
     for rec in records[last_channel_idx + 1:]:
         if rec.get("type") != "assistant":
             continue
         content = rec.get("message", {}).get("content")
         if has_reply_tool_call(content):
             reply_sent = True
-            break  # the user received something for this event - not drift
-        if len(message_text(content).strip()) >= MIN_TEXT_LEN:
-            produced_text = True
+            continue
+        text = message_text(content).strip()
+        if len(text) < MIN_TEXT_LEN:
+            continue
+        who = declaration(text)
+        if who is None:
+            undeclared = True
+        elif who != "terminal":
+            # Addressed to a person. Only real if nothing was ever sent for this
+            # event - trailing "[to: terminal]" narration after a genuine reply
+            # must never trigger a resend (that was the duplicate bug).
+            addressed_unsent = True
 
     # Pull chat_id out of the channel tag so the feedback can name the exact
     # destination instead of making the model go re-find it.
@@ -216,25 +233,27 @@ def main():
     if m:
         chat_id = m.group(1)
 
-    if produced_text and not reply_sent:
-        # Observability half: count it even if the feedback below is ignored.
-        try:
-            req = urllib.request.Request(DRIFT_WEBHOOK, method="POST", data=b"")
-            urllib.request.urlopen(req, timeout=2)
-        except Exception:
-            pass  # relayd may not be running (e.g. dev/test session) - never block on this
+    if not (undeclared or (addressed_unsent and not reply_sent)):
+        return
 
-        # Feedback half: hand the miss back to the model. For a Stop hook,
-        # decision:"block" means "don't end the turn" - reason is delivered to
-        # the model, which can then send the answer properly.
-        print(json.dumps({
-            "decision": "block",
-            "reason": (
-                "Your last answer was NOT delivered: you wrote it as terminal text "
-                "without calling mcp__relay__reply, so no send was attempted and no "
-                "error was raised. Send it now via mcp__relay__reply%s."
-            ) % (' with chat_id="%s"' % chat_id if chat_id else ""),
-        }))
+    try:
+        req = urllib.request.Request(DRIFT_WEBHOOK, method="POST", data=b"")
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass  # relayd may not be running (dev/test) - never block on this
+
+    target = ' with chat_id="%s"' % chat_id if chat_id else ""
+    if addressed_unsent and not reply_sent:
+        reason = ("You addressed output to a person but never called "
+                  "mcp__relay__reply, so it was not delivered. Send it now%s." % target)
+    else:
+        # Undeclared: ask for the declaration, and deliberately do NOT say
+        # "resend" - an imperative here made the model re-send messages it had
+        # already delivered.
+        reason = ("Declare a recipient on every output: \"[to: terminal]\" for internal "
+                  "notes, or \"[to: <chat_id>]\" for a person (which must also go through "
+                  "mcp__relay__reply). Your last output declared none%s." % target)
+    print(json.dumps({"decision": "block", "reason": reason}))
 
 
 if __name__ == "__main__":
