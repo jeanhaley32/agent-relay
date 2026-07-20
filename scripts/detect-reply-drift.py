@@ -84,10 +84,38 @@ def message_text(content):
 DECLARATION = re.compile(r"^\s*\[to:\s*([^\]]{1,64})\]", re.I)
 
 
+def valid_recipients(chat_id):
+    """Recipients a declaration may name: the terminal, or a real chat_id.
+
+    A declaration naming anything else (a typo, a person's name, a hallucinated
+    id) addresses nobody, so prompting a send would push the answer at a
+    destination that does not exist. Those are dropped instead - the model is
+    told the recipient was invalid, not told to send.
+    """
+    ids = set()
+    if chat_id:
+        ids.add(str(chat_id))
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "allowlist.json")) as f:
+            for cid in json.load(f).get("allowed", []):
+                ids.add(str(cid))
+    except Exception:
+        pass  # allowlist unreadable: fall back to the event's own chat_id
+    return ids
+
+
 def declaration(text):
     """Return the declared recipient, or None if the text declares none."""
     m = DECLARATION.match(text.strip())
     return m.group(1).strip().lower() if m else None
+
+
+def channel_chat_id(records, idx):
+    """chat_id from the relay tag, so feedback names the exact destination."""
+    m = re.search(r'chat_id="([^"]+)"',
+                  message_text(records[idx].get("message", {}).get("content")))
+    return m.group(1) if m else ""
 
 
 def has_reply_tool_call(content):
@@ -206,6 +234,8 @@ def main():
     reply_sent = False
     undeclared = False        # output with no recipient at all
     addressed_unsent = False  # addressed to a person but never put through reply
+    bad_recipient = None      # declared a recipient that does not exist
+    valid_ids = valid_recipients(channel_chat_id(records, last_channel_idx))
     for rec in records[last_channel_idx + 1:]:
         if rec.get("type") != "assistant":
             continue
@@ -219,21 +249,19 @@ def main():
         who = declaration(text)
         if who is None:
             undeclared = True
-        elif who != "terminal":
-            # Addressed to a person. Only real if nothing was ever sent for this
-            # event - trailing "[to: terminal]" narration after a genuine reply
-            # must never trigger a resend (that was the duplicate bug).
+        elif who == "terminal":
+            pass  # internal note - never a delivery, never a resend prompt
+        elif who not in valid_ids:
+            bad_recipient = who  # addressed to nobody real: drop, do not send
+        else:
+            # Addressed to a real person. Only drift if nothing was ever sent
+            # for this event - trailing "[to: terminal]" narration after a
+            # genuine reply must never trigger a resend (the duplicate bug).
             addressed_unsent = True
 
-    # Pull chat_id out of the channel tag so the feedback can name the exact
-    # destination instead of making the model go re-find it.
-    chat_id = ""
-    m = re.search(r'chat_id="([^"]+)"',
-                  message_text(records[last_channel_idx].get("message", {}).get("content")))
-    if m:
-        chat_id = m.group(1)
+    chat_id = channel_chat_id(records, last_channel_idx)
 
-    if not (undeclared or (addressed_unsent and not reply_sent)):
+    if not (undeclared or bad_recipient or (addressed_unsent and not reply_sent)):
         return
 
     try:
@@ -243,9 +271,16 @@ def main():
         pass  # relayd may not be running (dev/test) - never block on this
 
     target = ' with chat_id="%s"' % chat_id if chat_id else ""
-    if addressed_unsent and not reply_sent:
-        reason = ("You addressed output to a person but never called "
-                  "mcp__relay__reply, so it was not delivered. Send it now%s." % target)
+    if bad_recipient:
+        # Dropped, not resent: there is no such destination, so telling the
+        # model to "send it" would just aim the answer at nobody.
+        reason = ('"%s" is not a valid recipient, so that output was dropped. Use '
+                  '"[to: terminal]" or a real chat_id%s.' % (bad_recipient, target))
+    elif addressed_unsent and not reply_sent:
+        reason = ("Writing \"[to: <chat_id>]\" in the terminal does NOT send anything - it "
+                  "only labels the text, and nothing was delivered. This is not a duplicate "
+                  "or a lagged hook. Call mcp__relay__reply%s now; it is the first and only "
+                  "send." % target)
     else:
         # Undeclared: ask for the declaration, and deliberately do NOT say
         # "resend" - an imperative here made the model re-send messages it had

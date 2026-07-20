@@ -51,9 +51,11 @@ func main() {
 			`answer, call the reply tool with the chat_id from the tag. `+
 			`Declare a recipient on EVERY message you write: begin it with "[to: terminal]" `+
 			`if it is an internal note only you read, or "[to: <chat_id>]" if it is for a `+
-			`person - and a message addressed to a person must also be sent with the reply `+
-			`tool, because writing it in the terminal does not deliver it. Undeclared output `+
-			`is rejected and handed back to you. `+
+			`person. The label is NOT a send - it only records who you meant it for. To `+
+			`actually reach a person you must call the reply tool: call it FIRST with the `+
+			`full answer, then, if you want a terminal note, write "[to: terminal] sent". `+
+			`Never write an answer for a person as terminal text and expect it to arrive - `+
+			`it will not, and you will be asked to send it. Undeclared output is rejected. `+
 			`You can also schedule things for later: when the user asks to be reminded `+
 			`or to run something on a schedule, call schedule_message (cron for recurring, `+
 			`in_seconds for a one-shot). You may also schedule a self-wakeup to resume a `+
@@ -124,9 +126,9 @@ const outboundBuffer = 256
 // Re-asserting the contract on each message (terse, clearly namespaced) makes
 // that drift impossible. chatID is echoed because the reply tool needs it.
 func replyReminder(chatID string) string {
-	return "\n\n(relay: start every message with [to: terminal] for internal notes or [to: " +
-		chatID + "] for the user; anything for the user must also go through the reply tool " +
-		"with chat_id=\"" + chatID + "\", since terminal text is NOT delivered.)"
+	return "\n\n(relay: answer by CALLING the reply tool with chat_id=\"" + chatID +
+		"\" - terminal text is never delivered, and labelling it [to: " + chatID +
+		"] does not send it. Label internal notes [to: terminal].)"
 }
 
 // schedTimeout bounds how long a schedule tool waits for the daemon to answer.

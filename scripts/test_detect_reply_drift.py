@@ -63,6 +63,16 @@ results.append(check("undeclared text -> block", run([CHANNEL, TEXT, REPLY]), Tr
 # the model re-send already-delivered messages, so the user got everything
 # twice (73 false detections, 2026-07-19). Only "user got nothing" counts.
 results.append(check("REPLY then terminal note -> silent (no duplicate resends)", run([CHANNEL, REPLY, NOTE]), False))
+# A declaration naming nobody real (typo, hallucinated id, a person's name):
+# dropped with an explanation, NOT turned into a send at a bogus destination.
+BADDR = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"content": [
+    {"type": "text", "text": "[to: jean] An answer addressed to a recipient that does not exist."}]}}
+results.append(check("invalid recipient -> block", run([CHANNEL, BADDR]), True))
+_bad = run([CHANNEL, BADDR]) or {}
+results.append(check("invalid recipient reason says dropped, not 'send it'",
+                     {"decision": "block"} if ("not a valid recipient" in _bad.get("reason", "")
+                                               and "Send it now" not in _bad.get("reason", "")) else None,
+                     True))
 # Loop guard: never nudge twice, or the model can be trapped block/continue.
 results.append(check("stop_hook_active -> silent", run([CHANNEL, TEXT], stop_hook_active=True), False))
 # No relay traffic in this session at all: nothing to judge.
