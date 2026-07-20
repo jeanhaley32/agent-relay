@@ -261,7 +261,17 @@ def main():
 
     chat_id = channel_chat_id(records, last_channel_idx)
 
-    if not (undeclared or bad_recipient or (addressed_unsent and not reply_sent)):
+    # If anything was delivered for this event, say nothing at all. A missing or
+    # bogus "[to: ...]" label on trailing narration is cosmetic once the user has
+    # their answer - but any nudge here reads to the model as "that turn didn't
+    # land", and its repair instinct is to re-send the whole message. That is
+    # exactly what happened at 04:09 on 2026-07-20: correct send at 04:08:57,
+    # undeclared trailing line, kickback, identical text sent again 10s later.
+    # Wording alone can't prevent it (the message never said "resend"), so the
+    # only reliable guard is not to speak after a successful delivery.
+    if reply_sent:
+        return
+    if not (undeclared or bad_recipient or addressed_unsent):
         return
 
     try:

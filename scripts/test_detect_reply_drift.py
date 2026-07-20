@@ -57,8 +57,9 @@ results.append(check("terminal note then reply -> silent", run([CHANNEL, NOTE, R
 results.append(check("addressed + reply -> silent", run([CHANNEL, ADDRESSED, REPLY]), False))
 # Addressed to a person but never sent: the exact failure this exists to catch.
 results.append(check("addressed, never sent -> block", run([CHANNEL, ADDRESSED]), True))
-# No recipient declared at all: kicked back so the model states its intent.
-results.append(check("undeclared text -> block", run([CHANNEL, TEXT, REPLY]), True))
+# No recipient declared and nothing sent: kicked back so the model states its
+# intent. (With a reply present this must stay silent - see the 04:09 case.)
+results.append(check("undeclared text, nothing sent -> block", run([CHANNEL, TEXT]), True))
 # Trailing narration after a real send is NOT drift. Treating it as drift made
 # the model re-send already-delivered messages, so the user got everything
 # twice (73 false detections, 2026-07-19). Only "user got nothing" counts.
@@ -73,6 +74,17 @@ results.append(check("invalid recipient reason says dropped, not 'send it'",
                      {"decision": "block"} if ("not a valid recipient" in _bad.get("reason", "")
                                                and "Send it now" not in _bad.get("reason", "")) else None,
                      True))
+# Regression, 2026-07-20: a correct send followed by an undeclared trailing
+# line produced a kickback, and the model repaired it by re-sending the whole
+# message - the user got the identical text twice, 10s apart. Once anything has
+# been delivered for an event, the hook must stay silent whatever the trailing
+# text looks like.
+results.append(check("reply then UNDECLARED text -> silent (real duplicate, 04:09)",
+                     run([CHANNEL, REPLY, TEXT]), False))
+results.append(check("reply then bad recipient -> silent",
+                     run([CHANNEL, REPLY, BADDR]), False))
+results.append(check("reply then addressed text -> silent",
+                     run([CHANNEL, REPLY, ADDRESSED]), False))
 # Loop guard: never nudge twice, or the model can be trapped block/continue.
 results.append(check("stop_hook_active -> silent", run([CHANNEL, TEXT], stop_hook_active=True), False))
 # No relay traffic in this session at all: nothing to judge.
