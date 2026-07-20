@@ -46,10 +46,10 @@ results.append(check("text only -> block", run([CHANNEL, TEXT]), True))
 results.append(check("reply only -> silent", run([CHANNEL, REPLY]), False))
 # Thinking aloud, then actually sending: not drift.
 results.append(check("text then reply -> silent", run([CHANNEL, TEXT, REPLY]), False))
-# The bug that let 6 live tests pass while the user got nothing: the old code
-# broke out of the scan at the first reply, so trailing unsent text was never
-# examined. Drift is "the turn ENDED with unsent text", not "no reply existed".
-results.append(check("REPLY then text -> block  (regression: 2026-07-19)", run([CHANNEL, REPLY, TEXT]), True))
+# Trailing narration after a real send is NOT drift. Treating it as drift made
+# the model re-send already-delivered messages, so the user got everything
+# twice (73 false detections, 2026-07-19). Only "user got nothing" counts.
+results.append(check("REPLY then text -> silent (no duplicate resends)", run([CHANNEL, REPLY, TEXT]), False))
 # Loop guard: never nudge twice, or the model can be trapped block/continue.
 results.append(check("stop_hook_active -> silent", run([CHANNEL, TEXT], stop_hook_active=True), False))
 # No relay traffic in this session at all: nothing to judge.

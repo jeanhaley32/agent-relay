@@ -188,27 +188,25 @@ def main():
     if last_channel_idx is None:
         return  # this session has never seen a relay event - nothing to check
 
-    # Drift is "the turn ENDED with text that was never sent", not "no reply
-    # ever happened". Scanning for any reply and stopping there was wrong: the
-    # model routinely replies first and then writes more text (a status note, a
-    # test message), and that trailing text is exactly the drift we care about.
-    # Breaking on the first reply masked every one of those - 4 real tests in a
-    # row reported clean while the user got nothing (2026-07-19).
-    #
-    # So: walk forward and track whether there is text still outstanding. Text
-    # sets it; a reply clears it (that text was superseded by an actual send).
-    # Whatever the state is when the turn ends is the verdict.
-    pending_text = False
+    # Drift means the user got NOTHING: text after the last relay event with no
+    # reply at all. Do NOT treat "replied, then wrote more text" as drift - that
+    # trailing text is almost always narration about the send ("Folded into the
+    # existing report", "Sent - brief note"), not undelivered content. Flagging
+    # it made the model re-send messages it had already delivered, so the user
+    # received everything twice (73 false detections, 2026-07-19). The
+    # ambiguous case costs a duplicate; the unambiguous one costs silence, so
+    # only the unambiguous one is worth acting on.
+    reply_sent = False
+    produced_text = False
     for rec in records[last_channel_idx + 1:]:
         if rec.get("type") != "assistant":
             continue
         content = rec.get("message", {}).get("content")
         if has_reply_tool_call(content):
-            pending_text = False
-            continue
+            reply_sent = True
+            break  # the user received something for this event - not drift
         if len(message_text(content).strip()) >= MIN_TEXT_LEN:
-            pending_text = True
-    produced_text, reply_sent = pending_text, not pending_text
+            produced_text = True
 
     # Pull chat_id out of the channel tag so the feedback can name the exact
     # destination instead of making the model go re-find it.
