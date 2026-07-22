@@ -39,16 +39,16 @@ const (
 
 // Record is one line in the log.
 type Record struct {
-	TS       string `json:"ts"`
-	MsgID    string `json:"msg_id"`
-	Event    string `json:"event"`
-	Frontend string `json:"frontend,omitempty"` // telegram | discord
-	ChatID   string `json:"chat_id,omitempty"`
-	FromID   string `json:"from_id,omitempty"`
+	TS        string `json:"ts"`
+	MsgID     string `json:"msg_id"`
+	Event     string `json:"event"`
+	Frontend  string `json:"frontend,omitempty"` // telegram | discord
+	ChatID    string `json:"chat_id,omitempty"`
+	FromID    string `json:"from_id,omitempty"`
 	InReplyTo string `json:"in_reply_to,omitempty"` // links a reply back to the inbound msg_id
-	Bytes    int    `json:"bytes,omitempty"`        // message length; body is NOT logged
-	Detail   string `json:"detail,omitempty"`       // reason for gate_blocked/dropped, provider id for send_ok
-	Err      string `json:"err,omitempty"`
+	Bytes     int    `json:"bytes,omitempty"`       // message length; body is NOT logged
+	Detail    string `json:"detail,omitempty"`      // reason for gate_blocked/dropped, provider id for send_ok
+	Err       string `json:"err,omitempty"`
 }
 
 // Logger appends Records to a JSONL file.
