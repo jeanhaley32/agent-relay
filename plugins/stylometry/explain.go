@@ -5,33 +5,27 @@ import (
 	"time"
 )
 
-// FeatureDeviation is one dimension's contribution to an anomaly score: how
-// far this window's value sits from the average of the sender's own nearest
-// historical points on that single dimension.
+// FeatureDeviation is one dimension's distance from the sender's baseline.
 type FeatureDeviation struct {
 	Feature     string  `json:"feature"`
 	Value       float32 `json:"value"`
 	BaselineAvg float32 `json:"baseline_avg"`
-	Delta       float32 `json:"delta"` // Value - BaselineAvg; sign matters, not just magnitude
+	Delta       float32 `json:"delta"`
 }
 
-// Explanation is the full, inspectable record of one scored window — not
-// just the bare number relay.AnomalyDetector.Score returns. Built so a human
-// (or the model, via the JSONL log EventLog writes) can answer "what
-// actually caused this alert" instead of trusting a float blind.
+// Explanation is the full record of one scored batch, not just the bare
+// number relay.AnomalyDetector.Score returns.
 type Explanation struct {
 	UserID        string             `json:"user_id"`
 	At            time.Time          `json:"at"`
-	Window        string             `json:"window"` // the concatenated WindowSize-message text that was scored
+	Window        string             `json:"window"`
 	Score         float64            `json:"score"`
-	NeighborCount int                `json:"neighbor_count"` // how many historical points this was compared against; 0 means "not enough history yet"
+	NeighborCount int                `json:"neighbor_count"`
 	TopDeviations []FeatureDeviation `json:"top_deviations,omitempty"`
 }
 
-// topDeviations compares vec against the average of neighbors (both in
-// ExtractFeatures' dimension order) and returns the n dimensions with the
-// largest absolute delta, most-deviant first — the actual answer to "what
-// about this message looked unlike the sender," not just a distance number.
+// topDeviations returns the n dimensions with the largest absolute delta
+// between vec and the average of neighbors, most-deviant first.
 func topDeviations(vec []float32, neighbors [][]float32, n int) []FeatureDeviation {
 	if len(neighbors) == 0 {
 		return nil

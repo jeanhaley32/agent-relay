@@ -8,10 +8,8 @@ import (
 	"sync"
 )
 
-// EventLog appends one JSON line per scored window to a plain file — the
-// "open interface" for inspecting what caused an alert: readable with
-// `cat`/`grep`/`jq`, no query API needed, since whoever's asking "what
-// caused that" already has shell access to the machine running this.
+// EventLog appends one JSON line per scored batch to a plain file, readable
+// with cat/grep/jq — no query API needed.
 type EventLog struct {
 	Path string
 

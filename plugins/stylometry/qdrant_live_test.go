@@ -23,19 +23,10 @@ func requireLive(t *testing.T) string {
 	return url
 }
 
-// TestLive_ExactRepeatScoresLowerThanOutOfStyle is the real-world proof,
-// scoped to what's actually reliably true of the current feature set: after
-// building a baseline of consistent messages, a verbatim repeat of one of
-// them must score lower (more like the sender) than a message written in a
-// deliberately different register. This is the property that held up
-// against the live instance; a stronger "the out-of-style message crosses
-// some fixed absolute threshold" claim did not hold reliably with this
-// feature set on short messages and is not asserted here — separation is
-// real but modest, and AnomalyThreshold needs tuning against real traffic,
-// not assumed from a handful of test messages. WindowSize=1 here
-// deliberately, since batching is exercised separately by
-// TestLive_RollingWindowWidensSeparation and a single message is what
-// "exact repeat" naturally means.
+// TestLive_ExactRepeatScoresLowerThanOutOfStyle asserts a repeat of a
+// baseline message scores lower than a deliberately out-of-style one.
+// WindowSize=1 here; batching is covered separately by
+// TestLive_BatchingWidensSeparation.
 func TestLive_ExactRepeatScoresLowerThanOutOfStyle(t *testing.T) {
 	baseURL := requireLive(t)
 	ctx := context.Background()
@@ -102,14 +93,9 @@ func TestLive_BelowMinHistoryAlwaysScoresZero(t *testing.T) {
 	}
 }
 
-// TestLive_BatchingWidensSeparation is the measured result behind picking
-// WindowSize=5: with WindowSize=1 (one message per batch), an exact-repeat
-// batch and a deliberately out-of-style batch score close together; with
-// WindowSize=5 (5 messages concatenated per batch), the gap widens
-// substantially. Each call below sends exactly windowSize messages so it
-// lands on a clean batch boundary — the whole point of the earlier
-// sliding-window-to-batching fix was that boundary alignment is what makes
-// the comparison meaningful instead of noisy.
+// TestLive_BatchingWidensSeparation asserts WindowSize=5 separates in-style
+// from out-of-style batches more than WindowSize=1 — the measured result
+// behind picking 5 as the default.
 func TestLive_BatchingWidensSeparation(t *testing.T) {
 	baseURL := requireLive(t)
 	ctx := context.Background()
