@@ -40,6 +40,29 @@ func TestExtractFeatures_FunctionWordFrequencyDiffers(t *testing.T) {
 	}
 }
 
+// TestFeatureNames_MatchesVectorDimensionAndOrder guards the invariant
+// topDeviations depends on: FeatureNames()[i] must label ExtractFeatures'
+// index i, for every i, or explanations would attach the wrong name to the
+// wrong value.
+func TestFeatureNames_MatchesVectorDimensionAndOrder(t *testing.T) {
+	names := FeatureNames()
+	if len(names) != FeatureDim {
+		t.Fatalf("FeatureNames() returned %d names, want %d (FeatureDim)", len(names), FeatureDim)
+	}
+	for i, fw := range functionWords {
+		want := "fw:" + fw
+		if names[i] != want {
+			t.Errorf("names[%d] = %q, want %q", i, names[i], want)
+		}
+	}
+	for i, sn := range shapeFeatureNames {
+		idx := len(functionWords) + i
+		if names[idx] != sn {
+			t.Errorf("names[%d] = %q, want %q", idx, names[idx], sn)
+		}
+	}
+}
+
 func TestExtractFeatures_DeterministicForSameInput(t *testing.T) {
 	a := ExtractFeatures("Hello there, how are you doing today?")
 	b := ExtractFeatures("Hello there, how are you doing today?")

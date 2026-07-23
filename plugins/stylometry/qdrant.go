@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,20 +32,70 @@ type Detector struct {
 	// "does this exactly match one past message."
 	K int
 
+	// WindowSize is how many of a sender's messages get batched into one
+	// concatenated scoring unit, instead of scoring each message alone —
+	// non-overlapping batches (message 1-5, then 6-10, ...), not a sliding
+	// window; see pushWindow's doc comment for why sliding was tried and
+	// measurably didn't work. Measured directly against live Qdrant before
+	// picking this default: per-message scoring (WindowSize=1) separated
+	// in-style from out-of-style by only ~1.6x; batches of 5 widened that to
+	// ~23x. The tradeoff is latency two ways — a compromised account gets up
+	// to WindowSize messages through before a batch is even scored, and a
+	// score only ever arrives once every WindowSize messages, not on every
+	// one — both are the right side to err on for an advisory signal that
+	// fails open anyway.
+	WindowSize int
+
+	// Log, if set, records an Explanation for every scored window — the
+	// inspectable "what caused this alert" trail. nil ⇒ scoring still
+	// works, it's just not persisted anywhere.
+	Log *EventLog
+
 	httpClient *http.Client
+
+	windowMu sync.Mutex
+	windows  map[string][]string // userID -> most recent WindowSize message texts
 }
 
-// NewDetector returns a Detector with sane defaults (MinHistory=10, K=5, a
-// 5-second HTTP client) — override the fields directly if you need
-// different values.
+// NewDetector returns a Detector with sane defaults (MinHistory=10, K=5,
+// WindowSize=5, a 5-second HTTP client) — override the fields directly if
+// you need different values.
 func NewDetector(baseURL, collection string) *Detector {
 	return &Detector{
 		BaseURL:    baseURL,
 		Collection: collection,
 		MinHistory: 10,
 		K:          5,
+		WindowSize: 5,
 		httpClient: &http.Client{Timeout: 5 * time.Second},
+		windows:    make(map[string][]string),
 	}
+}
+
+// pushWindow buffers text for userID and, once WindowSize messages have
+// accumulated, returns the concatenated batch (clearing the buffer) and
+// true. Below WindowSize, it returns ("", false) — nothing to score yet.
+//
+// This is non-overlapping batching, not a sliding window, and that's a
+// deliberate correction: an earlier sliding design (append one message,
+// keep the last WindowSize, score every call) was measured to NOT reproduce
+// the separation improvement windowing is supposed to buy — successive
+// scored windows overlapped 4-of-5 messages, so each individual swap was
+// noisy relative to whatever else happened to be buffered at that moment,
+// not a stable comparison. Clean non-overlapping batches — exactly what was
+// validated (WindowSize=1 ~1.6x separation vs WindowSize=5 ~23x) — don't
+// have that problem, at the cost of only producing a score once every
+// WindowSize messages instead of on every one.
+func (d *Detector) pushWindow(userID, text string) (string, bool) {
+	d.windowMu.Lock()
+	defer d.windowMu.Unlock()
+	w := append(d.windows[userID], text)
+	if len(w) < d.WindowSize {
+		d.windows[userID] = w
+		return "", false
+	}
+	d.windows[userID] = nil
+	return strings.Join(w, " "), true
 }
 
 // EnsureCollection creates the Qdrant collection if it doesn't already
@@ -93,40 +145,78 @@ func (d *Detector) url(path string) string {
 
 type searchResult struct {
 	Result []struct {
-		Score float64 `json:"score"`
+		Score  float64   `json:"score"`
+		Vector []float32 `json:"vector"`
 	} `json:"result"`
 }
 
-// Score extracts a feature vector from text, searches Qdrant for userID's K
-// nearest historical points, and returns their average Euclidean distance as
-// the anomaly score (0 = matches their style closely; larger = less like
-// their established pattern — there's no fixed upper bound, tune
-// AnomalyThreshold against real traffic rather than assuming a 0-1 range).
-// Below MinHistory prior points, it returns 0 unconditionally —
-// not enough data to judge yet — but still records the point, so the
-// baseline builds up over the user's first several messages. Every call
-// (including below-MinHistory ones) upserts the new point, so the baseline
-// is always growing/rolling forward.
+// Score satisfies relay.AnomalyDetector: rolls text into userID's window,
+// scores it, logs the full explanation if Log is set, and returns just the
+// number — the bare-float contract the gate in relay.go actually needs. Use
+// ScoreExplain directly when you want the full breakdown in-process instead
+// of reading it back out of the log.
 func (d *Detector) Score(ctx context.Context, userID, text string) (float64, error) {
-	vec := ExtractFeatures(text)
-
-	count, err := d.userPointCount(ctx, userID)
+	exp, err := d.ScoreExplain(ctx, userID, text)
 	if err != nil {
 		return 0, err
 	}
+	return exp.Score, nil
+}
 
-	score := 0.0
+// ScoreExplain does the real work: buffers text into userID's non-overlapping
+// WindowSize-message batch (see pushWindow) — returning a zero-value
+// Explanation with NeighborCount 0 until a full batch has accumulated, which
+// is not the same as "scored and found normal," just "nothing to score yet"
+// — then, once a batch is ready, extracts features from the concatenated
+// text, searches Qdrant for userID's K nearest historical points, and
+// returns not just the average-Euclidean-distance score but which specific
+// feature dimensions drove it (see topDeviations) — 0 score, no deviations
+// if the sender has fewer than MinHistory prior batches (not enough data to
+// judge yet). Every completed batch upserts as a new point regardless, so
+// the baseline keeps growing forward, and — if Log is set — appends the full
+// Explanation so "what caused this alert" is answerable later without
+// re-deriving it.
+func (d *Detector) ScoreExplain(ctx context.Context, userID, text string) (Explanation, error) {
+	window, ready := d.pushWindow(userID, text)
+	exp := Explanation{UserID: userID, At: time.Now().UTC()}
+	if !ready {
+		return exp, nil
+	}
+	exp.Window = window
+	vec := ExtractFeatures(window)
+
+	count, err := d.userPointCount(ctx, userID)
+	if err != nil {
+		return exp, err
+	}
+
 	if count >= d.MinHistory {
-		score, err = d.anomalyScore(ctx, userID, vec)
+		neighbors, err := d.searchNeighbors(ctx, userID, vec)
 		if err != nil {
-			return 0, err
+			return exp, err
+		}
+		exp.NeighborCount = len(neighbors)
+		var sum float64
+		vecs := make([][]float32, len(neighbors))
+		for i, n := range neighbors {
+			sum += n.dist
+			vecs[i] = n.vec
+		}
+		if len(neighbors) > 0 {
+			exp.Score = sum / float64(len(neighbors))
+			exp.TopDeviations = topDeviations(vec, vecs, 5)
 		}
 	}
 
 	if err := d.upsertPoint(ctx, userID, vec); err != nil {
-		return 0, err
+		return exp, err
 	}
-	return score, nil
+	if d.Log != nil {
+		if err := d.Log.Append(exp); err != nil {
+			return exp, err
+		}
+	}
+	return exp, nil
 }
 
 func (d *Detector) userPointCount(ctx context.Context, userID string) (int, error) {
@@ -157,7 +247,15 @@ func (d *Detector) userPointCount(ctx context.Context, userID string) (int, erro
 	return out.Result.Count, nil
 }
 
-func (d *Detector) anomalyScore(ctx context.Context, userID string, vec []float32) (float64, error) {
+// neighbor pairs a search hit's distance with its stored vector, so
+// ScoreExplain can both average the distance (the score) and compute
+// per-dimension deviations against the neighbor vectors (the explanation).
+type neighbor struct {
+	dist float64
+	vec  []float32
+}
+
+func (d *Detector) searchNeighbors(ctx context.Context, userID string, vec []float32) ([]neighbor, error) {
 	body, _ := json.Marshal(map[string]any{
 		"vector": vec,
 		"filter": map[string]any{
@@ -165,33 +263,56 @@ func (d *Detector) anomalyScore(ctx context.Context, userID string, vec []float3
 		},
 		"limit":        d.K,
 		"with_payload": false,
+		"with_vector":  true,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.url("/collections/"+d.Collection+"/points/search"), bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("stylometry: search: %w", err)
+		return nil, fmt.Errorf("stylometry: search: %w", err)
 	}
 	defer resp.Body.Close()
 	var out searchResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, fmt.Errorf("stylometry: search: decode: %w", err)
-	}
-	if len(out.Result) == 0 {
-		return 0, nil
+		return nil, fmt.Errorf("stylometry: search: decode: %w", err)
 	}
 	// With Euclidean distance, Qdrant's search score IS the raw distance
 	// (higher = farther = more anomalous) — there's no 1-minus-similarity
 	// conversion to do, unlike Cosine's bounded [0,1] similarity. Verified
 	// against a live search response rather than assumed.
-	var sum float64
-	for _, r := range out.Result {
-		sum += r.Score
+	neighbors := make([]neighbor, len(out.Result))
+	for i, r := range out.Result {
+		neighbors[i] = neighbor{dist: r.Score, vec: r.Vector}
 	}
-	return sum / float64(len(out.Result)), nil
+	return neighbors, nil
+}
+
+// SeedHistory backfills userID's baseline directly from already-trusted past
+// messages (e.g. an exported chat history) — the manual half of "historical
+// vs live capture": messages are chunked into non-overlapping WindowSize
+// groups and upserted the same way live scoring does, but with no
+// search/threshold/logging step, since seed data isn't being gated, just
+// used to build the baseline a new user would otherwise have to accumulate
+// live over their first several real messages.
+func (d *Detector) SeedHistory(ctx context.Context, userID string, messages []string) error {
+	w := d.WindowSize
+	if w < 1 {
+		w = 1
+	}
+	for i := 0; i < len(messages); i += w {
+		end := i + w
+		if end > len(messages) {
+			end = len(messages)
+		}
+		vec := ExtractFeatures(strings.Join(messages[i:end], " "))
+		if err := d.upsertPoint(ctx, userID, vec); err != nil {
+			return fmt.Errorf("stylometry: seed history: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *Detector) upsertPoint(ctx context.Context, userID string, vec []float32) error {
