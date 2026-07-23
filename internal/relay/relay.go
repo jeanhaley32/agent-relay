@@ -127,6 +127,17 @@ type Broker struct {
 	// command itself being Admin: true), affects only non-admins.
 	Lockdown atomic.Bool
 
+	// Anomaly, if set, scores each inbound message against AnomalyThreshold
+	// before it's processed. Crossing it means "this doesn't look like the
+	// sender" - for an admin (per b.Commands.IsAdmin) that revokes their
+	// session and blocks the message, same as an idle-expired session; for
+	// anyone else it just warns AnomalyWarnChatID and lets the message
+	// through, since a non-admin has no session to revoke. nil Anomaly ⇒ no
+	// scoring at all, zero overhead.
+	Anomaly           AnomalyDetector
+	AnomalyThreshold  float64
+	AnomalyWarnChatID string
+
 	// ConversationCaps bounds per-chat_id cumulative token spend, tighter
 	// than and independent of the global Meter budget. Mutate only via
 	// SetCaps. nil map ⇒ no explicit caps.
@@ -488,6 +499,27 @@ func (b *Broker) Run(ctx context.Context) error {
 				continue
 			}
 			b.Session.Touch(m.Meta["from_id"])
+		}
+		// 0.5. Anomaly gate: score the message against the sender's own
+		// history. A detector failure (e.g. the backing store is down) fails
+		// open - this is an advisory signal layered on top of the real
+		// session/allowlist controls, not itself the security boundary, so
+		// an outage here must not lock everyone out.
+		if b.Anomaly != nil {
+			if score, err := b.Anomaly.Score(ctx, m.Meta["from_id"], m.Text); err == nil && score > b.AnomalyThreshold {
+				isAdmin := b.Commands != nil && b.Commands.IsAdmin != nil && b.Commands.IsAdmin(m.Meta["from_id"])
+				if isAdmin && b.Session != nil {
+					b.logEvent(m, eventlog.GateBlocked, "anomaly: admin session revoked, re-auth required", "")
+					b.Session.Revoke(m.Meta["from_id"])
+					b.challengeSession(ctx, m.ConversationID, m.Meta["from_id"])
+					continue
+				}
+				if !isAdmin && b.AnomalyWarnChatID != "" {
+					b.logEvent(m, eventlog.GateBlocked, "anomaly: non-admin flagged, admin warned, message still processed", "")
+					_ = b.Frontend.Send(ctx, AssistantMsg(b.AnomalyWarnChatID,
+						fmt.Sprintf("Anomaly flag: message from %s doesn't match their usual pattern (score %.2f).", m.Meta["from_id"], score)))
+				}
+			}
 		}
 		// 1. Escaped command (`\/…`): strip the backslash and send the literal
 		// "/…" to the model instead of intercepting it as a relay command.
