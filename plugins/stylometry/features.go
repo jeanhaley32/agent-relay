@@ -1,14 +1,9 @@
 // Package stylometry is an optional, opt-in AnomalyDetector implementation
-// for agent-relay (see relay.AnomalyDetector) — a separate Go module so
-// nobody who doesn't want it pays for its dependencies. It scores how well a
+// for agent-relay's relay.AnomalyDetector — a separate Go module so nobody
+// who doesn't want it pays for its dependencies. It scores how well a
 // message matches a sender's historical writing style, backed by Qdrant.
-//
-// This is soft, probabilistic signal, not proof of identity: function-word
-// frequencies and message-shape statistics are the standard stylometry
-// features (harder to fake than content words), but style genuinely varies
-// by mood/context/device, and anyone with access to a sender's message
-// history could deliberately mimic it. Wire this in as an advisory layer on
-// top of real controls (session expiry, allowlists), never as the sole gate.
+// This is soft signal, not proof of identity — wire it in as an advisory
+// layer on top of real controls, never as the sole gate.
 package stylometry
 
 import (
@@ -16,36 +11,27 @@ import (
 	"unicode"
 )
 
-// functionWords are the closed-class English words stylometry research
-// treats as the most person-specific and hardest to deliberately fake —
-// unlike content words, people don't consciously choose "the" vs "a" the way
-// they choose vocabulary, so their relative frequencies are a stable
-// fingerprint of habitual style. This is not an exhaustive list; it's a
-// fixed, ordered set so the resulting feature vector has a stable dimension
-// across every call.
+// functionWords are the closed-class words treated as the hardest to
+// deliberately fake — their relative frequency is a stable fingerprint of
+// habitual style. Fixed and ordered so the feature vector's dimension never
+// changes across calls.
 var functionWords = []string{
 	"the", "a", "an", "and", "but", "or", "so", "if", "of", "to", "in", "on",
 	"at", "for", "with", "that", "this", "it", "is", "was", "are", "were",
 	"i", "you", "we", "they", "not", "just",
 }
 
-// shapeFeatureNames labels the 6 non-function-word dimensions appended after
-// functionWords, in the exact order ExtractFeatures appends them — kept
-// alongside functionWords so FeatureNames() and ExtractFeatures can never
-// drift out of sync with each other.
+// shapeFeatureNames labels the 6 dimensions ExtractFeatures appends after
+// functionWords, in that exact order.
 var shapeFeatureNames = []string{
 	"avg_word_length", "avg_sentence_length", "message_length_words",
 	"punctuation_ratio", "uppercase_ratio", "digit_ratio",
 }
 
-// FeatureDim is the fixed length of every vector ExtractFeatures returns —
-// callers (e.g. the Qdrant collection schema) need this to be stable.
+// FeatureDim is the fixed length of every vector ExtractFeatures returns.
 var FeatureDim = len(functionWords) + len(shapeFeatureNames)
 
-// FeatureNames returns a human-readable label for each dimension of the
-// vector ExtractFeatures returns, in the same order — e.g. "fw:the",
-// "fw:and", ..., "punctuation_ratio". Used to explain which specific
-// dimensions drove an anomaly score, not just report a bare number.
+// FeatureNames labels each dimension ExtractFeatures returns, in order.
 func FeatureNames() []string {
 	names := make([]string, 0, FeatureDim)
 	for _, fw := range functionWords {
@@ -55,13 +41,9 @@ func FeatureNames() []string {
 	return names
 }
 
-// ExtractFeatures computes a fixed-length stylometric feature vector from a
-// single message: function-word frequencies (normalized by word count) plus
-// a handful of shape statistics — average word length, average sentence
-// length, message length in words, punctuation ratio, uppercase-letter
-// ratio, and digit ratio. All frequencies/ratios are normalized to [0,1]-ish
-// ranges (relative to word or character count) so no single long message
-// dominates the vector purely by being long.
+// ExtractFeatures computes a fixed-length stylometric feature vector from
+// text: function-word frequencies plus a handful of normalized shape
+// statistics.
 func ExtractFeatures(text string) []float32 {
 	words := strings.Fields(text)
 	wordCount := float64(len(words))
