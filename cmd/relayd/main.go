@@ -47,6 +47,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 	"github.com/jeanhaley32/agent-relay/internal/session"
+	"github.com/jeanhaley32/agent-relay/plugins/stylometry"
 )
 
 // replyDriftTotal counts turns where the model produced assistant text in
@@ -445,6 +446,22 @@ func main() {
 				return "All admin sessions expired. Your next message (including this reply's delivery) will trigger a tailnet re-auth challenge."
 			},
 		})
+	}
+
+	if cfg.Stylometry.Enabled {
+		det := stylometry.NewDetector(cfg.Stylometry.QdrantURL, cfg.Stylometry.Collection)
+		if cfg.Stylometry.LogPath != "" {
+			det.Log = &stylometry.EventLog{Path: cfg.Stylometry.LogPath}
+		}
+		if err := det.EnsureCollection(context.Background()); err != nil {
+			logger.Printf("stylometry disabled (EnsureCollection: %v)", err)
+		} else {
+			b.Anomaly = det
+			b.AnomalyThreshold = cfg.Stylometry.Threshold
+			b.AnomalyWarnChatID = cfg.Stylometry.WarnChatID
+			logger.Printf("stylometry enabled: collection=%s threshold=%.2f",
+				cfg.Stylometry.Collection, cfg.Stylometry.Threshold)
+		}
 	}
 
 	logger.Printf("relayd up — tier=%s, socket=%s, allowed=%d sender(s), admins=%d",
