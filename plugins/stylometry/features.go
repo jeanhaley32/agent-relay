@@ -29,9 +29,31 @@ var functionWords = []string{
 	"i", "you", "we", "they", "not", "just",
 }
 
+// shapeFeatureNames labels the 6 non-function-word dimensions appended after
+// functionWords, in the exact order ExtractFeatures appends them — kept
+// alongside functionWords so FeatureNames() and ExtractFeatures can never
+// drift out of sync with each other.
+var shapeFeatureNames = []string{
+	"avg_word_length", "avg_sentence_length", "message_length_words",
+	"punctuation_ratio", "uppercase_ratio", "digit_ratio",
+}
+
 // FeatureDim is the fixed length of every vector ExtractFeatures returns —
 // callers (e.g. the Qdrant collection schema) need this to be stable.
-var FeatureDim = len(functionWords) + 6
+var FeatureDim = len(functionWords) + len(shapeFeatureNames)
+
+// FeatureNames returns a human-readable label for each dimension of the
+// vector ExtractFeatures returns, in the same order — e.g. "fw:the",
+// "fw:and", ..., "punctuation_ratio". Used to explain which specific
+// dimensions drove an anomaly score, not just report a bare number.
+func FeatureNames() []string {
+	names := make([]string, 0, FeatureDim)
+	for _, fw := range functionWords {
+		names = append(names, "fw:"+fw)
+	}
+	names = append(names, shapeFeatureNames...)
+	return names
+}
 
 // ExtractFeatures computes a fixed-length stylometric feature vector from a
 // single message: function-word frequencies (normalized by word count) plus

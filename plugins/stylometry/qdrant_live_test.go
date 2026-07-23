@@ -32,7 +32,10 @@ func requireLive(t *testing.T) string {
 // some fixed absolute threshold" claim did not hold reliably with this
 // feature set on short messages and is not asserted here — separation is
 // real but modest, and AnomalyThreshold needs tuning against real traffic,
-// not assumed from a handful of test messages.
+// not assumed from a handful of test messages. WindowSize=1 here
+// deliberately, since batching is exercised separately by
+// TestLive_RollingWindowWidensSeparation and a single message is what
+// "exact repeat" naturally means.
 func TestLive_ExactRepeatScoresLowerThanOutOfStyle(t *testing.T) {
 	baseURL := requireLive(t)
 	ctx := context.Background()
@@ -40,6 +43,7 @@ func TestLive_ExactRepeatScoresLowerThanOutOfStyle(t *testing.T) {
 
 	d := NewDetector(baseURL, "stylometry_live_test")
 	d.MinHistory = 5
+	d.WindowSize = 1
 	if err := d.EnsureCollection(ctx); err != nil {
 		t.Fatalf("EnsureCollection: %v", err)
 	}
@@ -95,5 +99,155 @@ func TestLive_BelowMinHistoryAlwaysScoresZero(t *testing.T) {
 	}
 	if score != 0 {
 		t.Fatalf("expected score 0 for a user with no history yet, got %.3f", score)
+	}
+}
+
+// TestLive_BatchingWidensSeparation is the measured result behind picking
+// WindowSize=5: with WindowSize=1 (one message per batch), an exact-repeat
+// batch and a deliberately out-of-style batch score close together; with
+// WindowSize=5 (5 messages concatenated per batch), the gap widens
+// substantially. Each call below sends exactly windowSize messages so it
+// lands on a clean batch boundary — the whole point of the earlier
+// sliding-window-to-batching fix was that boundary alignment is what makes
+// the comparison meaningful instead of noisy.
+func TestLive_BatchingWidensSeparation(t *testing.T) {
+	baseURL := requireLive(t)
+	ctx := context.Background()
+
+	styleA := []string{
+		"I think we should look at the numbers again before deciding.",
+		"The report is ready and I sent it to the team this morning.",
+		"Can you check if the server is still running fine today?",
+		"I was thinking about the plan and it makes sense to me now.",
+		"We should probably wait until the tests are done before shipping.",
+	}
+	styleB := []string{
+		"yo lol nah fr fr bro thats crazy no cap deadass",
+		"ngl this hits different fr, lowkey obsessed rn tbh",
+		"bruh moment fr, cant even rn lmaooo dead",
+		"sheesh that slaps ngl, bussin fr fr no cap",
+		"lowkey vibing rn ngl, this energy is unmatched fr",
+	}
+
+	// sendBatch sends exactly windowSize messages, which always completes
+	// exactly one batch given a fresh (or already batch-aligned) buffer.
+	sendBatch := func(d *Detector, userID string, msgs []string, windowSize int) float64 {
+		t.Helper()
+		var last float64
+		for i := 0; i < windowSize; i++ {
+			s, err := d.Score(ctx, userID, msgs[i%len(msgs)])
+			if err != nil {
+				t.Fatalf("Score: %v", err)
+			}
+			last = s
+		}
+		return last
+	}
+
+	gapFor := func(windowSize int) float64 {
+		userID := fmt.Sprintf("stylometry-window-test-%d-%d", windowSize, time.Now().UnixNano())
+		d := NewDetector(baseURL, "stylometry_live_test")
+		d.MinHistory = 2
+		d.WindowSize = windowSize
+		if err := d.EnsureCollection(ctx); err != nil {
+			t.Fatalf("EnsureCollection: %v", err)
+		}
+		// Two baseline batches to clear MinHistory, then one repeat-of-A
+		// batch and one out-of-style (B) batch, each on a clean boundary.
+		sendBatch(d, userID, styleA, windowSize)
+		sendBatch(d, userID, styleA, windowSize)
+		repeat := sendBatch(d, userID, styleA, windowSize)
+		out := sendBatch(d, userID, styleB, windowSize)
+		return out - repeat
+	}
+
+	gap1 := gapFor(1)
+	gap5 := gapFor(5)
+	t.Logf("gap at WindowSize=1: %.4f, WindowSize=5: %.4f", gap1, gap5)
+	if gap5 <= gap1 {
+		t.Fatalf("expected WindowSize=5 to separate in-style from out-of-style more than WindowSize=1 (gap1=%.4f, gap5=%.4f)", gap1, gap5)
+	}
+}
+
+// TestLive_SeedHistoryEnablesImmediateScoring is the real-world proof for
+// the manual historical-backfill path: after SeedHistory, a fresh user (who
+// has never sent a live message) should already score against that seeded
+// baseline instead of needing to accumulate MinHistory live first.
+func TestLive_SeedHistoryEnablesImmediateScoring(t *testing.T) {
+	baseURL := requireLive(t)
+	ctx := context.Background()
+	userID := fmt.Sprintf("stylometry-seed-test-%d", time.Now().UnixNano())
+
+	d := NewDetector(baseURL, "stylometry_live_test")
+	d.MinHistory = 1
+	d.WindowSize = 3
+	if err := d.EnsureCollection(ctx); err != nil {
+		t.Fatalf("EnsureCollection: %v", err)
+	}
+
+	history := []string{
+		"I think we should look at the numbers again.",
+		"The report is ready and I sent it this morning.",
+		"Can you check if the server is running fine?",
+		"I was thinking about the plan, makes sense now.",
+		"We should wait until the tests are done first.",
+		"The results look good, want to double check.",
+	}
+	if err := d.SeedHistory(ctx, userID, history); err != nil {
+		t.Fatalf("SeedHistory: %v", err)
+	}
+
+	count, err := d.userPointCount(ctx, userID)
+	if err != nil {
+		t.Fatalf("userPointCount: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("expected SeedHistory to have created at least one baseline point")
+	}
+
+	// A full WindowSize=3 batch is needed to complete a scored batch; only
+	// the last of these 3 calls actually reaches Qdrant with a result.
+	postSeed := []string{
+		"I think we should check the report once more.",
+		"Can you look at this again when you get a chance?",
+		"The numbers seem fine but let's verify tomorrow.",
+	}
+	var exp Explanation
+	for _, msg := range postSeed {
+		exp, err = d.ScoreExplain(ctx, userID, msg)
+		if err != nil {
+			t.Fatalf("ScoreExplain after seed: %v", err)
+		}
+	}
+	if exp.NeighborCount == 0 {
+		t.Fatal("expected the first completed batch after seeding to already have neighbors to compare against")
+	}
+}
+
+// TestLive_ScoreExplainLogsToEventLog confirms Log actually gets written to
+// when set — the "open interface" for inspecting what caused an alert.
+func TestLive_ScoreExplainLogsToEventLog(t *testing.T) {
+	baseURL := requireLive(t)
+	ctx := context.Background()
+	userID := fmt.Sprintf("stylometry-log-test-%d", time.Now().UnixNano())
+	logPath := t.TempDir() + "/events.jsonl"
+
+	d := NewDetector(baseURL, "stylometry_live_test")
+	d.WindowSize = 1 // one message is one complete batch, simplest case for this test
+	d.Log = &EventLog{Path: logPath}
+	if err := d.EnsureCollection(ctx); err != nil {
+		t.Fatalf("EnsureCollection: %v", err)
+	}
+
+	if _, err := d.ScoreExplain(ctx, userID, "a message that should get logged"); err != nil {
+		t.Fatalf("ScoreExplain: %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("expected the log file to have been created: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected at least one logged line")
 	}
 }
