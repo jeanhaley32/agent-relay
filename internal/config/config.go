@@ -16,11 +16,24 @@ import (
 
 // Config is the top-level daemon configuration.
 type Config struct {
-	Telegram  TelegramConfig  `json:"telegram"`
-	Discord   DiscordConfig   `json:"discord"`
-	Claude    ClaudeConfig    `json:"claude"`
-	Budget    BudgetConfig    `json:"budget"`
-	Scheduler SchedulerConfig `json:"scheduler"`
+	Telegram   TelegramConfig   `json:"telegram"`
+	Discord    DiscordConfig    `json:"discord"`
+	Claude     ClaudeConfig     `json:"claude"`
+	Budget     BudgetConfig     `json:"budget"`
+	Scheduler  SchedulerConfig  `json:"scheduler"`
+	Stylometry StylometryConfig `json:"stylometry"`
+}
+
+// StylometryConfig configures the optional Qdrant-backed anomaly detector
+// (plugins/stylometry). Plain data only, so this package never imports the
+// detector itself — cmd/relayd wires the two together.
+type StylometryConfig struct {
+	Enabled    bool    `json:"enabled"`
+	QdrantURL  string  `json:"qdrant_url"`
+	Collection string  `json:"collection"`
+	Threshold  float64 `json:"threshold"`
+	WarnChatID string  `json:"warn_chat_id"`
+	LogPath    string  `json:"log_path"`
 }
 
 type SchedulerConfig struct {
