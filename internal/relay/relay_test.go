@@ -412,6 +412,146 @@ func TestSessionGate(t *testing.T) {
 	}
 }
 
+// stubAnomalyDetector returns a fixed score for every call, and records which
+// (userID, text) pairs it was asked to score.
+type stubAnomalyDetector struct {
+	score float64
+	err   error
+}
+
+func (s *stubAnomalyDetector) Score(ctx context.Context, userID, text string) (float64, error) {
+	return s.score, s.err
+}
+
+// TestAnomalyGate_AdminRevokesSession covers the admin branch: a message
+// scoring above AnomalyThreshold from a sender b.Commands.IsAdmin recognizes
+// must revoke their session and block the message, exactly like an
+// idle-expired session — never reach the backend.
+func TestAnomalyGate_AdminRevokesSession(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+	appr := approval.NewManager("http://tailnet.example")
+	sess := session.NewManager(30 * time.Minute)
+	sess.Activate("admin-chat") // starts with a valid session
+
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Session:           sess,
+		Approval:          appr,
+		SessionGatedUsers: map[string]bool{"admin-chat": true},
+		SessionTTL:        2 * time.Second,
+		Anomaly:           &stubAnomalyDetector{score: 0.99},
+		AnomalyThreshold:  0.5,
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "re-authenticate") {
+			t.Fatalf("expected a re-auth challenge after an anomalous admin message, got %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an anomaly-triggered re-auth challenge on the frontend")
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("anomalous admin message reached the backend instead of being blocked: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+	if sess.Active("admin-chat") {
+		t.Fatal("expected the admin's session to be revoked, still shows active")
+	}
+}
+
+// TestAnomalyGate_NonAdminWarnsButPasses covers the non-admin branch: there's
+// no session to revoke, so the message is still forwarded, but the
+// configured admin chat gets a warning.
+func TestAnomalyGate_NonAdminWarnsButPasses(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(id string) bool { return id == "admin-chat" }
+
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Anomaly:           &stubAnomalyDetector{score: 0.99},
+		AnomalyThreshold:  0.5,
+		AnomalyWarnChatID: "admin-chat",
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "toth-chat", "from_id": "toth-chat"}}
+
+	select {
+	case m := <-front.sent:
+		if m.ConversationID != "admin-chat" || !strings.Contains(m.Text, "Anomaly flag") {
+			t.Fatalf("expected an anomaly warning delivered to the admin chat, got conv=%q text=%q", m.ConversationID, m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an anomaly warning on the frontend")
+	}
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the flagged non-admin message to still reach the backend")
+	}
+}
+
+// TestAnomalyGate_BelowThresholdIsANoOp covers the common case: a score that
+// doesn't cross AnomalyThreshold must not warn, revoke, or otherwise disturb
+// normal message flow.
+func TestAnomalyGate_BelowThresholdIsANoOp(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return false }
+
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Anomaly:           &stubAnomalyDetector{score: 0.1},
+		AnomalyThreshold:  0.5,
+		AnomalyWarnChatID: "admin-chat",
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "toth-chat", "from_id": "toth-chat"}}
+
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the below-threshold message to reach the backend")
+	}
+	select {
+	case m := <-front.sent:
+		t.Fatalf("expected no warning for a below-threshold score, got %q", m.Text)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+}
+
 // TestSessionGateDenied covers the challengeSession poller's deny branch
 // (relay.go's StatusDenied/StatusExpired case): a denied decision must NOT
 // activate the session, must clear challengeInFlight so a later message

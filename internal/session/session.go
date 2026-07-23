@@ -67,3 +67,13 @@ func (m *Manager) ExpireAll() {
 	defer m.mu.Unlock()
 	m.active = make(map[string]time.Time)
 }
+
+// Revoke immediately invalidates userID's session alone, forcing just that
+// identity to re-authenticate on its next message — the single-user
+// counterpart to ExpireAll, for a targeted "this one looks compromised"
+// signal (e.g. an anomaly detector) rather than kicking everyone off.
+func (m *Manager) Revoke(userID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.active, userID)
+}
