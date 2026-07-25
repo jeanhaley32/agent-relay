@@ -451,3 +451,39 @@ func TestSplitMidFailureQueuesRemainingInOrder(t *testing.T) {
 		t.Fatalf("QueueDepth = %d, want %d (the failed chunk plus every chunk after it)", got, wantQueued)
 	}
 }
+
+// TestSafeErrRedactsToken proves the bot token never survives into a logged
+// error string. A transport-level failure yields a *url.Error whose Error()
+// embeds the full request URL — token and all — so SafeErr must strip it.
+func TestSafeErrRedactsToken(t *testing.T) {
+	const secret = "123456:AAHsuperSecretBotTokenValue"
+
+	// Point at a closed port so f.http.Do fails at the transport level, giving
+	// a real *url.Error that wraps the token-bearing request URL.
+	f := New(secret,
+		WithBaseURL("http://127.0.0.1:1"),
+		WithHTTPClient(&http.Client{Timeout: time.Second}),
+		WithPollTimeout(0))
+	defer f.Close()
+
+	_, err := f.Me(context.Background())
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if !strings.Contains(err.Error(), secret) {
+		t.Fatalf("test premise broken: raw error should embed the token, got %q", err.Error())
+	}
+	if got := f.SafeErr(err); strings.Contains(got, secret) {
+		t.Fatalf("SafeErr leaked the token: %q", got)
+	}
+
+	// nil and empty-token edge cases.
+	if got := f.SafeErr(nil); got != "<nil>" {
+		t.Fatalf("SafeErr(nil) = %q, want <nil>", got)
+	}
+	empty := New("", WithBaseURL("http://127.0.0.1:1"), WithPollTimeout(0))
+	defer empty.Close()
+	if got := empty.SafeErr(err); got != err.Error() {
+		t.Fatalf("empty-token SafeErr should passthrough, got %q", got)
+	}
+}
