@@ -455,6 +455,14 @@ func TestAnomalyGate_AdminRevokesSession(t *testing.T) {
 
 	select {
 	case m := <-front.sent:
+		if !strings.Contains(m.Text, "doesn't match your usual writing pattern") {
+			t.Fatalf("expected an anomaly notice to the tripping sender, got %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an anomaly notice on the frontend")
+	}
+	select {
+	case m := <-front.sent:
 		if !strings.Contains(m.Text, "re-authenticate") {
 			t.Fatalf("expected a re-auth challenge after an anomalous admin message, got %q", m.Text)
 		}
@@ -495,6 +503,14 @@ func TestAnomalyGate_NonAdminWarnsButPasses(t *testing.T) {
 
 	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "toth-chat", "from_id": "toth-chat"}}
 
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "doesn't match your usual writing pattern") {
+			t.Fatalf("expected an anomaly notice to the tripping sender, got conv=%q text=%q", m.ConversationID, m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an anomaly notice on the frontend")
+	}
 	select {
 	case m := <-front.sent:
 		if m.ConversationID != "admin-chat" || !strings.Contains(m.Text, "Anomaly flag") {
