@@ -510,12 +510,16 @@ func (b *Broker) Run(ctx context.Context) error {
 				isAdmin := b.Commands != nil && b.Commands.IsAdmin != nil && b.Commands.IsAdmin(m.Meta["from_id"])
 				if isAdmin && b.Session != nil {
 					b.logEvent(m, eventlog.GateBlocked, "anomaly: admin session revoked, re-auth required", "")
+					_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID,
+						fmt.Sprintf("This message doesn't match your usual writing pattern (score %.2f) - your session has been revoked as a precaution.", score)))
 					b.Session.Revoke(m.Meta["from_id"])
 					b.challengeSession(ctx, m.ConversationID, m.Meta["from_id"])
 					continue
 				}
 				if !isAdmin && b.AnomalyWarnChatID != "" {
 					b.logEvent(m, eventlog.GateBlocked, "anomaly: non-admin flagged, admin warned, message still processed", "")
+					_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID,
+						fmt.Sprintf("This message doesn't match your usual writing pattern (score %.2f) - flagged for review.", score)))
 					_ = b.Frontend.Send(ctx, AssistantMsg(b.AnomalyWarnChatID,
 						fmt.Sprintf("Anomaly flag: message from %s doesn't match their usual pattern (score %.2f).", m.Meta["from_id"], score)))
 				}
