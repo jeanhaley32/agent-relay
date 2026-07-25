@@ -59,6 +59,66 @@ import (
 // exactly this pattern.
 var replyDriftTotal atomic.Int64
 
+// adminTarget is one admin's reachable chat on a specific frontend: its chat
+// id plus that frontend's Send. Admin escalations (tool-approval prompts,
+// scheduler last-line-of-defense DMs, Grafana alerts) fan out to every
+// configured target, so a Discord-only-admin deployment is notified exactly
+// like a Telegram one instead of being silently dropped.
+type adminTarget struct {
+	chatID string
+	send   func(context.Context, relay.Message) error
+}
+
+// errNoAdminConfigured signals that an admin escalation could not be
+// delivered because no admin target is configured, not that a send failed.
+var errNoAdminConfigured = errors.New("relayd: no admin target configured")
+
+// notifyAdmins sends text to every admin target's own frontend. It returns
+// nil if at least one send succeeds, the first error if all fail, and
+// errNoAdminConfigured if there are no targets at all.
+func notifyAdmins(ctx context.Context, targets []adminTarget, text string) error {
+	if len(targets) == 0 {
+		return errNoAdminConfigured
+	}
+	var firstErr error
+	ok := false
+	for _, t := range targets {
+		err := t.send(ctx, relay.Message{
+			ConversationID: t.chatID, Text: text, Meta: map[string]string{"chat_id": t.chatID},
+		})
+		if err == nil {
+			ok = true
+		} else if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if ok {
+		return nil
+	}
+	return firstErr
+}
+
+// buildAdminTargets fans out to every Telegram admin (via the Telegram
+// frontend) plus, when Discord is enabled, every Discord admin (via the
+// Discord frontend). discordFront is nil when Discord is disabled.
+func buildAdminTargets(cfg *config.Config, front *telegram.Frontend, discordFront *discord.Frontend, logger *log.Logger) []adminTarget {
+	var targets []adminTarget
+	for _, admin := range cfg.Telegram.Admins {
+		id := strconv.FormatInt(admin, 10)
+		targets = append(targets, adminTarget{chatID: id, send: front.Send})
+	}
+	if discordFront != nil {
+		ids, err := cfg.Discord.AdminIDs()
+		if err != nil {
+			logger.Printf("admin targets: discord admin ids: %v", err)
+		}
+		for _, id := range ids {
+			targets = append(targets, adminTarget{chatID: id.String(), send: discordFront.Send})
+		}
+	}
+	return targets
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to JSON config file")
 	flag.Parse()
@@ -185,17 +245,17 @@ func main() {
 	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Admin: true, Run: verdict(back, true)})
 	cmds.Register(command.Command{Name: "deny", Help: "admin: reject a tool request: /deny <id>", Admin: true, Run: verdict(back, false)})
 
+	// Admin escalation targets: every configured admin on whichever
+	// frontend(s) they live on (Telegram and/or Discord). A Discord-only-admin
+	// deployment must be reachable exactly like a Telegram one.
+	admins := buildAdminTargets(cfg, front, discordFront, logger)
+
 	// Forward Claude's tool-approval prompts to every admin's chat.
 	go func() {
 		for req := range back.Permissions() {
 			msg := fmt.Sprintf("🔐 Claude wants to use %s\n%s\n\napprove: /allow %s   deny: /deny %s",
 				req.Tool, req.Detail, req.ID, req.ID)
-			for _, admin := range cfg.Telegram.Admins {
-				id := strconv.FormatInt(admin, 10)
-				_ = front.Send(context.Background(), relay.Message{
-					ConversationID: id, Text: msg, Meta: map[string]string{"chat_id": id},
-				})
-			}
+			_ = notifyAdmins(context.Background(), admins, msg)
 		}
 	}()
 
@@ -212,13 +272,6 @@ func main() {
 			loc = l
 		}
 	}
-	// adminChatID is the target for direct-to-Jean escalations and ack receipts.
-	// (Also used by the Grafana webhook below.)
-	adminChatID := ""
-	if len(cfg.Telegram.Admins) > 0 {
-		adminChatID = strconv.FormatInt(cfg.Telegram.Admins[0], 10)
-	}
-
 	// Pending-event tracker: follows every fired trigger until the agent
 	// acknowledges it, escalating (re-inject → direct message to Jean) if it is
 	// silently buried in a busy session. inject reports whether the frame
@@ -232,23 +285,14 @@ func main() {
 		})
 		return back.Connected()
 	}
-	// errNoAdminConfigured signals that an admin escalation could not be
-	// delivered because no admin chat ID is configured, not that the send
-	// itself failed.
-	errNoAdminConfigured := errors.New("relayd: no admin chat id configured")
 	// sendToAdmin returns the send error so the tracker's fallback path can
 	// avoid marking a failed last-line-of-defense escalation as delivered.
 	// With no admin configured there's nobody to escalate to, but that's
-	// still a failure to deliver - report it as one rather than silently
-	// claiming success, so callers don't mistake "delivered" for "no admin".
+	// still a failure to deliver - report it as one (errNoAdminConfigured)
+	// rather than silently claiming success. Fans out to every configured
+	// admin target across whichever frontend(s) they live on.
 	sendToAdmin := func(text string) error {
-		if adminChatID == "" {
-			return errNoAdminConfigured
-		}
-		return front.Send(context.Background(), relay.Message{
-			ConversationID: adminChatID, Text: text,
-			Meta: map[string]string{"chat_id": adminChatID},
-		})
+		return notifyAdmins(context.Background(), admins, text)
 	}
 	// receipt is fire-and-forget (a best-effort audit ping), so it discards the
 	// error; the fallback path uses the error-returning form directly.
@@ -360,7 +404,7 @@ func main() {
 	// this same host, no need to expose it beyond localhost. Also hosts
 	// /webhook/reply-drift and /webhook/token-usage, hence needing b now
 	// that it exists.
-	go serveGrafanaWebhook(back, adminChatID, acc, meter, front, discordFront, tracker, sched, logger, b, *cfgPath)
+	go serveGrafanaWebhook(back, admins, acc, meter, front, discordFront, tracker, sched, logger, b, *cfgPath)
 
 	// Reply-inferred acknowledgment: a model reply landing on a chat after a
 	// trigger fired there is strong evidence the trigger was handled, so
@@ -627,8 +671,8 @@ type grafanaWebhookPayload struct {
 // path the scheduler uses (back.Send), rather than notifying Telegram
 // directly - so the model applies judgment/context before anything reaches
 // the user, instead of Grafana paging around it.
-func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, sched *scheduler.Scheduler, logger *log.Logger, b *relay.Broker, cfgPath string) {
-	mux := newRelaydMux(back, adminChatID, acc, meter, front, discordFront, tracker, sched, logger, b, cfgPath)
+func serveGrafanaWebhook(back *claudebk.Endpoint, admins []adminTarget, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, sched *scheduler.Scheduler, logger *log.Logger, b *relay.Broker, cfgPath string) {
+	mux := newRelaydMux(back, admins, acc, meter, front, discordFront, tracker, sched, logger, b, cfgPath)
 	// Shared with scripts/detect-reply-drift.py (and any other hook that calls
 	// back into relayd): both read RELAY_WEBHOOK_ADDR and fall back to the same
 	// default, so moving the port moves both instead of silently breaking the
@@ -654,7 +698,7 @@ func serveGrafanaWebhook(back *claudebk.Endpoint, adminChatID string, acc *acces
 // newRelaydMux builds the loopback-only observability/webhook mux served by
 // serveGrafanaWebhook. Split out so tests can exercise each handler directly
 // via httptest without starting a real listener.
-func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, sched *scheduler.Scheduler, logger *log.Logger, b *relay.Broker, cfgPath string) *http.ServeMux {
+func newRelaydMux(back *claudebk.Endpoint, admins []adminTarget, acc *access.Manager, meter *budget.Meter, front *telegram.Frontend, discordFront *discord.Frontend, tracker *scheduler.Tracker, sched *scheduler.Scheduler, logger *log.Logger, b *relay.Broker, cfgPath string) *http.ServeMux {
 	mux := http.NewServeMux()
 	// Exposes two things the admin dashboard/alert rule needs: unauthorized
 	// senders queued internally by access.Manager.Record (otherwise only
@@ -865,8 +909,8 @@ func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manag
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if adminChatID == "" {
-			logger.Printf("grafana webhook: no admin chat configured, dropping alert")
+		if len(admins) == 0 {
+			logger.Printf("grafana webhook: no admin target configured, dropping alert")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -885,19 +929,21 @@ func newRelaydMux(back *claudebk.Endpoint, adminChatID string, acc *access.Manag
 			name := a.Labels["alertname"]
 			severity := a.Labels["severity"]
 			summary := a.Annotations["summary"]
-			prompt := fmt.Sprintf(
-				"[Grafana alert, status=%s, severity=%s] %s: %s\n\n"+
-					"Use your judgment on how urgently to surface this to the user via the "+
-					"reply tool (chat_id=\"%s\") - a firing critical alert probably warrants an "+
-					"immediate message, a resolved one may just be worth a brief note, and if "+
-					"you're already mid-investigation on the same subsystem you can fold it into "+
-					"that instead of sending a separate ping.",
-				a.Status, severity, name, summary, adminChatID,
-			)
-			_ = back.Send(context.Background(), relay.Message{
-				ConversationID: adminChatID, Role: relay.User, Text: prompt,
-				Meta: map[string]string{"chat_id": adminChatID, "grafana_alert": "1"},
-			})
+			for _, adm := range admins {
+				prompt := fmt.Sprintf(
+					"[Grafana alert, status=%s, severity=%s] %s: %s\n\n"+
+						"Use your judgment on how urgently to surface this to the user via the "+
+						"reply tool (chat_id=\"%s\") - a firing critical alert probably warrants an "+
+						"immediate message, a resolved one may just be worth a brief note, and if "+
+						"you're already mid-investigation on the same subsystem you can fold it into "+
+						"that instead of sending a separate ping.",
+					a.Status, severity, name, summary, adm.chatID,
+				)
+				_ = back.Send(context.Background(), relay.Message{
+					ConversationID: adm.chatID, Role: relay.User, Text: prompt,
+					Meta: map[string]string{"chat_id": adm.chatID, "grafana_alert": "1"},
+				})
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 	})
