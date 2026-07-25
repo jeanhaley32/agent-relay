@@ -35,6 +35,7 @@ const (
 	SendOK      = "send_ok"      // frontend confirmed delivery
 	SendFailed  = "send_failed"  // delivery failed (err is populated)
 	Dropped     = "dropped"      // discarded internally — the class that used to be silent
+	AnomalyErr  = "anomaly_err"  // anomaly detector failed to score — gate is blind, fails open
 )
 
 // Record is one line in the log.
