@@ -126,11 +126,20 @@ func main() {
 	defer back.Close()
 
 	// Telegram frontend, authorized via the access manager.
-	front := telegram.New(token,
+	telegramOpts := []telegram.Option{
 		telegram.WithAuthorizer(acc),
 		telegram.WithPollTimeout(cfg.Telegram.PollTimeout),
 		telegram.WithLogger(logger),
-	)
+	}
+	if cfg.Telegram.DeniedLogPath != "" {
+		dl, err := telegram.NewFileDeniedLogger(cfg.Telegram.DeniedLogPath)
+		if err != nil {
+			logger.Fatalf("denied-sender log: %v", err)
+		}
+		defer dl.Close()
+		telegramOpts = append(telegramOpts, telegram.WithDeniedLogger(dl))
+	}
+	front := telegram.New(token, telegramOpts...)
 
 	// Handshake: verify the token and identify the bot before serving. Retries
 	// with backoff for up to ~2 minutes before giving up - a bare Fatalf here

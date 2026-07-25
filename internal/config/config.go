@@ -52,6 +52,11 @@ type TelegramConfig struct {
 	Allowlist     []int64 `json:"allowlist"`      // permitted sender user ids
 	AllowlistFile string  `json:"allowlist_file"` // optional: persist approved ids here
 	PollTimeout   int     `json:"poll_timeout"`   // long-poll seconds
+
+	// DeniedLogPath, if set, captures every message attempt from a
+	// non-allowlisted sender (full text, not just id/name) to this JSONL
+	// file. Empty disables it.
+	DeniedLogPath string `json:"denied_log_path"`
 }
 
 // DiscordConfig configures the Discord frontend. Discord is fully optional —
