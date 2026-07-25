@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/approval"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
+	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/session"
 )
 
@@ -565,6 +567,103 @@ func TestAnomalyGate_BelowThresholdIsANoOp(t *testing.T) {
 		t.Fatalf("expected no warning for a below-threshold score, got %q", m.Text)
 	case <-time.After(300 * time.Millisecond):
 		// good
+	}
+}
+
+// TestAnomalyGate_ScoreErrorIsLogged covers the fail-open path: a detector
+// error (store down, timeout) must not silently skip the gate — the outage is
+// recorded to the eventlog so "the detector is blind" is auditable — while the
+// message still flows through (fail open).
+func TestAnomalyGate_ScoreErrorIsLogged(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+
+	logPath := t.TempDir() + "/events.jsonl"
+	ev, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ev.Close()
+
+	b := &Broker{
+		Frontend:         front,
+		Backend:          back,
+		Commands:         cmds,
+		Meter:            budget.New("pro", nil),
+		Events:           ev,
+		Anomaly:          &stubAnomalyDetector{err: errors.New("qdrant unreachable")},
+		AnomalyThreshold: 0.5,
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat", "msg_id": "m1"}}
+
+	// Fails open: message still reaches the backend.
+	select {
+	case m := <-back.got:
+		if m.Text != "hello" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the message to fail open and reach the backend")
+	}
+
+	// The detector error must be recorded, not silently swallowed.
+	if err := ev.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), eventlog.AnomalyErr) || !strings.Contains(string(data), "qdrant unreachable") {
+		t.Fatalf("expected a logged anomaly detector error, got log:\n%s", data)
+	}
+}
+
+// TestAnomalyGate_AdminOverThresholdNoSession covers the gap where Anomaly is
+// configured but Session is nil (a legal combination): an admin scoring over
+// threshold must still get a visible response — a flag notice and, if
+// AnomalyWarnChatID is set, an admin warning — never total silence.
+func TestAnomalyGate_AdminOverThresholdNoSession(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Anomaly:           &stubAnomalyDetector{score: 0.99},
+		AnomalyThreshold:  0.5,
+		AnomalyWarnChatID: "admin-chat",
+		// Session deliberately nil.
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "doesn't match your usual writing pattern") {
+			t.Fatalf("expected an anomaly notice to the tripping admin, got %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an anomaly notice on the frontend, not silence")
+	}
+	select {
+	case m := <-front.sent:
+		if m.ConversationID != "admin-chat" || !strings.Contains(m.Text, "Anomaly flag") {
+			t.Fatalf("expected an admin warning, got conv=%q text=%q", m.ConversationID, m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an admin warning on the frontend")
 	}
 }
 

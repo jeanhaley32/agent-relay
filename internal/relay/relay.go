@@ -506,17 +506,35 @@ func (b *Broker) Run(ctx context.Context) error {
 		// session/allowlist controls, not itself the security boundary, so
 		// an outage here must not lock everyone out.
 		if b.Anomaly != nil {
-			if score, err := b.Anomaly.Score(ctx, m.Meta["from_id"], m.Text); err == nil && score > b.AnomalyThreshold {
+			score, err := b.Anomaly.Score(ctx, m.Meta["from_id"], m.Text)
+			switch {
+			case err != nil:
+				// Detector is blind (store down, timeout, malformed reply). The
+				// gate fails open by design, but silence here lets an attacker
+				// DoS the detector to defeat it unnoticed - so make the outage
+				// auditable instead of skipping quietly.
+				b.logEvent(m, eventlog.AnomalyErr, "anomaly detector failed to score - gate blind, failing open", err.Error())
+			case score > b.AnomalyThreshold:
 				isAdmin := b.Commands != nil && b.Commands.IsAdmin != nil && b.Commands.IsAdmin(m.Meta["from_id"])
-				if isAdmin && b.Session != nil {
+				switch {
+				case isAdmin && b.Session != nil:
 					b.logEvent(m, eventlog.GateBlocked, "anomaly: admin session revoked, re-auth required", "")
 					_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID,
 						fmt.Sprintf("This message doesn't match your usual writing pattern (score %.2f) - your session has been revoked as a precaution.", score)))
 					b.Session.Revoke(m.Meta["from_id"])
 					b.challengeSession(ctx, m.ConversationID, m.Meta["from_id"])
 					continue
-				}
-				if !isAdmin && b.AnomalyWarnChatID != "" {
+				case isAdmin:
+					// No Session to revoke, but an over-threshold admin must never
+					// be a silent no-op: log it, and warn if a chat is configured.
+					b.logEvent(m, eventlog.GateBlocked, "anomaly: admin flagged, no session to revoke", "")
+					_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID,
+						fmt.Sprintf("This message doesn't match your usual writing pattern (score %.2f) - flagged for review.", score)))
+					if b.AnomalyWarnChatID != "" {
+						_ = b.Frontend.Send(ctx, AssistantMsg(b.AnomalyWarnChatID,
+							fmt.Sprintf("Anomaly flag: message from %s doesn't match their usual pattern (score %.2f).", m.Meta["from_id"], score)))
+					}
+				case b.AnomalyWarnChatID != "":
 					b.logEvent(m, eventlog.GateBlocked, "anomaly: non-admin flagged, admin warned, message still processed", "")
 					_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID,
 						fmt.Sprintf("This message doesn't match your usual writing pattern (score %.2f) - flagged for review.", score)))
