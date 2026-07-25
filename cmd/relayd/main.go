@@ -65,6 +65,19 @@ func main() {
 
 	logger := log.New(os.Stderr, "[relayd] ", log.LstdFlags)
 
+	// Tailscale is a hard dependency (see README Requirements) - relayd binds
+	// its admin re-auth/approval flow to the tailscale0 interface. Check for
+	// the interface's existence up front, before any other setup work, and
+	// fail with a clear "Tailscale isn't installed/running" message rather
+	// than letting the user discover it two minutes into an unrelated retry
+	// loop further down. Not having an IP assigned YET is a separate, normal
+	// boot-race case (handled later by tailscaleIPWithRetry) - this check is
+	// only for "the interface doesn't exist at all".
+	if _, err := net.InterfaceByName("tailscale0"); err != nil {
+		logger.Fatalf("Tailscale is required but not found (no tailscale0 interface): %v\n"+
+			"Install Tailscale and run `tailscale up` before starting relayd - see README Requirements.", err)
+	}
+
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		logger.Fatalf("config: %v", err)
@@ -300,7 +313,17 @@ func main() {
 	// link points at. Being able to load the approve page at all is proof
 	// of tailnet membership - stronger than trusting a Telegram chat_id
 	// alone, which is spoofable if that account is ever compromised.
-	appr := approval.NewManager("http://100.99.212.119:9212")
+	//
+	// The bind address is resolved from the tailscale0 interface at startup
+	// rather than hardcoded, so this doesn't silently break (wrong IP baked
+	// into a public binary/repo) if the tailnet IP ever changes. Retried with
+	// the same backoff as the listener below - tailscaled may not have
+	// assigned the interface an address yet this early at boot.
+	tsIP, err := tailscaleIPWithRetry(2*time.Minute, logger)
+	if err != nil {
+		logger.Fatalf("resolve tailscale IP: %v", err)
+	}
+	appr := approval.NewManager(fmt.Sprintf("http://%s:9212", tsIP))
 	reqListener, err := net.Listen("tcp", "127.0.0.1:9211")
 	if err != nil {
 		logger.Fatalf("approval request listener: %v", err)
@@ -314,7 +337,7 @@ func main() {
 	// boot (tailscaled racing relayd) - retry with backoff instead of
 	// silently running with a broken gate, which would permanently lock the
 	// admin out of Telegram control (the re-auth link would 404 forever).
-	appListener, err := listenWithRetry("tcp", "100.99.212.119:9212", 2*time.Minute, logger)
+	appListener, err := listenWithRetry("tcp", fmt.Sprintf("%s:9212", tsIP), 2*time.Minute, logger)
 	if err != nil {
 		logger.Fatalf("approval page listener: %v", err)
 	}
@@ -588,6 +611,52 @@ func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend
 	logger.Printf("connected to Discord (admins=%d, allowlist=%d, guild_messages=%v)",
 		len(adminIDs), len(allowIDs), cfg.Discord.AllowGuildMessages)
 	return front, discordAcc
+}
+
+// tailscaleIP resolves this host's current Tailscale IPv4 address from the
+// tailscale0 interface, so it never needs to be hardcoded (which previously
+// baked one specific IP into a public repo/binary and would silently break
+// if the tailnet IP ever changed).
+func tailscaleIP() (string, error) {
+	iface, err := net.InterfaceByName("tailscale0")
+	if err != nil {
+		return "", fmt.Errorf("tailscale0 interface: %w", err)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", fmt.Errorf("tailscale0 addresses: %w", err)
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip4 := ipNet.IP.To4(); ip4 != nil {
+			return ip4.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no IPv4 address on tailscale0")
+}
+
+// tailscaleIPWithRetry retries tailscaleIP with a fixed 1s backoff until
+// timeout elapses - mirrors listenWithRetry's boot-race handling, since
+// resolving the address has the exact same "interface not up yet" problem
+// as binding to it.
+func tailscaleIPWithRetry(timeout time.Duration, logger *log.Logger) (string, error) {
+	giveUp := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		ip, err := tailscaleIP()
+		if err == nil {
+			return ip, nil
+		}
+		lastErr = err
+		if time.Now().After(giveUp) {
+			return "", fmt.Errorf("giving up after %s: %w", timeout, lastErr)
+		}
+		logger.Printf("tailscale0 not ready yet, retrying: %v", err)
+		time.Sleep(1 * time.Second)
+	}
 }
 
 // listenWithRetry binds addr, retrying with a fixed 1s backoff until
