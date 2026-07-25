@@ -160,9 +160,9 @@ func main() {
 			break
 		}
 		if time.Now().After(handshakeDeadline) {
-			logger.Fatalf("bot connection failed after retrying for 2m (check the %s env var): %v", cfg.Telegram.TokenEnv, err)
+			logger.Fatalf("bot connection failed after retrying for 2m (check the %s env var): %s", cfg.Telegram.TokenEnv, front.SafeErr(err))
 		}
-		logger.Printf("bot handshake failed, retrying in %s: %v", backoff, err)
+		logger.Printf("bot handshake failed, retrying in %s: %s", backoff, front.SafeErr(err))
 		time.Sleep(backoff)
 		if backoff < 15*time.Second {
 			backoff *= 2
