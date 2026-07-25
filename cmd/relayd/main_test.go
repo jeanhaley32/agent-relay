@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -218,7 +219,7 @@ func TestHandleEventListAndAck(t *testing.T) {
 // and the shared test tracker) - enough to drive the method-guard and
 // payload-decode branches of each /webhook/* handler without a real relayd
 // process.
-func newTestMux(t *testing.T, adminChatID string) (*http.ServeMux, *relay.Broker) {
+func newTestMux(t *testing.T, admins []adminTarget) (*http.ServeMux, *relay.Broker) {
 	t.Helper()
 	back, err := claudebk.New(filepath.Join(t.TempDir(), "shim.sock"))
 	if err != nil {
@@ -237,12 +238,12 @@ func newTestMux(t *testing.T, adminChatID string) (*http.ServeMux, *relay.Broker
 	}
 
 	acc := access.New(nil, nil, "", logger)
-	mux := newRelaydMux(back, adminChatID, acc, meter, nil, nil, tr, nil, logger, b, cfgPath)
+	mux := newRelaydMux(back, admins, acc, meter, nil, nil, tr, nil, logger, b, cfgPath)
 	return mux, b
 }
 
 func TestWebhookReplyDriftHandler(t *testing.T) {
-	mux, _ := newTestMux(t, "")
+	mux, _ := newTestMux(t, nil)
 
 	// Wrong method is rejected.
 	rec := httptest.NewRecorder()
@@ -263,7 +264,7 @@ func TestWebhookReplyDriftHandler(t *testing.T) {
 }
 
 func TestWebhookTokenUsageHandler(t *testing.T) {
-	mux, b := newTestMux(t, "")
+	mux, b := newTestMux(t, nil)
 	b.SetCaps(map[string]int64{"chat1": 1000}, 0)
 
 	// Wrong method is rejected.
@@ -290,7 +291,7 @@ func TestWebhookTokenUsageHandler(t *testing.T) {
 }
 
 func TestWebhookReloadCapsHandler(t *testing.T) {
-	mux, _ := newTestMux(t, "")
+	mux, _ := newTestMux(t, nil)
 
 	// Wrong method is rejected.
 	rec := httptest.NewRecorder()
@@ -311,7 +312,7 @@ func TestWebhookReloadCapsHandler(t *testing.T) {
 // Telegram frontend - safe in production where front is always non-nil, but
 // this is the largest handler on the mux and previously had zero coverage.
 func TestMetricsHandler(t *testing.T) {
-	mux, _ := newTestMux(t, "")
+	mux, _ := newTestMux(t, nil)
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -337,7 +338,7 @@ func TestMetricsHandler(t *testing.T) {
 // the handler itself now refuses the alert (503) instead of every other
 // endpoint on the mux silently never existing.
 func TestWebhookGrafanaHandler(t *testing.T) {
-	muxNoAdmin, _ := newTestMux(t, "")
+	muxNoAdmin, _ := newTestMux(t, nil)
 	rec := httptest.NewRecorder()
 	body, _ := json.Marshal(map[string]any{"alerts": []any{}})
 	muxNoAdmin.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/grafana", bytes.NewReader(body)))
@@ -345,7 +346,7 @@ func TestWebhookGrafanaHandler(t *testing.T) {
 		t.Errorf("no admin chat: got status %d, want %d", rec.Code, http.StatusServiceUnavailable)
 	}
 
-	muxAdmin, _ := newTestMux(t, "12345")
+	muxAdmin, _ := newTestMux(t, []adminTarget{testTarget("12345")})
 
 	rec = httptest.NewRecorder()
 	muxAdmin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook/grafana", nil))
@@ -372,5 +373,92 @@ func TestWebhookGrafanaHandler(t *testing.T) {
 	muxAdmin.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/grafana", bytes.NewReader(payload)))
 	if rec.Code != http.StatusOK {
 		t.Errorf("valid payload: got status %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+// testTarget is a no-op admin target used where the send itself isn't the
+// subject under test (e.g. the Grafana handler, which injects via back.Send
+// rather than the target's own frontend).
+func testTarget(id string) adminTarget {
+	return adminTarget{chatID: id, send: func(context.Context, relay.Message) error { return nil }}
+}
+
+// recordTarget captures every message sent to it, standing in for a real
+// frontend (Telegram or Discord) so a fan-out can be asserted without a live
+// connection.
+type recordTarget struct {
+	chatID string
+	got    []relay.Message
+}
+
+func (r *recordTarget) target() adminTarget {
+	return adminTarget{chatID: r.chatID, send: func(_ context.Context, m relay.Message) error {
+		r.got = append(r.got, m)
+		return nil
+	}}
+}
+
+// TestNotifyAdminsDiscordOnly proves the HIGH-severity gap is closed for the
+// escalation fan-out: with only a Discord admin target configured (no Telegram
+// admin), a tool-approval prompt still reaches that Discord admin instead of
+// being silently dropped, and sendToAdmin's error contract is preserved
+// (nil on delivery, errNoAdminConfigured when there's nobody to escalate to).
+func TestNotifyAdminsDiscordOnly(t *testing.T) {
+	discord := &recordTarget{chatID: "987654321098765432"}
+	admins := []adminTarget{discord.target()}
+
+	if err := notifyAdmins(context.Background(), admins, "🔐 Claude wants to use Bash"); err != nil {
+		t.Fatalf("notifyAdmins: unexpected error %v", err)
+	}
+	if len(discord.got) != 1 {
+		t.Fatalf("discord admin got %d messages, want 1", len(discord.got))
+	}
+	if discord.got[0].ConversationID != discord.chatID || discord.got[0].Meta["chat_id"] != discord.chatID {
+		t.Errorf("message not addressed to discord admin: %+v", discord.got[0])
+	}
+	if !contains(discord.got[0].Text, "Claude wants to use") {
+		t.Errorf("unexpected text: %q", discord.got[0].Text)
+	}
+
+	// No targets at all => explicit no-admin error, not a silent success.
+	if err := notifyAdmins(context.Background(), nil, "x"); err != errNoAdminConfigured {
+		t.Errorf("notifyAdmins(nil): got %v, want errNoAdminConfigured", err)
+	}
+}
+
+// TestNotifyAdminsFansOutToBothFrontends verifies backward compatibility: a
+// Telegram+Discord config reaches BOTH admins.
+func TestNotifyAdminsFansOutToBothFrontends(t *testing.T) {
+	tg := &recordTarget{chatID: "1"}
+	disc := &recordTarget{chatID: "222222222222222222"}
+	admins := []adminTarget{tg.target(), disc.target()}
+
+	if err := notifyAdmins(context.Background(), admins, "alert"); err != nil {
+		t.Fatalf("notifyAdmins: %v", err)
+	}
+	if len(tg.got) != 1 || len(disc.got) != 1 {
+		t.Fatalf("fan-out: telegram=%d discord=%d, want 1 each", len(tg.got), len(disc.got))
+	}
+}
+
+// TestWebhookGrafanaReachesDiscordAdmin proves the Grafana path is no longer
+// dropped for a Discord-only-admin deployment: with a Discord admin target the
+// handler accepts the alert (200) instead of the old "no admin chat" 503.
+func TestWebhookGrafanaReachesDiscordAdmin(t *testing.T) {
+	mux, _ := newTestMux(t, []adminTarget{testTarget("987654321098765432")})
+
+	payload, _ := json.Marshal(map[string]any{
+		"alerts": []map[string]any{
+			{
+				"status":      "firing",
+				"labels":      map[string]string{"alertname": "DiscOnly", "severity": "critical"},
+				"annotations": map[string]string{"summary": "discord-only admin must still be alerted"},
+			},
+		},
+	})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/grafana", bytes.NewReader(payload)))
+	if rec.Code != http.StatusOK {
+		t.Errorf("discord-only admin: got status %d, want %d (alert must not be dropped)", rec.Code, http.StatusOK)
 	}
 }
