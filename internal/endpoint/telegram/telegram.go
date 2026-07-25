@@ -44,6 +44,18 @@ type Authorizer interface {
 	Record(id int64, name string)
 }
 
+// DeniedLogger captures every message a non-allowlisted sender attempts to
+// send, not just the first (Authorizer.Record is a no-op after the first
+// pending/denied entry, so it can't be used for this). A nil DeniedLogger is
+// a no-op — this is optional, off by default.
+type DeniedLogger interface {
+	LogDenied(id int64, name, chatID, text string)
+}
+
+type noopDeniedLogger struct{}
+
+func (noopDeniedLogger) LogDenied(int64, string, string, string) {}
+
 // staticAuthorizer is a fixed allowlist (WithAllowlist). It records nothing.
 type staticAuthorizer map[int64]bool
 
@@ -56,6 +68,7 @@ type Frontend struct {
 	base        string
 	http        *http.Client
 	auth        Authorizer
+	deniedLog   DeniedLogger
 	pollTimeout int // long-poll seconds
 	logger      *log.Logger
 
@@ -117,6 +130,17 @@ func WithAllowlist(ids ...int64) Option {
 // that can grant access dynamically and record pending requests.
 func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a } }
 
+// WithDeniedLogger captures full message content from non-allowlisted senders
+// (every attempt, not just the first) - see DeniedLogger.
+func WithDeniedLogger(l DeniedLogger) Option {
+	return func(f *Frontend) {
+		if l == nil {
+			l = noopDeniedLogger{}
+		}
+		f.deniedLog = l
+	}
+}
+
 // WithPollTimeout sets the long-poll timeout in seconds (default 30).
 func WithPollTimeout(sec int) Option { return func(f *Frontend) { f.pollTimeout = sec } }
 
@@ -137,6 +161,7 @@ func New(token string, opts ...Option) *Frontend {
 		token:       token,
 		base:        defaultBaseURL,
 		auth:        staticAuthorizer{}, // fail-closed default (denies everyone)
+		deniedLog:   noopDeniedLogger{},
 		pollTimeout: 30,
 		logger:      log.New(io.Discard, "", 0),
 		recv:        make(chan relay.Message, 32),
@@ -242,6 +267,7 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 					name = m.From.FirstName
 				}
 				f.auth.Record(m.From.ID, name) // queue as a pending request
+				f.deniedLog.LogDenied(m.From.ID, name, strconv.FormatInt(m.Chat.ID, 10), m.Text)
 				f.logger.Printf("dropped message from unauthorized sender id=%d (%s) — recorded as pending", m.From.ID, name)
 				continue
 			}
