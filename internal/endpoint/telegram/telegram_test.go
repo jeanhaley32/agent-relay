@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -186,6 +187,79 @@ func TestGroupChatDropped(t *testing.T) {
 		t.Fatalf("group-chat message leaked through: %+v", extra)
 	case <-time.After(300 * time.Millisecond):
 		// good — dropped
+	}
+}
+
+// TestDeniedLoggerCapturesFullMessage verifies a non-allowlisted sender's
+// actual message text (not just id/name) is captured, and that a SECOND
+// attempt from the same still-denied sender is captured too - Authorizer.Record
+// is a no-op after the first pending entry, so the denied logger has to be a
+// genuinely separate path, not piggybacked on Record.
+func TestDeniedLoggerCapturesFullMessage(t *testing.T) {
+	mux := http.NewServeMux()
+	first := true
+	mux.HandleFunc("/bot"+testToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if first && r.URL.Query().Get("offset") == "" {
+			first = false
+			fmt.Fprint(w, `{"ok":true,"result":[
+				{"update_id":10,"message":{"message_id":1,"from":{"id":999,"username":"stranger"},"chat":{"id":999,"type":"private"},"text":"gimme access"}},
+				{"update_id":11,"message":{"message_id":2,"from":{"id":999,"username":"stranger"},"chat":{"id":999,"type":"private"},"text":"seriously, let me in"}}
+			]}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	logPath := t.TempDir() + "/denied.jsonl"
+	dl, err := NewFileDeniedLogger(logPath)
+	if err != nil {
+		t.Fatalf("NewFileDeniedLogger: %v", err)
+	}
+	defer dl.Close()
+
+	f := New(testToken,
+		WithBaseURL(srv.URL),
+		WithHTTPClient(srv.Client()),
+		WithAllowlist(111), // 999 is not on it
+		WithDeniedLogger(dl),
+		WithPollTimeout(0),
+	)
+	defer f.Close()
+
+	select {
+	case msg := <-f.Recv():
+		t.Fatalf("denied sender's message should never surface, got: %+v", msg)
+	case <-time.After(500 * time.Millisecond):
+		// good — dropped, not delivered
+	}
+
+	dl.mu.Lock()
+	_ = dl.file.Sync()
+	dl.mu.Unlock()
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading denied log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 captured attempts (both messages, not just the first), got %d: %q", len(lines), data)
+	}
+	var e1, e2 deniedEntry
+	if err := json.Unmarshal([]byte(lines[0]), &e1); err != nil {
+		t.Fatalf("unmarshal line 1: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &e2); err != nil {
+		t.Fatalf("unmarshal line 2: %v", err)
+	}
+	if e1.ID != 999 || e1.Text != "gimme access" {
+		t.Fatalf("wrong first entry: %+v", e1)
+	}
+	if e2.ID != 999 || e2.Text != "seriously, let me in" {
+		t.Fatalf("wrong second entry (repeat attempts must still be captured): %+v", e2)
 	}
 }
 
