@@ -65,6 +65,19 @@ func main() {
 
 	logger := log.New(os.Stderr, "[relayd] ", log.LstdFlags)
 
+	// Tailscale is a hard dependency (see README Requirements) - relayd binds
+	// its admin re-auth/approval flow to the tailscale0 interface. Check for
+	// the interface's existence up front, before any other setup work, and
+	// fail with a clear "Tailscale isn't installed/running" message rather
+	// than letting the user discover it two minutes into an unrelated retry
+	// loop further down. Not having an IP assigned YET is a separate, normal
+	// boot-race case (handled later by tailscaleIPWithRetry) - this check is
+	// only for "the interface doesn't exist at all".
+	if _, err := net.InterfaceByName("tailscale0"); err != nil {
+		logger.Fatalf("Tailscale is required but not found (no tailscale0 interface): %v\n"+
+			"Install Tailscale and run `tailscale up` before starting relayd - see README Requirements.", err)
+	}
+
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		logger.Fatalf("config: %v", err)
