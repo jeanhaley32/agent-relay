@@ -181,6 +181,22 @@ func New(token string, opts ...Option) *Frontend {
 	return f
 }
 
+// SafeErr renders err with the bot token stripped out. Every request URL
+// embeds the token in its path (bot<token>/METHOD), so a transport-level
+// failure surfaces as a *url.Error whose Error() prints the full URL — token
+// and all. Route any error that might wrap a request URL through this before
+// logging it. Empty token → passthrough.
+func (f *Frontend) SafeErr(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	s := err.Error()
+	if f.token == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, f.token, "<token>")
+}
+
 func (f *Frontend) Name() string               { return "telegram" }
 func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 
@@ -232,7 +248,7 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 				return
 			}
 			f.getUpdatesFailures.Add(1)
-			f.logger.Printf("getUpdates error: %v", err)
+			f.logger.Printf("getUpdates error: %s", f.SafeErr(err))
 			select {
 			case <-ctx.Done():
 				return
@@ -415,10 +431,10 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 		// message that will never be delivered, not just the ones that went
 		// through the retry queue first.
 		f.permanentDrops.Add(1)
-		f.logger.Printf("telegram send permanently failed (not retrying): %v", err)
+		f.logger.Printf("telegram send permanently failed (not retrying): %s", f.SafeErr(err))
 		return err
 	}
-	f.logger.Printf("telegram send failed, queuing for background retry: %v", err)
+	f.logger.Printf("telegram send failed, queuing for background retry: %s", f.SafeErr(err))
 	f.enqueueRetry(m)
 	return err
 }
@@ -544,16 +560,16 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 				if errors.As(err, &perm) {
 					f.queueDepth.Add(-1)
 					f.permanentDrops.Add(1)
-					f.logger.Printf("telegram retry gave up (permanent failure) for chat %s: %v",
-						item.msg.Meta["chat_id"], err)
+					f.logger.Printf("telegram retry gave up (permanent failure) for chat %s: %s",
+						item.msg.Meta["chat_id"], f.SafeErr(err))
 					continue
 				}
 				item.attempts++
 				if item.attempts >= maxRetryAttempts {
 					f.queueDepth.Add(-1)
 					f.permanentDrops.Add(1)
-					f.logger.Printf("telegram retry gave up after %d attempts for chat %s: %v",
-						item.attempts, item.msg.Meta["chat_id"], err)
+					f.logger.Printf("telegram retry gave up after %d attempts for chat %s: %s",
+						item.attempts, item.msg.Meta["chat_id"], f.SafeErr(err))
 					continue
 				}
 				item.nextAt = now.Add(retryBackoff(item.attempts))
