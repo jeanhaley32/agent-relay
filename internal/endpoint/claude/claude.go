@@ -48,6 +48,15 @@ type SchedRequest struct {
 	ChatID    string // requesting conversation (create target / audit)
 }
 
+// ReauthRequest is a force_reauth tool call surfaced from the Claude session.
+// The daemon gates it behind an admin approval and answers with ReauthRespond,
+// echoing ReqID. Target is the admin user id to re-auth; empty ⇒ ChatID.
+type ReauthRequest struct {
+	ReqID  string // correlation id to echo in the response
+	ChatID string // requesting conversation
+	Target string // admin user id to re-auth (empty ⇒ ChatID)
+}
+
 // Endpoint is the Claude Code backend.
 type Endpoint struct {
 	socketPath string
@@ -55,6 +64,7 @@ type Endpoint struct {
 	recv       chan relay.Message
 	perms      chan PermRequest
 	schedreq   chan SchedRequest
+	reauthreq  chan ReauthRequest
 	out        chan ipc.Frame // inject frames queued for the shim (buffered)
 	done       chan struct{}
 
@@ -85,6 +95,7 @@ func New(socketPath string) (*Endpoint, error) {
 		recv:       make(chan relay.Message, 32),
 		perms:      make(chan PermRequest, 32),
 		schedreq:   make(chan SchedRequest, 32),
+		reauthreq:  make(chan ReauthRequest, 32),
 		out:        make(chan ipc.Frame, inboundBuffer),
 		done:       make(chan struct{}),
 	}
@@ -114,6 +125,23 @@ func (e *Endpoint) Permissions() <-chan PermRequest { return e.perms }
 // Schedules delivers schedule-tool calls from the Claude session. Consume these
 // and call SchedRespond to answer each (the tool call blocks until then).
 func (e *Endpoint) Schedules() <-chan SchedRequest { return e.schedreq }
+
+// Reauths delivers force_reauth tool calls from the Claude session. Consume
+// these and call ReauthRespond to answer each (the tool call blocks until
+// then, including while the daemon waits for an admin's approval).
+func (e *Endpoint) Reauths() <-chan ReauthRequest { return e.reauthreq }
+
+// ReauthRespond answers a pending force_reauth request by its correlation id.
+// result is a human-readable summary; errText is empty on success.
+func (e *Endpoint) ReauthRespond(reqID, result, errText string) error {
+	e.mu.Lock()
+	c := e.conn
+	e.mu.Unlock()
+	if c == nil {
+		return ErrNoSession
+	}
+	return c.Send(ipc.Frame{Kind: ipc.KindReauthResp, RequestID: reqID, Result: result, Err: errText})
+}
 
 // SchedRespond answers a pending schedule request by its correlation id. result
 // is a human-readable summary; errText is empty on success.
@@ -161,6 +189,7 @@ func (e *Endpoint) acceptLoop() {
 	defer close(e.recv)
 	defer close(e.perms)
 	defer close(e.schedreq)
+	defer close(e.reauthreq)
 	for {
 		nc, err := e.ln.Accept()
 		if err != nil {
@@ -234,6 +263,13 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 			case e.schedreq <- req:
 			default: // consumer gone: answer with a busy error so the tool doesn't hang
 				_ = e.SchedRespond(f.RequestID, "", "scheduler busy")
+			}
+		case ipc.KindReauthReq:
+			req := ReauthRequest{ReqID: f.RequestID, ChatID: f.ChatID, Target: f.Target}
+			select {
+			case e.reauthreq <- req:
+			default: // consumer gone: answer with a busy error so the tool doesn't hang
+				_ = e.ReauthRespond(f.RequestID, "", "reauth service busy")
 			}
 		default:
 			// ignore unexpected frames
