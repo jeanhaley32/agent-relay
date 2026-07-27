@@ -83,6 +83,7 @@ func main() {
 	registerScheduleTools(srv, cl)
 	registerEventTools(srv, cl)
 	registerReauthTool(srv, cl)
+	registerHypatiaTool(srv)
 
 	// daemon → Claude: inject messages, apply verdicts.
 	cl.onFrame = func(f ipc.Frame) {
