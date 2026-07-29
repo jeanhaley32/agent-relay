@@ -17,4 +17,12 @@ set -eu
 cd /home/jeanh/agent-relay
 session_id=$(cat .relay_session_id)
 
-exec env SESSION_ID="$session_id" UNATTENDED=1 ISOLATE=0 bash scripts/run.sh
+# CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION raises the per-session subagent spawn
+# ceiling from its default of 200. This is an always-on, multi-day session that
+# spawns a subagent on nearly every scheduled trigger, so the cumulative
+# per-process count reached 200 and hard-blocked all further Task/Agent calls
+# ("Subagent spawn limit reached (200 of 200)") - unrelated to any account/usage
+# limit. The counter resets on process (re)start; a higher ceiling just delays
+# the next wall. 2000 buys roughly 10x the runway before a restart is needed.
+exec env SESSION_ID="$session_id" UNATTENDED=1 ISOLATE=0 \
+	CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=2000 bash scripts/run.sh
