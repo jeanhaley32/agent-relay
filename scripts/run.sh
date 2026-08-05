@@ -114,8 +114,15 @@ fi
 # (Re)launch Claude in the (stable) chosen directory with the relay channel.
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -c "$CLAUDE_DIR"
+# A tmux pane's shell inherits the tmux SERVER's environment, captured when the
+# server first started - NOT this script's env. So any var we were launched with
+# (e.g. CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION from start-relay.sh) is invisible
+# to Claude unless we inject it into the pane command itself. Expand it here,
+# where the value IS present, and prefix the assignment onto the command run in
+# the pane. Default 200 (Claude's own default) keeps interactive use unchanged.
+SUBAGENT_CAP="${CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION:-200}"
 tmux send-keys -t "$SESSION" \
-  "$CLAUDE --model $MODEL $SEC_FLAGS $CONT_FLAG --dangerously-load-development-channels server:relay" C-m
+  "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=$SUBAGENT_CAP $CLAUDE --model $MODEL $SEC_FLAGS $CONT_FLAG --dangerously-load-development-channels server:relay" C-m
 
 # The "development channels" prompt is a CLI startup modal emitted before the
 # session even exists (not an in-session tool, so --disallowedTools doesn't

@@ -9,7 +9,7 @@ import importlib.util, json, os, subprocess, sys, tempfile
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detect-reply-drift.py")
 
 CHANNEL = {"type": "user", "timestamp": "2026-07-19T21:00:00Z", "message": {"content": [
-    {"type": "text", "text": '<channel source="relay" chat_id="1000000001">question</channel>'}]}}
+    {"type": "text", "text": '<channel source="relay" chat_id="555000111">question</channel>'}]}}
 TEXT = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"content": [
     {"type": "text", "text": "A substantive answer that was only written to the terminal."}]}}
 # Declared outputs. Every model output must name its recipient: "terminal" for
@@ -18,10 +18,10 @@ TEXT = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"c
 NOTE = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"content": [
     {"type": "text", "text": "[to: terminal] Checking the log before I answer this one."}]}}
 ADDRESSED = {"type": "assistant", "timestamp": "2026-07-19T21:00:05Z", "message": {"content": [
-    {"type": "text", "text": "[to: 1000000001] Here is the answer you asked for, at length."}]}}
+    {"type": "text", "text": "[to: 555000111] Here is the answer you asked for, at length."}]}}
 REPLY = {"type": "assistant", "timestamp": "2026-07-19T21:00:06Z", "message": {"content": [
     {"type": "tool_use", "name": "mcp__relay__reply",
-     "input": {"chat_id": "1000000001", "text": "sent"}}]}}
+     "input": {"chat_id": "555000111", "text": "sent"}}]}}
 
 
 def run(records, stop_hook_active=False):
