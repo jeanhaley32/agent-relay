@@ -28,6 +28,8 @@ const (
 	KindPermVerdict Kind = "perm_verdict" // daemon -> shim: allow/deny a pending tool request
 	KindSchedReq    Kind = "sched_req"    // shim -> daemon: a schedule tool was called
 	KindSchedResp   Kind = "sched_resp"   // daemon -> shim: result of a schedule op
+	KindReauthReq   Kind = "reauth_req"   // shim -> daemon: force_reauth tool was called
+	KindReauthResp  Kind = "reauth_resp"  // daemon -> shim: result of a force_reauth op
 )
 
 // Schedule op names carried in Frame.Op for KindSchedReq.
@@ -63,8 +65,13 @@ type Frame struct {
 	Cron      string `json:"cron,omitempty"`       // recurring cron spec (create)
 	InSeconds int64  `json:"in_seconds,omitempty"` // one-shot delay in seconds (create)
 	SchedID   string `json:"sched_id,omitempty"`   // schedule id (cancel req / create resp)
-	Result    string `json:"result,omitempty"`     // human-readable result (sched_resp)
-	Err       string `json:"err,omitempty"`        // error text, empty on success (sched_resp)
+	Result    string `json:"result,omitempty"`     // human-readable result (sched_resp / reauth_resp)
+	Err       string `json:"err,omitempty"`        // error text, empty on success (sched_resp / reauth_resp)
+
+	// force_reauth field: the admin user id to re-auth (reauth_req). Empty ⇒
+	// target the requesting conversation (ChatID), which for a 1:1 admin chat
+	// is that admin's own user id.
+	Target string `json:"target,omitempty"`
 }
 
 // Conn is a framed JSON connection. Send is safe for concurrent use; Recv must

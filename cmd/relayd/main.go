@@ -280,8 +280,11 @@ func main() {
 	}
 
 	// Permission relay: admins approve tool-use prompts via /allow and /deny.
-	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Admin: true, Run: verdict(back, true)})
-	cmds.Register(command.Command{Name: "deny", Help: "admin: reject a tool request: /deny <id>", Admin: true, Run: verdict(back, false)})
+	// The same commands also resolve force_reauth requests the model triggers
+	// (see reauthGate) — one approval surface for every gated action.
+	reauth := newReauthGate()
+	cmds.Register(command.Command{Name: "allow", Help: "admin: approve a tool request: /allow <id>", Admin: true, Run: verdict(back, reauth, true)})
+	cmds.Register(command.Command{Name: "deny", Help: "admin: reject a tool request: /deny <id>", Admin: true, Run: verdict(back, reauth, false)})
 
 	// Admin escalation targets: every configured admin on whichever
 	// frontend(s) they live on (Telegram and/or Discord). A Discord-only-admin
@@ -554,6 +557,16 @@ func main() {
 			peer, ok := tailnetStatus.Peer(device)
 			return true, ok && peer.Online
 		}
+
+		// force_reauth tool: the model can trigger a targeted re-auth challenge
+		// (the single-admin counterpart of /reauth's ExpireAll), but only for a
+		// gated admin and only after a human approves via /allow — so a
+		// manipulated model session can't force-revoke an admin unilaterally.
+		go serveReauth(back, reauth,
+			func(id string) bool { return gated[id] },
+			b.Session.Revoke,
+			func(text string) error { return notifyAdmins(context.Background(), admins, text) },
+			logger)
 
 		cmds.Register(command.Command{
 			Name:  "reauth",
@@ -1193,11 +1206,20 @@ func outboundAllowed(chatID string, acc *access.Manager, discordAcc *access.Mana
 }
 
 // verdict returns an /allow or /deny handler that answers a pending tool-approval
-// request by its id. Admin gating is enforced centrally by the registry.
-func verdict(back *claudebk.Endpoint, allow bool) command.Handler {
+// request by its id. Admin gating is enforced centrally by the registry. A
+// force_reauth request registered by the model uses this same command surface:
+// gate.decide claims the id first; anything it doesn't recognize falls through
+// to the Claude Code permission path (back.Decide).
+func verdict(back *claudebk.Endpoint, gate *reauthGate, allow bool) command.Handler {
 	return func(_ command.Context, args []string) string {
 		if len(args) < 1 {
 			return "usage: /" + map[bool]string{true: "allow", false: "deny"}[allow] + " <request_id>"
+		}
+		if gate != nil && gate.decide(args[0], allow) {
+			if allow {
+				return "✅ allowed " + args[0] + " (force_reauth)"
+			}
+			return "⛔ denied " + args[0] + " (force_reauth)"
 		}
 		if err := back.Decide(args[0], allow); err != nil {
 			return "error: " + err.Error()
