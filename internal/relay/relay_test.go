@@ -414,6 +414,102 @@ func TestSessionGate(t *testing.T) {
 	}
 }
 
+// TestAdminDevicePresentGate covers the device-presence gate now folded into
+// the session gate: it covers EVERY message from a gated sender (plain chat
+// included, not just Admin-flagged commands), since a plain-English request
+// can lead to a real tool call just as easily as a formal command. Live
+// device presence stands in for an approved session; when the device is
+// offline, the ordinary approved-session challenge/override applies.
+func TestAdminDevicePresentGate(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+	cmds.Register(command.Command{Name: "danger", Admin: true, Run: func(command.Context, []string) string { return "did it" }})
+	appr := approval.NewManager("http://tailnet.example")
+
+	deviceOnline := false
+	b := &Broker{
+		Frontend:          front,
+		Backend:           back,
+		Commands:          cmds,
+		Meter:             budget.New("pro", nil),
+		Session:           session.NewManager(30 * time.Minute),
+		Approval:          appr,
+		SessionGatedUsers: map[string]bool{"admin-chat": true, "device-online-chat": true},
+		SessionTTL:        2 * time.Second,
+		AdminDevicePresent: func(senderID string) (bool, bool) {
+			return true, deviceOnline // always "required", online toggled by the test
+		},
+	}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	// 1. Plain chat (not a slash command) while the bound device is offline:
+	// must be challenged and discarded, not forwarded to the backend. This
+	// is the case the narrower command-only gate used to miss.
+	front.recv <- Message{Role: User, Text: "hello", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+	var link string
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "http://tailnet.example/approve/") {
+			t.Fatalf("expected a challenge with an approval link, got %q", m.Text)
+		}
+		link = m.Text[strings.Index(m.Text, "http://tailnet.example/approve/"):]
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a device-offline challenge on the frontend for plain chat")
+	}
+	select {
+	case m := <-back.got:
+		t.Fatalf("plain chat leaked to the backend while device-gated and unapproved: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+		// good
+	}
+
+	// 2. Approve the challenge (same HTTP surface a human would hit).
+	token := link[strings.LastIndex(link, "/")+1:]
+	appSrv := httptest.NewServer(appr.ApproveHandler())
+	defer appSrv.Close()
+	resp, err := http.PostForm(appSrv.URL+"/approve/"+token, url.Values{"decision": {"approve"}})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	resp.Body.Close()
+	select {
+	case m := <-front.sent:
+		if !strings.Contains(m.Text, "re-authenticated") {
+			t.Fatalf("expected a re-authenticated confirmation, got %q", m.Text)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("session was never activated after approval")
+	}
+
+	// 3. Retried admin command now succeeds via the approved session, even
+	// though the device is still (per the stub) offline.
+	front.recv <- Message{Role: User, Text: "/danger", Meta: map[string]string{"chat_id": "admin-chat", "from_id": "admin-chat"}}
+	select {
+	case m := <-front.sent:
+		if m.Text != "did it" {
+			t.Fatalf("expected the admin command to run after re-auth, got %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("admin command was not admitted after session re-auth")
+	}
+
+	// 4. Once the device itself comes online, a fresh sender with no active
+	// session should be admitted directly for plain chat too, no challenge.
+	deviceOnline = true
+	front.recv <- Message{Role: User, Text: "hello again", Meta: map[string]string{"chat_id": "device-online-chat", "from_id": "device-online-chat"}}
+	select {
+	case m := <-back.got:
+		if m.Text != "hello again" {
+			t.Fatalf("wrong message reached backend: %q", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("plain chat with device online should not have been gated")
+	}
+}
+
 // stubAnomalyDetector returns a fixed score for every call, and records which
 // (userID, text) pairs it was asked to score.
 type stubAnomalyDetector struct {

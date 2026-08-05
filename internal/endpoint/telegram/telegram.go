@@ -301,6 +301,7 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 					"chat_id":   strconv.FormatInt(m.Chat.ID, 10),
 					"from_id":   strconv.FormatInt(m.From.ID, 10),
 					"from_name": m.From.Username,
+					"platform":  "telegram",
 				},
 			}
 			select {

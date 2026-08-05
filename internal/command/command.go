@@ -77,6 +77,24 @@ func Escaped(text string) (unescaped string, ok bool) {
 	return text, false
 }
 
+// IsAdminCommand reports whether text names a registered Admin-flagged
+// command, without running it or checking the caller's identity - a peek
+// callers can use to decide whether an admin-only gate (like a tailnet
+// presence challenge) needs to run before Dispatch. Unknown commands and
+// non-commands both report false.
+func (r *Registry) IsAdminCommand(text string) bool {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "/") {
+		return false
+	}
+	fields := strings.Fields(text[1:])
+	if len(fields) == 0 {
+		return false
+	}
+	c, ok := r.cmds[fields[0]]
+	return ok && c.Admin
+}
+
 // Dispatch handles a command line. handled is false if text is not a command,
 // in which case the caller forwards the message to the backend as normal.
 func (r *Registry) Dispatch(ctx Context, text string) (reply string, handled bool) {
