@@ -14,12 +14,12 @@ import (
 // that plain text is not delivered. This is the guard against the model drifting
 // back to terminal-only answers over a long session.
 func TestReplyReminder(t *testing.T) {
-	r := replyReminder("6369276467")
+	r := replyReminder("555000111")
 	// Assert the contract, not its phrasing: name the tool, name the exact
 	// destination, say terminal text is not delivered, and say the "[to: ...]"
 	// label is not itself a send - the model read the label as a delivery and
 	// stopped calling the tool (2026-07-20).
-	for _, want := range []string{"reply tool", `chat_id="6369276467"`,
+	for _, want := range []string{"reply tool", `chat_id="555000111"`,
 		"never delivered", "does not send it", "[to: terminal]"} {
 		if !strings.Contains(r, want) {
 			t.Fatalf("reminder missing %q: %s", want, r)
@@ -58,7 +58,7 @@ func TestReplyHandlerSurfacesAckError(t *testing.T) {
 		cl.resolve(ipc.Frame{Kind: ipc.KindReplyAck, RequestID: f.RequestID, Err: "telegram: message too long"})
 	}()
 
-	err := handler(context.Background(), "6369276467", "hello")
+	err := handler(context.Background(), "555000111", "hello")
 	if err == nil {
 		t.Fatal("expected an error from a reply_ack carrying resp.Err, got nil")
 	}
@@ -78,7 +78,7 @@ func TestReplyHandlerSuccessReturnsNilError(t *testing.T) {
 		cl.resolve(ipc.Frame{Kind: ipc.KindReplyAck, RequestID: f.RequestID})
 	}()
 
-	if err := handler(context.Background(), "6369276467", "hello"); err != nil {
+	if err := handler(context.Background(), "555000111", "hello"); err != nil {
 		t.Fatalf("expected nil error on a successful ack, got %v", err)
 	}
 }

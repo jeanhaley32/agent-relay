@@ -82,6 +82,7 @@ func main() {
 	// the daemon and returns its result to the model.
 	registerScheduleTools(srv, cl)
 	registerEventTools(srv, cl)
+	registerReauthTool(srv, cl)
 
 	// daemon → Claude: inject messages, apply verdicts.
 	cl.onFrame = func(f ipc.Frame) {
@@ -101,7 +102,7 @@ func main() {
 			if err := srv.SendVerdict(f.RequestID, f.Allow); err != nil {
 				logger.Printf("send verdict error: %v", err)
 			}
-		case ipc.KindSchedResp, ipc.KindReplyAck:
+		case ipc.KindSchedResp, ipc.KindReplyAck, ipc.KindReauthResp:
 			cl.resolve(f)
 		}
 	}
@@ -133,6 +134,13 @@ func replyReminder(chatID string) string {
 
 // schedTimeout bounds how long a schedule tool waits for the daemon to answer.
 const schedTimeout = 10 * time.Second
+
+// reauthTimeout bounds how long the force_reauth tool waits for the daemon to
+// answer. Unlike the schedule tools this blocks on a human admin approving the
+// action via /allow, so it must be far longer than schedTimeout. It stays
+// strictly greater than the daemon-side approval window so the daemon reports a
+// real verdict (or timeout) before this gives up with a generic error.
+const reauthTimeout = 3 * time.Minute
 
 // replyAckTimeout bounds how long the reply tool call waits for the daemon
 // to confirm delivery. Must stay strictly greater than relay.FrontendSendTimeout
@@ -286,6 +294,48 @@ func registerEventTools(srv *channel.Server, cl *client) {
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		Handler: func(_ context.Context, _ json.RawMessage) (string, error) {
 			return do(ipc.Frame{Op: ipc.OpEventList})
+		},
+	})
+}
+
+// registerReauthTool adds the force_reauth tool. A call turns into a reauth_req
+// frame; the daemon gates it behind an admin /allow approval before revoking
+// the target admin's session, then answers with reauth_resp. The tool call
+// blocks for the whole approval window, so it uses reauthTimeout, not
+// schedTimeout.
+func registerReauthTool(srv *channel.Server, cl *client) {
+	srv.RegisterTool(mcp.Tool{
+		Name: "force_reauth",
+		Description: "Force a tailnet re-authentication challenge for an admin: revoke their current " +
+			"session so their next message must be re-approved over the tailnet. Use when you suspect " +
+			"an admin's messaging account may be compromised or impersonated. This is gated: an admin " +
+			"must approve the action with /allow before it takes effect, so it cannot be used unilaterally. " +
+			"`admin` is the admin's user id; omit to target the current conversation's admin.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"admin":   map[string]any{"type": "string", "description": "Admin user id to re-auth. Omit to target the current conversation's admin."},
+				"chat_id": map[string]any{"type": "string", "description": "The current conversation id (from the channel tag)"},
+			},
+		},
+		Handler: func(_ context.Context, args json.RawMessage) (string, error) {
+			var a struct {
+				Admin  string `json:"admin"`
+				ChatID string `json:"chat_id"`
+			}
+			if err := json.Unmarshal(args, &a); err != nil {
+				return "", err
+			}
+			resp, err := cl.request(ipc.Frame{
+				Kind: ipc.KindReauthReq, Target: a.Admin, ChatID: a.ChatID,
+			}, reauthTimeout)
+			if err != nil {
+				return "", err
+			}
+			if resp.Err != "" {
+				return "", errors.New(resp.Err)
+			}
+			return resp.Result, nil
 		},
 	})
 }
