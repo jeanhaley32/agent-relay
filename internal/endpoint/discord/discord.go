@@ -540,6 +540,7 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 			"channel_id": m.channelID.String(),
 			"from_id":    m.authorID.String(),
 			"from_name":  m.authorName,
+			"platform":   "discord",
 		},
 	}
 	if m.guildID != nil {
