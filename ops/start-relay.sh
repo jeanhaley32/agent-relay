@@ -17,12 +17,16 @@ set -eu
 cd /home/jeanh/agent-relay
 session_id=$(cat .relay_session_id)
 
-# CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION raises the per-session subagent spawn
-# ceiling from its default of 200. This is an always-on, multi-day session that
-# spawns a subagent on nearly every scheduled trigger, so the cumulative
-# per-process count reached 200 and hard-blocked all further Task/Agent calls
-# ("Subagent spawn limit reached (200 of 200)") - unrelated to any account/usage
-# limit. The counter resets on process (re)start; a higher ceiling just delays
-# the next wall. 2000 buys roughly 10x the runway before a restart is needed.
+# Per-session runtime ceilings, both raised from their small defaults. These are
+# cumulative per-process counters (NOT account/usage/billing limits): an
+# always-on, multi-day session that spawns a subagent and runs web searches on
+# nearly every scheduled trigger exhausts them and gets hard-blocked -
+#   "Subagent spawn limit reached (200 of 200)"          (default 200)
+#   web search refused, falls back to WebFetch            (default is lower still)
+# The counters reset on process (re)start; a higher ceiling just delays the next
+# wall. Both must also be injected into the tmux pane in run.sh - a pane inherits
+# the tmux SERVER's env, not this launcher's, so setting them here alone is not
+# enough (verified via /proc/<pid>/environ). See run.sh for that half.
 exec env SESSION_ID="$session_id" UNATTENDED=1 ISOLATE=0 \
-	CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=2000 bash scripts/run.sh
+	CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=2000 \
+	CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION=1000 bash scripts/run.sh
