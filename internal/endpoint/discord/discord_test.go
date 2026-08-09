@@ -742,3 +742,37 @@ func (w testWriter) Write(p []byte) (int, error) {
 	w.t.Logf("%s", strings.TrimRight(string(p), "\n"))
 	return len(p), nil
 }
+
+// captureDenied records LogDenied calls for assertions.
+type captureDenied struct {
+	platform, name, chatID, text string
+	id                           int64
+	calls                        int
+}
+
+func (c *captureDenied) LogDenied(platform string, id int64, name, chatID, text string) {
+	c.platform, c.id, c.name, c.chatID, c.text = platform, id, name, chatID, text
+	c.calls++
+}
+
+// TestGateDeniedLogsAttempt: a denied Discord sender is captured by the shared
+// denied logger tagged platform="discord" — closing the gap where Discord
+// denials previously went unrecorded.
+func TestGateDeniedLogsAttempt(t *testing.T) {
+	cap := &captureDenied{}
+	f := &Frontend{
+		auth:            &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+		deniedLog:       cap,
+		logger:          testLogger(t),
+		allowedGuildIDs: map[snowflake.ID]bool{},
+	}
+	if _, ok := f.gate(inboundMessage{messageID: 1, channelID: 9002, authorID: 999, authorName: "stranger", content: "spam"}); ok {
+		t.Fatal("denied sender should be dropped")
+	}
+	if cap.calls != 1 {
+		t.Fatalf("expected 1 denied-log call, got %d", cap.calls)
+	}
+	if cap.platform != "discord" || cap.id != 999 || cap.chatID != "9002" || cap.text != "spam" {
+		t.Fatalf("wrong denied entry: %+v", cap)
+	}
+}

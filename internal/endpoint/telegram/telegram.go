@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/deniedlog"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/inbound"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -44,18 +45,6 @@ type Authorizer interface {
 	Record(id int64, name string)
 }
 
-// DeniedLogger captures every message a non-allowlisted sender attempts to
-// send, not just the first (Authorizer.Record is a no-op after the first
-// pending/denied entry, so it can't be used for this). A nil DeniedLogger is
-// a no-op — this is optional, off by default.
-type DeniedLogger interface {
-	LogDenied(id int64, name, chatID, text string)
-}
-
-type noopDeniedLogger struct{}
-
-func (noopDeniedLogger) LogDenied(int64, string, string, string) {}
-
 // staticAuthorizer is a fixed allowlist (WithAllowlist). It records nothing.
 type staticAuthorizer map[int64]bool
 
@@ -68,7 +57,7 @@ type Frontend struct {
 	base        string
 	http        *http.Client
 	auth        Authorizer
-	deniedLog   DeniedLogger
+	deniedLog   deniedlog.Logger
 	pollTimeout int // long-poll seconds
 	logger      *log.Logger
 
@@ -131,11 +120,12 @@ func WithAllowlist(ids ...int64) Option {
 func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a } }
 
 // WithDeniedLogger captures full message content from non-allowlisted senders
-// (every attempt, not just the first) - see DeniedLogger.
-func WithDeniedLogger(l DeniedLogger) Option {
+// (every attempt, not just the first) - see deniedlog.Logger. A nil logger is
+// treated as deniedlog.Noop.
+func WithDeniedLogger(l deniedlog.Logger) Option {
 	return func(f *Frontend) {
 		if l == nil {
-			l = noopDeniedLogger{}
+			l = deniedlog.Noop{}
 		}
 		f.deniedLog = l
 	}
@@ -161,7 +151,7 @@ func New(token string, opts ...Option) *Frontend {
 		token:       token,
 		base:        defaultBaseURL,
 		auth:        staticAuthorizer{}, // fail-closed default (denies everyone)
-		deniedLog:   noopDeniedLogger{},
+		deniedLog:   deniedlog.Noop{},
 		pollTimeout: 30,
 		logger:      log.New(io.Discard, "", 0),
 		recv:        make(chan relay.Message, 32),
@@ -283,7 +273,7 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 					name = m.From.FirstName
 				}
 				f.auth.Record(m.From.ID, name) // queue as a pending request
-				f.deniedLog.LogDenied(m.From.ID, name, strconv.FormatInt(m.Chat.ID, 10), m.Text)
+				f.deniedLog.LogDenied("telegram", m.From.ID, name, strconv.FormatInt(m.Chat.ID, 10), m.Text)
 				f.logger.Printf("dropped message from unauthorized sender id=%d (%s) — recorded as pending", m.From.ID, name)
 				continue
 			}
