@@ -8,8 +8,11 @@
 // happened to the message I sent at 16:31?" meant an hour of forensics.
 //
 // Every record carries msg_id, assigned once at ingress and propagated through
-// Meta, so `grep <msg_id> relay-events.jsonl` reconstructs a message's entire
-// lifecycle: received -> gated/injected -> replied -> sent/failed.
+// Meta, so `grep <msg_id>` follows one inbound message end to end: received ->
+// gated, or injected/buffered on admission. The model's reply is a distinct
+// message with its own msg_id (reply -> sent/failed), joined back to the inbound
+// that caused it by in_reply_to — so a full round-trip is two id-threads linked
+// by that field, not one.
 //
 // Writes are line-atomic (a single Write of one newline-terminated JSON object)
 // and mutex-guarded, so concurrent producers can't interleave partial lines.
