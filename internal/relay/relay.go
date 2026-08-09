@@ -109,6 +109,12 @@ type Broker struct {
 	// "sent" regardless of what actually happened. nil ⇒ no hook.
 	AckBackendReply func(m Message, sendErr error)
 
+	// OnInboundObserved, if set, fires for every accepted inbound message
+	// (after the identity-pair check, before commands/gating) with its
+	// platform/chat_id/guild_id/from_name — the automatic write path for the
+	// contacts directory. nil ⇒ no observation, zero overhead.
+	OnInboundObserved func(m Message)
+
 	// Session gate: if Session and Approval are both set, inbound messages
 	// from any user_id (from_id) in SessionGatedUsers require an active,
 	// non-idle-expired session before being processed, keyed on the
@@ -120,6 +126,18 @@ type Broker struct {
 	Approval          *approval.Manager
 	SessionGatedUsers map[string]bool
 	SessionTTL        time.Duration // approval request validity window
+
+	// AdminDevicePresent, if set, is consulted by the session gate above for
+	// every message (not just slash commands) from a SessionGatedUsers
+	// sender: for a sender with a bound device (required=true), live device
+	// presence (online=true) stands in for an approved session directly -
+	// frictionless while the device is actually online. If the device is
+	// offline (or unbound, required=false), the ordinary approved-session
+	// check applies. This exists because a plain chat request can lead to a
+	// real tool call just as easily as a formal command can, so the gate
+	// has to cover the whole session, not a "/command" proxy for it.
+	// nil Broker field ⇒ no device signal, ordinary session gate only.
+	AdminDevicePresent func(senderID string) (required, online bool)
 
 	// Lockdown, when set, blocks every message from a non-admin sender
 	// before it reaches slash commands or the model - only b.Commands.IsAdmin
@@ -137,6 +155,13 @@ type Broker struct {
 	Anomaly           AnomalyDetector
 	AnomalyThreshold  float64
 	AnomalyWarnChatID string
+
+	// AnomalyIdentity, if set, maps (platform, raw chat_id) to a canonical
+	// identity string before scoring - e.g. resolving a person linked across
+	// Telegram and Discord to the same "person:<name>" key, so their style
+	// history accumulates as one profile instead of splitting per-platform.
+	// nil or an empty return ⇒ fall back to the raw from_id as-is.
+	AnomalyIdentity func(platform, chatID string) string
 
 	// ConversationCaps bounds per-chat_id cumulative token spend, tighter
 	// than and independent of the global Meter budget. Mutate only via
@@ -480,6 +505,9 @@ func (b *Broker) Run(ctx context.Context) error {
 			log.Printf("relay: dropped message with mismatched from_id=%q chat_id=%q - identity-pair invariant violated", fromID, chatID)
 			continue
 		}
+		if b.OnInboundObserved != nil {
+			b.OnInboundObserved(m)
+		}
 		// -1. Lockdown: non-admin senders are blocked entirely while active.
 		if b.Lockdown.Load() {
 			isAdmin := b.Commands != nil && b.Commands.IsAdmin != nil && b.Commands.IsAdmin(m.Meta["from_id"])
@@ -490,15 +518,32 @@ func (b *Broker) Run(ctx context.Context) error {
 			}
 		}
 		// 0. Session gate: guarded user must have an active, non-idle
-		// session before anything else runs, including slash commands.
+		// session before anything else runs, including slash commands. This
+		// covers EVERY message, not just Admin-flagged commands - a plain
+		// chat request can just as easily lead to a real tool call (Bash,
+		// Edit, a service restart) as a formal "/command" can, so the gate
+		// can't live at the command-dispatch layer alone.
 		// Keyed on from_id (see SessionGatedUsers doc comment above).
 		if b.Session != nil && b.Approval != nil && b.SessionGatedUsers[m.Meta["from_id"]] {
-			if !b.Session.Active(m.Meta["from_id"]) {
+			// Live device presence, if bound, stands in for session validity
+			// directly - frictionless while the bound device is actually
+			// online, no need to re-click an approval link every 30 min. If
+			// unbound (required=false) or the device is offline, fall back
+			// to the ordinary approved-session check.
+			deviceOK := false
+			if b.AdminDevicePresent != nil {
+				if required, online := b.AdminDevicePresent(m.Meta["from_id"]); required {
+					deviceOK = online
+				}
+			}
+			if !deviceOK && !b.Session.Active(m.Meta["from_id"]) {
 				b.logEvent(m, eventlog.GateBlocked, "session expired - re-auth required, message discarded", "")
 				b.challengeSession(ctx, m.ConversationID, m.Meta["from_id"])
 				continue
 			}
-			b.Session.Touch(m.Meta["from_id"])
+			if !deviceOK {
+				b.Session.Touch(m.Meta["from_id"])
+			}
 		}
 		// 0.5. Anomaly gate: score the message against the sender's own
 		// history. A detector failure (e.g. the backing store is down) fails
@@ -506,7 +551,13 @@ func (b *Broker) Run(ctx context.Context) error {
 		// session/allowlist controls, not itself the security boundary, so
 		// an outage here must not lock everyone out.
 		if b.Anomaly != nil {
-			score, err := b.Anomaly.Score(ctx, m.Meta["from_id"], m.Text)
+			styloID := m.Meta["from_id"]
+			if b.AnomalyIdentity != nil {
+				if resolved := b.AnomalyIdentity(m.Meta["platform"], m.Meta["from_id"]); resolved != "" {
+					styloID = resolved
+				}
+			}
+			score, err := b.Anomaly.Score(ctx, styloID, m.Text)
 			switch {
 			case err != nil:
 				// Detector is blind (store down, timeout, malformed reply). The
