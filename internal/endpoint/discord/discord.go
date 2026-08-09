@@ -27,6 +27,7 @@ import (
 	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/snowflake/v2"
 
+	"github.com/jeanhaley32/agent-relay/internal/deniedlog"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/inbound"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
@@ -100,9 +101,10 @@ type inboundMessage struct {
 
 // Frontend is a Discord Bot API frontend Endpoint.
 type Frontend struct {
-	token  string
-	auth   Authorizer
-	logger *log.Logger
+	token     string
+	auth      Authorizer
+	deniedLog deniedlog.Logger
+	logger    *log.Logger
 
 	allowGuildMessages    bool
 	allowedGuildIDs       map[snowflake.ID]bool
@@ -229,6 +231,17 @@ func WithAllowlist(ids ...snowflake.ID) Option {
 // requests.
 func WithAuthorizer(a Authorizer) Option { return func(f *Frontend) { f.auth = a } }
 
+// WithDeniedLogger captures full message content from non-allowlisted senders
+// (every attempt), matching the Telegram frontend. A nil logger ⇒ deniedlog.Noop.
+func WithDeniedLogger(l deniedlog.Logger) Option {
+	return func(f *Frontend) {
+		if l == nil {
+			l = deniedlog.Noop{}
+		}
+		f.deniedLog = l
+	}
+}
+
 func WithLogger(l *log.Logger) Option { return func(f *Frontend) { f.logger = l } }
 
 // WithAllowGuildMessages enables guild (server) messages in addition to DMs.
@@ -270,6 +283,7 @@ func New(token string, opts ...Option) (*Frontend, error) {
 	f := &Frontend{
 		token:                 token,
 		auth:                  staticAuthorizer{}, // fail-closed default (denies everyone)
+		deniedLog:             deniedlog.Noop{},
 		logger:                log.New(io.Discard, "", 0),
 		allowedGuildIDs:       map[snowflake.ID]bool{},
 		requireMentionInGuild: true,
@@ -496,6 +510,11 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 
 	if !f.auth.Allowed(m.authorID) {
 		f.auth.Record(m.authorID, m.authorName)
+		if f.deniedLog != nil {
+			// Snowflake ids are time-based and well under math.MaxInt64, so the
+			// int64 conversion is lossless (same as the Authorizer boundary).
+			f.deniedLog.LogDenied("discord", int64(m.authorID), m.authorName, m.channelID.String(), m.content)
+		}
 		f.logger.Printf("discord: dropped message from unauthorized sender id=%s (%s) — recorded as pending",
 			m.authorID, m.authorName)
 		return relay.Message{}, false

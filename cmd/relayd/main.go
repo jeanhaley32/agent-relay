@@ -41,6 +41,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	"github.com/jeanhaley32/agent-relay/internal/config"
 	"github.com/jeanhaley32/agent-relay/internal/contacts"
+	"github.com/jeanhaley32/agent-relay/internal/deniedlog"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
@@ -229,13 +230,17 @@ func main() {
 		telegram.WithPollTimeout(cfg.Telegram.PollTimeout),
 		telegram.WithLogger(logger),
 	}
+	// One denied-sender log, shared across every frontend (Telegram + Discord),
+	// so unauthorized attempts on any platform land in a single audit file.
+	var deniedLog deniedlog.Logger = deniedlog.Noop{}
 	if cfg.Telegram.DeniedLogPath != "" {
-		dl, err := telegram.NewFileDeniedLogger(cfg.Telegram.DeniedLogPath)
+		dl, err := deniedlog.NewFileDeniedLogger(cfg.Telegram.DeniedLogPath)
 		if err != nil {
 			logger.Fatalf("denied-sender log: %v", err)
 		}
 		defer dl.Close()
-		telegramOpts = append(telegramOpts, telegram.WithDeniedLogger(dl))
+		deniedLog = dl
+		telegramOpts = append(telegramOpts, telegram.WithDeniedLogger(deniedLog))
 	}
 	front := telegram.New(token, telegramOpts...)
 
@@ -275,7 +280,7 @@ func main() {
 	frontendEndpoint := relay.Endpoint(front)
 	var discordFront *discord.Frontend
 	if cfg.Discord.Enabled {
-		discordFront, discordAcc = mustStartDiscord(cfg, logger)
+		discordFront, discordAcc = mustStartDiscord(cfg, logger, deniedLog)
 		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
 	}
 
@@ -653,7 +658,7 @@ func ackErrText(sendErr error) string {
 // discord.enabled=true with a genuinely bad token/config still gets a clear
 // startup failure, just not on the very first attempt (the exact gap this
 // function exists to close - see DESIGN.md's wiring/startup design).
-func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend, *access.Manager) {
+func mustStartDiscord(cfg *config.Config, logger *log.Logger, deniedLog deniedlog.Logger) (*discord.Frontend, *access.Manager) {
 	token, err := cfg.DiscordToken()
 	if err != nil {
 		logger.Fatalf("discord: %v", err)
@@ -686,6 +691,7 @@ func mustStartDiscord(cfg *config.Config, logger *log.Logger) (*discord.Frontend
 
 	front, err := discord.New(token,
 		discord.WithAuthorizer(discord.Int64Authorizer(discordAcc)),
+		discord.WithDeniedLogger(deniedLog),
 		discord.WithLogger(logger),
 		discord.WithAllowGuildMessages(cfg.Discord.AllowGuildMessages),
 		discord.WithAllowedGuildIDs(guildIDs...),
