@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/deniedlog"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
@@ -214,7 +215,7 @@ func TestDeniedLoggerCapturesFullMessage(t *testing.T) {
 	defer srv.Close()
 
 	logPath := t.TempDir() + "/denied.jsonl"
-	dl, err := NewFileDeniedLogger(logPath)
+	dl, err := deniedlog.NewFileDeniedLogger(logPath)
 	if err != nil {
 		t.Fatalf("NewFileDeniedLogger: %v", err)
 	}
@@ -236,10 +237,6 @@ func TestDeniedLoggerCapturesFullMessage(t *testing.T) {
 		// good — dropped, not delivered
 	}
 
-	dl.mu.Lock()
-	_ = dl.file.Sync()
-	dl.mu.Unlock()
-
 	data, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("reading denied log: %v", err)
@@ -248,7 +245,7 @@ func TestDeniedLoggerCapturesFullMessage(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 captured attempts (both messages, not just the first), got %d: %q", len(lines), data)
 	}
-	var e1, e2 deniedEntry
+	var e1, e2 deniedlog.Entry
 	if err := json.Unmarshal([]byte(lines[0]), &e1); err != nil {
 		t.Fatalf("unmarshal line 1: %v", err)
 	}
