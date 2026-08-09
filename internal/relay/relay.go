@@ -84,11 +84,12 @@ const FrontendSendTimeout = 12 * time.Second
 type Broker struct {
 	Frontend Endpoint
 	Backend  Endpoint
-	// Events, if set, receives one structured record per lifecycle step of
-	// every message (received -> gated/injected -> reply -> sent/failed), keyed
-	// by the msg_id stamped at ingress. This is the audit trail that makes a
-	// lost message answerable: `grep <msg_id> relay-events.jsonl` shows exactly
-	// how far it got and where it stopped. nil ⇒ no event logging.
+	// Events, if set, receives one structured record per lifecycle step: an
+	// inbound message logs received -> gated, or injected/buffered on admission,
+	// and the model's reply logs reply -> sent/failed under its own msg_id,
+	// linked back by in_reply_to. This is the audit trail that makes a lost
+	// message answerable: `grep <msg_id> relay-events.jsonl` shows exactly how
+	// far it got and where it stopped. nil ⇒ no event logging.
 	Events   *eventlog.Logger
 	Commands *command.Registry
 	Meter    *budget.Meter
@@ -194,6 +195,16 @@ type Broker struct {
 	// would otherwise get a fresh link and poller per message.
 	challengeMu       sync.Mutex
 	challengeInFlight map[string]bool
+
+	// lastInbound maps a chat_id to the msg_id of the most recent inbound
+	// message admitted to the backend on that conversation. A model reply is
+	// attributed to that id as its in_reply_to, so the audit trail can join a
+	// reply back to the message that caused it. Written by the inbound loop on
+	// admission, read by the outbound loop when logging a reply, hence a
+	// sync.Map. Approximate by design: a reply is linked to the most recent
+	// admitted inbound on its conversation (correct for the common one-in /
+	// one-or-more-out turn, and for a reply to a scheduled trigger).
+	lastInbound sync.Map // chat_id -> msg_id
 }
 
 // SetCaps atomically replaces both ConversationCaps and
@@ -362,13 +373,14 @@ func (b *Broker) logEvent(m Message, event, detail, errText string) {
 		return
 	}
 	b.Events.Log(eventlog.Record{
-		MsgID:  m.Meta["msg_id"],
-		Event:  event,
-		ChatID: m.Meta["chat_id"],
-		FromID: m.Meta["from_id"],
-		Bytes:  len(m.Text),
-		Detail: detail,
-		Err:    errText,
+		MsgID:     m.Meta["msg_id"],
+		Event:     event,
+		ChatID:    m.Meta["chat_id"],
+		FromID:    m.Meta["from_id"],
+		InReplyTo: m.Meta["in_reply_to"],
+		Bytes:     len(m.Text),
+		Detail:    detail,
+		Err:       errText,
 	})
 }
 
@@ -458,6 +470,14 @@ func (b *Broker) Run(ctx context.Context) error {
 			b.Meter.Record(estimate)
 			// Outbound gate: the model may target any chat via its reply tool;
 			// only deliver to allowed chats.
+			// Attribute this reply to the last inbound admitted on its
+			// conversation, so the audit trail links reply -> cause.
+			if m.Meta == nil {
+				m.Meta = map[string]string{}
+			}
+			if cause, ok := b.lastInbound.Load(m.Meta["chat_id"]); ok {
+				m.Meta["in_reply_to"] = cause.(string)
+			}
 			b.logEvent(m, eventlog.Reply, "", "")
 			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
 				b.logEvent(m, eventlog.Dropped, "outbound chat not allowlisted", "")
@@ -630,6 +650,19 @@ func (b *Broker) Run(ctx context.Context) error {
 		if err := b.Backend.Send(ctx, m); err != nil {
 			b.logEvent(m, eventlog.Dropped, "backend send failed", err.Error())
 			_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, "backend error: "+err.Error()))
+			continue
+		}
+		// Accepted by the backend. Record this as the cause for the next reply
+		// on this conversation, and log whether it reached a live session
+		// (injected) or was queued for a disconnected shim (buffered). The
+		// buffered case is the audit-trail evidence that a message survived a
+		// relayd/model reconnect rather than being lost — a claim worth being
+		// able to prove, not just assert.
+		b.lastInbound.Store(m.Meta["chat_id"], m.Meta["msg_id"])
+		if lc, ok := b.Backend.(interface{ Connected() bool }); ok && !lc.Connected() {
+			b.logEvent(m, eventlog.Buffered, "", "")
+		} else {
+			b.logEvent(m, eventlog.Injected, "", "")
 		}
 	}
 	return nil

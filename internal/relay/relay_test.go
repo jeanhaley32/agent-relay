@@ -1164,3 +1164,108 @@ func TestSetCapsLiveReload(t *testing.T) {
 		t.Fatal("expected removing the cap via SetCaps to actually remove it")
 	}
 }
+
+// discBackend is a backend that is never connected, so the broker records an
+// admitted message as buffered (queued for a disconnected shim) rather than
+// injected into a live session.
+type discBackend struct {
+	got  chan Message
+	recv chan Message
+}
+
+func (b *discBackend) Name() string                            { return "disc" }
+func (b *discBackend) Recv() <-chan Message                    { return b.recv }
+func (b *discBackend) Send(_ context.Context, m Message) error { b.got <- m; return nil }
+func (b *discBackend) Close() error                            { close(b.recv); return nil }
+func (b *discBackend) Connected() bool                         { return false }
+
+// TestLedgerLifecycleLinked proves the audit trail records the full lifecycle
+// and joins a reply back to the inbound message that caused it: an admitted
+// message logs received then injected, and the model's reply logs a reply
+// carrying in_reply_to = the inbound msg_id, then send_ok.
+func TestLedgerLifecycleLinked(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+
+	logPath := t.TempDir() + "/events.jsonl"
+	ev, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ev.Close()
+
+	b := &Broker{Frontend: front, Backend: back, Commands: cmds, Meter: budget.New("pro", nil), Events: ev}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	front.recv <- Message{Role: User, Text: "hi", Meta: map[string]string{"chat_id": "c1", "from_id": "c1", "msg_id": "inbound-1"}}
+	select {
+	case <-back.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("message never reached backend")
+	}
+	// Model replies on the same conversation.
+	back.recv <- Message{Role: Assistant, Text: "hello back", Meta: map[string]string{"chat_id": "c1", "msg_id": "reply-1"}}
+	select {
+	case <-front.sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reply never delivered to frontend")
+	}
+
+	if err := ev.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	for _, want := range []string{eventlog.Received, eventlog.Injected, eventlog.Reply, eventlog.SendOK} {
+		if !strings.Contains(s, `"event":"`+want+`"`) {
+			t.Fatalf("expected a %q event in the ledger, got:\n%s", want, s)
+		}
+	}
+	// The reply must be linked back to the inbound msg_id that caused it.
+	if !strings.Contains(s, `"in_reply_to":"inbound-1"`) {
+		t.Fatalf("expected reply linked to inbound-1 via in_reply_to, got:\n%s", s)
+	}
+}
+
+// TestLedgerBuffered proves a message admitted while the backend has no live
+// session is recorded as buffered — the audit evidence that it survived a
+// disconnect rather than being lost.
+func TestLedgerBuffered(t *testing.T) {
+	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
+	back := &discBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
+	cmds := command.NewRegistry()
+	cmds.IsAdmin = func(string) bool { return true }
+
+	logPath := t.TempDir() + "/events.jsonl"
+	ev, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ev.Close()
+
+	b := &Broker{Frontend: front, Backend: back, Commands: cmds, Meter: budget.New("pro", nil), Events: ev}
+	go b.Run(context.Background())
+	defer close(front.recv)
+
+	front.recv <- Message{Role: User, Text: "queued", Meta: map[string]string{"chat_id": "c2", "from_id": "c2", "msg_id": "inbound-2"}}
+	select {
+	case <-back.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("message never reached backend")
+	}
+	// Give the injected/buffered log line time to be written.
+	time.Sleep(100 * time.Millisecond)
+	if err := ev.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(data), `"event":"`+eventlog.Buffered+`"`) {
+		t.Fatalf("expected a buffered event for a disconnected backend, got:\n%s", string(data))
+	}
+}
