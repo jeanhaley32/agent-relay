@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,10 +35,12 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/jeanhaley32/agent-relay/internal/access"
+	"github.com/jeanhaley32/agent-relay/internal/adminbind"
 	"github.com/jeanhaley32/agent-relay/internal/approval"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	"github.com/jeanhaley32/agent-relay/internal/config"
+	"github.com/jeanhaley32/agent-relay/internal/contacts"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
@@ -47,6 +50,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 	"github.com/jeanhaley32/agent-relay/internal/session"
+	"github.com/jeanhaley32/agent-relay/internal/tailnet"
 	"github.com/jeanhaley32/agent-relay/plugins/stylometry"
 )
 
@@ -162,6 +166,18 @@ func main() {
 	// whichever access manager(s) are actually live.
 	var discordAcc *access.Manager
 
+	// Admin device binding: ties an admin's sender id to a Tailscale device
+	// that must show as present before their admin-flagged commands run.
+	// Opt-in and admin-only (see internal/adminbind doc comment) - a sender
+	// with no binding is unaffected, so this is fully backward compatible
+	// until an admin explicitly binds their own device.
+	adminBindPath := filepath.Join(filepath.Dir(cfg.Telegram.AllowlistFile), "adminbind.json")
+	if cfg.Telegram.AllowlistFile == "" {
+		adminBindPath = "adminbind.json"
+	}
+	adminDevices := adminbind.New(adminBindPath, logger)
+	tailnetStatus := tailnet.New(5 * time.Second)
+
 	// Budget + shared control-plane commands + the admin /handshake command.
 	meter := budget.New(cfg.Budget.Tier, nil)
 	cmds := relay.StandardCommands(meter)
@@ -174,10 +190,7 @@ func main() {
 		if err != nil {
 			return false
 		}
-		if acc.IsAdmin(id) {
-			return true
-		}
-		return discordAcc != nil && discordAcc.IsAdmin(id)
+		return acc.IsAdmin(id) || (discordAcc != nil && discordAcc.IsAdmin(id))
 	}
 	cmds.Register(command.Command{
 		Name:  "handshake",
@@ -191,12 +204,24 @@ func main() {
 		}),
 	})
 
+	// Contacts directory: relayd-maintained record of platform identities,
+	// built automatically from inbound traffic. Resolves names like
+	// "discord.jeanh32" or "person:jean" to a live chat_id, so schedules and
+	// replies don't hardcode raw chat_ids that go stale when someone switches
+	// which app they're using (see ~/vessel-log/notes/relay-contacts-protocol.md).
+	contactsPath := filepath.Join(filepath.Dir(cfg.Telegram.AllowlistFile), "contacts.json")
+	if cfg.Telegram.AllowlistFile == "" {
+		contactsPath = "contacts.json"
+	}
+	dir := contacts.New(contactsPath, logger)
+
 	// Claude backend: listen on the socket for the shim.
 	back, err := claudebk.New(cfg.Claude.Socket)
 	if err != nil {
 		logger.Fatalf("claude backend: %v", err)
 	}
 	defer back.Close()
+	back.Resolve = dir.Resolve
 
 	// Telegram frontend, authorized via the access manager.
 	telegramOpts := []telegram.Option{
@@ -411,6 +436,9 @@ func main() {
 	}
 
 	b := &relay.Broker{Frontend: frontendEndpoint, Backend: back, Commands: cmds, Meter: meter,
+		OnInboundObserved: func(m relay.Message) {
+			dir.Observe(m.Meta["platform"], m.Meta["chat_id"], m.Meta["guild_id"], m.Meta["from_name"])
+		},
 		Events:                 events,
 		ConversationCaps:       cfg.Budget.ConversationCaps,
 		DefaultConversationCap: cfg.Budget.DefaultConversationCap,
@@ -516,6 +544,20 @@ func main() {
 		b.SessionGatedUsers = gated
 		b.SessionTTL = 10 * time.Minute
 
+		// Admin device-presence gate (on top of the session gate above): an
+		// admin who has bound a Tailscale device to their id must have that
+		// device online for their Admin-flagged commands specifically, or a
+		// fresh re-auth approval (same Session/Approval machinery) standing
+		// in for it - see AdminDevicePresent's doc comment on Broker.
+		b.AdminDevicePresent = func(senderID string) (required, online bool) {
+			device, bound := adminDevices.Device(senderID)
+			if !bound {
+				return false, false
+			}
+			peer, ok := tailnetStatus.Peer(device)
+			return true, ok && peer.Online
+		}
+
 		// force_reauth tool: the model can trigger a targeted re-auth challenge
 		// (the single-admin counterpart of /reauth's ExpireAll), but only for a
 		// gated admin and only after a human approves via /allow — so a
@@ -548,6 +590,17 @@ func main() {
 			b.Anomaly = det
 			b.AnomalyThreshold = cfg.Stylometry.Threshold
 			b.AnomalyWarnChatID = cfg.Stylometry.WarnChatID
+			// Resolve linked identities (e.g. the same person's Telegram and
+			// Discord accounts) to one canonical key so their style history
+			// accumulates as a single profile instead of splitting per
+			// platform - see contacts.Directory.Link.
+			b.AnomalyIdentity = func(platform, chatID string) string {
+				id, ok := dir.Lookup(platform, chatID)
+				if !ok || id.LinkedTo == "" {
+					return ""
+				}
+				return "person:" + id.LinkedTo
+			}
 			logger.Printf("stylometry enabled: collection=%s threshold=%.2f",
 				cfg.Stylometry.Collection, cfg.Stylometry.Threshold)
 		}

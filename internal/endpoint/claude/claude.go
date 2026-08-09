@@ -72,6 +72,15 @@ type Endpoint struct {
 	conn *ipc.Conn // current shim connection (nil until one connects)
 
 	closeOnce sync.Once
+
+	// Resolve, if set, is consulted for every ChatID carried on a reply or
+	// schedule frame from the shim — turning a contacts-directory name
+	// (e.g. "discord.jeanh32", "person:jean") into the live chat_id it
+	// should actually be delivered to. ok=false (including nil Resolve)
+	// leaves the ChatID unchanged, so this is backward compatible with
+	// literal chat_ids the model already knows. Set once before Run(); not
+	// safe to mutate concurrently with inbound frames.
+	Resolve func(name string) (chatID string, ok bool)
 }
 
 // New starts listening on socketPath for the shim and returns the endpoint. The
@@ -224,8 +233,14 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 		}
 		switch f.Kind {
 		case ipc.KindReply:
+			chatID := f.ChatID
+			if e.Resolve != nil {
+				if resolved, ok := e.Resolve(chatID); ok {
+					chatID = resolved
+				}
+			}
 			msg := relay.Message{
-				ConversationID: f.ChatID,
+				ConversationID: chatID,
 				Role:           relay.Assistant,
 				Text:           f.Text,
 				// reply_id carries the correlation id back to ReplyRespond,
@@ -234,7 +249,7 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 				// Outbound replies get their own msg_id too: "uniquely identify
 				// EVERY message" means model-generated ones as well, otherwise a
 				// reply can be seen in the audit trail but never referred to.
-				Meta: map[string]string{"chat_id": f.ChatID, "reply_id": f.RequestID, "msg_id": eventlog.NewMsgID()},
+				Meta: map[string]string{"chat_id": chatID, "reply_id": f.RequestID, "msg_id": eventlog.NewMsgID()},
 			}
 			select {
 			case e.recv <- msg:
@@ -255,9 +270,15 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 			default:
 			}
 		case ipc.KindSchedReq:
+			chatID := f.ChatID
+			if e.Resolve != nil {
+				if resolved, ok := e.Resolve(chatID); ok {
+					chatID = resolved
+				}
+			}
 			req := SchedRequest{
 				ReqID: f.RequestID, Op: f.Op, Text: f.Text, Cron: f.Cron,
-				InSeconds: f.InSeconds, SchedID: f.SchedID, ChatID: f.ChatID,
+				InSeconds: f.InSeconds, SchedID: f.SchedID, ChatID: chatID,
 			}
 			select {
 			case e.schedreq <- req:
