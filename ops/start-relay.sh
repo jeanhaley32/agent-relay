@@ -27,6 +27,10 @@ session_id=$(cat .relay_session_id)
 # wall. Both must also be injected into the tmux pane in run.sh - a pane inherits
 # the tmux SERVER's env, not this launcher's, so setting them here alone is not
 # enough (verified via /proc/<pid>/environ). See run.sh for that half.
-exec env SESSION_ID="$session_id" UNATTENDED=1 ISOLATE=0 \
+# MODEL=opus runs the relay session on Opus instead of run.sh's sonnet default.
+# Unlike the cap vars above, this needs no pane injection: run.sh reads MODEL
+# into $MODEL and expands it into the launch command itself, so the launcher's
+# env is sufficient.
+exec env SESSION_ID="$session_id" UNATTENDED=1 ISOLATE=0 MODEL=opus \
 	CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=2000 \
 	CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION=1000 bash scripts/run.sh
