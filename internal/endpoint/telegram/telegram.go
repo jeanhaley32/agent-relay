@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
-	"github.com/jeanhaley32/agent-relay/internal/eventlog"
+	"github.com/jeanhaley32/agent-relay/internal/inbound"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
@@ -287,23 +287,12 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 				f.logger.Printf("dropped message from unauthorized sender id=%d (%s) — recorded as pending", m.From.ID, name)
 				continue
 			}
-			msg := relay.Message{
-				ConversationID: strconv.FormatInt(m.Chat.ID, 10),
-				Role:           relay.User,
-				Text:           m.Text,
-				Meta: map[string]string{
-					// msg_id is this message's identity for the whole relay. It
-					// is stamped once here at ingress and rides along in Meta
-					// (which propagates into the inject frame and the <channel>
-					// tag), so every later log line can be correlated back to
-					// the exact message a user sent.
-					"msg_id":    eventlog.NewMsgID(),
-					"chat_id":   strconv.FormatInt(m.Chat.ID, 10),
-					"from_id":   strconv.FormatInt(m.From.ID, 10),
-					"from_name": m.From.Username,
-					"platform":  "telegram",
-				},
-			}
+			// Canonical inbound envelope (msg_id, ts, platform, sender identity)
+			// is built by the shared inbound package so every frontend produces
+			// the same shape from one place. chat_id == the conversation id for
+			// Telegram.
+			chatID := strconv.FormatInt(m.Chat.ID, 10)
+			msg := inbound.Envelope("telegram", chatID, m.Text, chatID, strconv.FormatInt(m.From.ID, 10), m.From.Username)
 			select {
 			case f.recv <- msg:
 			case <-ctx.Done():

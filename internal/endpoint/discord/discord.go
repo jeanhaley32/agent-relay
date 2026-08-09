@@ -28,7 +28,7 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
-	"github.com/jeanhaley32/agent-relay/internal/eventlog"
+	"github.com/jeanhaley32/agent-relay/internal/inbound"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
@@ -527,22 +527,12 @@ func (f *Frontend) gate(m inboundMessage) (relay.Message, bool) {
 		f.dmConvs.Store(convID, struct{}{})
 	}
 
-	msg := relay.Message{
-		ConversationID: convID,
-		Role:           relay.User,
-		Text:           m.content,
-		Meta: map[string]string{
-			// See telegram.go: msg_id is stamped once at ingress and rides in
-			// Meta through the whole relay, so every log line for this message
-			// can be correlated back to what the user actually sent.
-			"msg_id":     eventlog.NewMsgID(),
-			"chat_id":    convID,
-			"channel_id": m.channelID.String(),
-			"from_id":    m.authorID.String(),
-			"from_name":  m.authorName,
-			"platform":   "discord",
-		},
-	}
+	// Canonical inbound envelope (msg_id, ts, platform, sender identity) comes
+	// from the shared inbound package — the same constructor Telegram uses — so
+	// the common shape lives in one place. Discord then layers on its
+	// platform-specific channel_id (and, below, the guild marker).
+	msg := inbound.Envelope("discord", convID, m.content, convID, m.authorID.String(), m.authorName)
+	msg.Meta["channel_id"] = m.channelID.String()
 	if m.guildID != nil {
 		// Marks this message as one where chat_id (the channel id) is NOT
 		// expected to equal from_id (the sender's user id) — the Broker's
