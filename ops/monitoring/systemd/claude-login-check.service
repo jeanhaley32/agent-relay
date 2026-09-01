@@ -1,0 +1,9 @@
+[Unit]
+Description=Emit Prometheus metrics on Claude relay login/auth health
+After=agent-relay.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/jeanh/agent-relay/scripts/check-claude-login.py
+# Short, read-only probe; keep it from lingering if tmux hangs.
+TimeoutStartSec=30
