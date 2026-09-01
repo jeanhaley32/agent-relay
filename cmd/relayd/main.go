@@ -1169,6 +1169,59 @@ func newRelaydMux(back *claudebk.Endpoint, admins []adminTarget, acc *access.Man
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+
+	// /webhook/login-alert delivers an alert STRAIGHT to the admin frontend
+	// (Telegram/Discord), bypassing the Claude session entirely. This exists
+	// precisely for alerts about the Claude session itself being unavailable -
+	// login/auth expiry above all. The ordinary /webhook/grafana path injects
+	// alerts via back.Send (into the model), so an alert saying "Claude login is
+	// dead" would land in the same dead pane and never reach the user - which is
+	// exactly what happened on 2026-09-01 (the alerts fired, showed up in the
+	// pane behind a "Login expired" wall, and Jean had to notice manually). This
+	// path routes through relayd (a separate always-up service that already holds
+	// the frontend Send handles), never through the model, so it survives Claude
+	// being down. Loopback-only, same as the other webhooks.
+	mux.HandleFunc("/webhook/login-alert", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if len(admins) == 0 {
+			logger.Printf("login-alert webhook: no admin target configured, dropping alert")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var payload grafanaWebhookPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			logger.Printf("login-alert webhook: bad payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		for _, a := range payload.Alerts {
+			name := a.Labels["alertname"]
+			severity := a.Labels["severity"]
+			summary := a.Annotations["summary"]
+			if summary == "" {
+				summary = a.Annotations["description"]
+			}
+			text := fmt.Sprintf("⚠️ [%s/%s] %s: %s\n\n(Delivered out-of-band by relayd - the Claude session may be unreachable. If this is a login/auth expiry, run /login in the relay tmux pane.)",
+				a.Status, severity, name, summary)
+			for _, adm := range admins {
+				// adm.send is the frontend's own Send (telegram/discord) - direct
+				// to the user, NOT through the model backend. AssistantMsg marks
+				// it as an outbound assistant message to that conversation.
+				if err := adm.send(context.Background(), relay.AssistantMsg(adm.chatID, text)); err != nil {
+					logger.Printf("login-alert webhook: send to %s failed: %v", adm.chatID, err)
+				}
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	return mux
 }
 

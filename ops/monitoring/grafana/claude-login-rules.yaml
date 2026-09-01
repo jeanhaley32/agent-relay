@@ -1,0 +1,78 @@
+apiVersion: 1
+groups:
+- orgId: 1
+  name: claude-login
+  folder: Vessel Alerts
+  interval: 1m
+  rules:
+  # REACTIVE: the relay Claude pane is showing the "Login expired / run /login"
+  # wall right now. This is the signal that actually fired on 2026-09-01. Routed
+  # out-of-band because the session it reports on is, by definition, down.
+  - uid: claude-login-expired
+    title: Claude Relay Login Expired
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange: {from: 120, to: 0}
+      datasourceUid: PBFA97CFB590B2093
+      model:
+        expr: claude_login_expired
+        instant: true
+        refId: A
+    - refId: C
+      relativeTimeRange: {from: 120, to: 0}
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        refId: C
+        expression: A
+        conditions:
+        - evaluator: {type: gt, params: [0]}
+          operator: {type: and}
+          query: {params: [A]}
+          reducer: {type: last}
+          type: query
+    noDataState: OK
+    execErrState: OK
+    for: 2m
+    labels:
+      severity: critical
+      alert_channel: out-of-band
+    annotations:
+      summary: 'Claude relay login has EXPIRED — the session cannot process messages until you run /login in the relay tmux pane (tmux attach -t relay). This alert was delivered out-of-band because the Claude session itself is down.'
+
+  # PROACTIVE: the refresh token (the ~monthly hard wall that a re-login resets)
+  # expires in under 24h. Gives a day to re-login on your own schedule instead
+  # of being surprised. Warning severity, same out-of-band path.
+  - uid: claude-refresh-token-expiring
+    title: Claude Refresh Token Expiring Soon
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange: {from: 600, to: 0}
+      datasourceUid: PBFA97CFB590B2093
+      model:
+        expr: claude_refresh_token_expires_seconds
+        instant: true
+        refId: A
+    - refId: C
+      relativeTimeRange: {from: 600, to: 0}
+      datasourceUid: __expr__
+      model:
+        type: threshold
+        refId: C
+        expression: A
+        conditions:
+        - evaluator: {type: lt, params: [86400]}
+          operator: {type: and}
+          query: {params: [A]}
+          reducer: {type: last}
+          type: query
+    noDataState: OK
+    execErrState: OK
+    for: 10m
+    labels:
+      severity: warning
+      alert_channel: out-of-band
+    annotations:
+      summary: 'Claude refresh token expires in under 24h — run /login in the relay tmux pane soon to avoid the relay going dark. A manual /login resets this for another ~month.'

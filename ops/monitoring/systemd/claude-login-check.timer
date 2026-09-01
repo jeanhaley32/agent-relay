@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Claude login/auth health check periodically
+
+[Timer]
+# Every 2 minutes: catches a login-expired pane quickly without being chatty.
+OnBootSec=90
+OnUnitActiveSec=120
+AccuracySec=15
+
+[Install]
+WantedBy=timers.target
