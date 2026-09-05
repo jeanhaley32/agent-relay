@@ -18,6 +18,7 @@ import (
 type Config struct {
 	Telegram   TelegramConfig   `json:"telegram"`
 	Discord    DiscordConfig    `json:"discord"`
+	Matrix     MatrixConfig     `json:"matrix"`
 	Claude     ClaudeConfig     `json:"claude"`
 	Budget     BudgetConfig     `json:"budget"`
 	Scheduler  SchedulerConfig  `json:"scheduler"`
@@ -113,6 +114,22 @@ func (d DiscordConfig) RequireMentionInGuild() bool {
 		return true
 	}
 	return *d.RequireMentionInGuildRaw
+}
+
+// MatrixConfig configures the optional Matrix frontend — Jean's private,
+// tailnet-only admin channel via a self-hosted homeserver. Like Discord it is
+// fully optional and fail-closed: Enabled=false (the zero value) means the
+// frontend goroutine never starts. Because the homeserver is reachable only
+// over Tailscale, reachability itself is the authentication, so this path is
+// deliberately exempt from the session/approval gate — see
+// internal/endpoint/matrix. The Admins here are Matrix user ids
+// (e.g. "@admin:example.org"); only their messages are relayed, and they are treated
+// as relay admins (so the group-room from_id!=chat_id lockdown doesn't fire).
+type MatrixConfig struct {
+	Enabled       bool     `json:"enabled"`
+	HomeserverURL string   `json:"homeserver_url"` // e.g. https://rodin.tailf50bd.ts.net:8448
+	TokenEnv      string   `json:"token_env"`      // env var holding the bot access token
+	Admins        []string `json:"admins"`         // Matrix user ids whose messages are relayed
 }
 
 // AdminIDs parses Discord.Admins as snowflake ids, returning a clear error on
