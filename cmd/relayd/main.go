@@ -44,6 +44,7 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/deniedlog"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/matrix"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
 	"github.com/jeanhaley32/agent-relay/internal/eventlog"
@@ -179,6 +180,18 @@ func main() {
 	adminDevices := adminbind.New(adminBindPath, logger)
 	tailnetStatus := tailnet.New(5 * time.Second)
 
+	// matrixAdmins is the set of Matrix user ids (e.g. "@admin:example.org") treated
+	// as relay admins. Matrix ids are non-numeric, so they live outside the
+	// access.Manager (which keys on int64) and are consulted directly by the
+	// IsAdmin closure below. Deliberately NOT added to SessionGatedUsers: the
+	// tailnet-only homeserver is the gate-bypass — see internal/endpoint/matrix.
+	matrixAdmins := make(map[string]bool, len(cfg.Matrix.Admins))
+	if cfg.Matrix.Enabled {
+		for _, a := range cfg.Matrix.Admins {
+			matrixAdmins[a] = true
+		}
+	}
+
 	// Budget + shared control-plane commands + the admin /handshake command.
 	meter := budget.New(cfg.Budget.Tier, nil)
 	cmds := relay.StandardCommands(meter)
@@ -187,6 +200,9 @@ func main() {
 	// admin ids live in its own manager, so a Discord admin's id is only
 	// ever found in discordAcc, and would otherwise never satisfy IsAdmin.
 	cmds.IsAdmin = func(senderID string) bool {
+		if matrixAdmins[senderID] {
+			return true // Matrix admin ids are non-numeric (@user:server)
+		}
 		id, err := strconv.ParseInt(senderID, 10, 64)
 		if err != nil {
 			return false
@@ -279,9 +295,18 @@ func main() {
 	// Frontend slot via relay.MultiFrontend alongside Telegram.
 	frontendEndpoint := relay.Endpoint(front)
 	var discordFront *discord.Frontend
+	var matrixFront *matrix.Frontend
+	frontends := []relay.Endpoint{front}
 	if cfg.Discord.Enabled {
 		discordFront, discordAcc = mustStartDiscord(cfg, logger, deniedLog)
-		frontendEndpoint = relay.NewMultiFrontend(front, discordFront)
+		frontends = append(frontends, discordFront)
+	}
+	if cfg.Matrix.Enabled {
+		matrixFront = mustStartMatrix(cfg, logger)
+		frontends = append(frontends, matrixFront)
+	}
+	if len(frontends) > 1 {
+		frontendEndpoint = relay.NewMultiFrontend(frontends...)
 	}
 
 	// Permission relay: admins approve tool-use prompts via /allow and /deny.
@@ -492,7 +517,15 @@ func main() {
 	}
 	// Outbound gate: see outboundAllowed's doc comment for the full rationale.
 	b.OutboundAllowed = func(chatID string) bool {
-		known := func(id string) bool { return discordFront != nil && discordFront.KnownConversation(id) }
+		known := func(id string) bool {
+			if discordFront != nil && discordFront.KnownConversation(id) {
+				return true
+			}
+			// A Matrix room id (starts with '!') is a legitimate outbound
+			// target: the model only ever gets a Matrix conversation from an
+			// authorized admin's inbound message, so replying into it is safe.
+			return matrixFront != nil && matrixFront.OwnsConversationID(id)
+		}
 		if outboundAllowed(chatID, acc, discordAcc, known) {
 			return true
 		}
@@ -727,6 +760,54 @@ func mustStartDiscord(cfg *config.Config, logger *log.Logger, deniedLog deniedlo
 	logger.Printf("connected to Discord (admins=%d, allowlist=%d, guild_messages=%v)",
 		len(adminIDs), len(allowIDs), cfg.Discord.AllowGuildMessages)
 	return front, discordAcc
+}
+
+// mustStartMatrix constructs the Matrix frontend, verifies its access token
+// against the homeserver (whoami), and starts its inbound /sync loop. Fatal on
+// misconfiguration (missing token/homeserver) so a half-configured admin
+// channel fails loudly rather than silently never receiving. The Connect uses a
+// bounded retry loop for the same boot-time-network-race reason as Discord.
+func mustStartMatrix(cfg *config.Config, logger *log.Logger) *matrix.Frontend {
+	tokenEnv := cfg.Matrix.TokenEnv
+	if tokenEnv == "" {
+		tokenEnv = "MATRIX_ACCESS_TOKEN"
+	}
+	token := os.Getenv(tokenEnv)
+	if token == "" {
+		logger.Fatalf("matrix: no access token in env %s", tokenEnv)
+	}
+	if cfg.Matrix.HomeserverURL == "" {
+		logger.Fatalf("matrix: homeserver_url is required")
+	}
+	if len(cfg.Matrix.Admins) == 0 {
+		logger.Fatalf("matrix: at least one admin user id is required (fail-closed)")
+	}
+	front := matrix.New(cfg.Matrix.HomeserverURL, token, cfg.Matrix.Admins, logger)
+
+	backoff := 2 * time.Second
+	connectDeadline := time.Now().Add(2 * time.Minute)
+	var selfID string
+	for {
+		cctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
+		id, err := front.Connect(cctx)
+		ccancel()
+		if err == nil {
+			selfID = id
+			break
+		}
+		if time.Now().After(connectDeadline) {
+			logger.Fatalf("matrix: connect failed after retrying for 2m: %v", err)
+		}
+		logger.Printf("matrix connect failed, retrying in %s: %v", backoff, err)
+		time.Sleep(backoff)
+		if backoff < 15*time.Second {
+			backoff *= 2
+		}
+	}
+	go front.Run(context.Background(), selfID)
+	logger.Printf("connected to Matrix as %s (homeserver=%s, admins=%d)",
+		selfID, cfg.Matrix.HomeserverURL, len(cfg.Matrix.Admins))
+	return front
 }
 
 // tailscaleIP resolves this host's current Tailscale IPv4 address from the
