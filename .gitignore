@@ -38,3 +38,6 @@ __pycache__/
 
 # Message audit trail: contains chat_id/from_id, never commit
 relay-events.jsonl
+
+# Matrix inbound media spool (downloaded files, not source)
+matrix-media/

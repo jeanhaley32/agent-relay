@@ -130,6 +130,11 @@ type MatrixConfig struct {
 	HomeserverURL string   `json:"homeserver_url"` // e.g. https://rodin.tailf50bd.ts.net:8448
 	TokenEnv      string   `json:"token_env"`      // env var holding the bot access token
 	Admins        []string `json:"admins"`         // Matrix user ids whose messages are relayed
+	// MediaSpool is a directory where inbound media (images/audio/video/files)
+	// are downloaded so the backend can open them. Empty ⇒ media is surfaced as
+	// a text note but not downloaded. Relative paths resolve against relayd's
+	// working directory.
+	MediaSpool string `json:"media_spool"`
 }
 
 // AdminIDs parses Discord.Admins as snowflake ids, returning a clear error on

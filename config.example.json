@@ -20,7 +20,8 @@
     "enabled": false,
     "homeserver_url": "https://matrix.example.org:8448",
     "token_env": "MATRIX_ACCESS_TOKEN",
-    "admins": ["@admin:example.org"]
+    "admins": ["@admin:example.org"],
+    "media_spool": "matrix-media"
   },
   "claude": {
     "socket": "/tmp/agent-relay.sock"
