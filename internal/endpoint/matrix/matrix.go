@@ -31,6 +31,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +60,7 @@ type Frontend struct {
 	homeserver string // base URL, e.g. https://rodin.tailf50bd.ts.net:8448
 	token      string // bot access token
 	admins     map[string]bool
+	mediaSpool string // dir where inbound media files are saved (empty ⇒ media ignored)
 	logger     *log.Logger
 	http       *http.Client
 
@@ -82,8 +85,11 @@ type Frontend struct {
 
 // New constructs a Matrix frontend. homeserver is the base URL; token is the
 // bot's access token; admins is the set of Matrix user ids (e.g.
-// "@admin:example.org") whose messages are relayed — every other sender is ignored.
-func New(homeserver, token string, admins []string, logger *log.Logger) *Frontend {
+// "@admin:example.org") whose messages are relayed — every other sender is
+// ignored. mediaSpool is a directory where inbound media (images/audio/etc.)
+// are downloaded so the backend can open them; empty disables media handling
+// (media messages are then surfaced as a text note without a downloaded file).
+func New(homeserver, token string, admins []string, mediaSpool string, logger *log.Logger) *Frontend {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -95,6 +101,7 @@ func New(homeserver, token string, admins []string, logger *log.Logger) *Fronten
 		homeserver: strings.TrimRight(homeserver, "/"),
 		token:      token,
 		admins:     adm,
+		mediaSpool: mediaSpool,
 		logger:     logger,
 		http:       &http.Client{Timeout: httpTimeout},
 		out:        make(chan relay.Message, 64),
@@ -195,12 +202,26 @@ func (f *Frontend) Run(ctx context.Context, selfID string) {
 	}
 }
 
-// inbound is a decoded room message event.
+// inbound is a decoded room message event. For media messages (image/audio/
+// video/file), mxcURL/filename/mimetype are set and the adapter downloads the
+// file before delivering a text pointer to it.
 type inbound struct {
-	roomID  string
-	sender  string
-	body    string
-	eventID string
+	roomID   string
+	sender   string
+	body     string
+	eventID  string
+	msgtype  string
+	mxcURL   string
+	filename string
+	mimetype string
+}
+
+// mediaMsgTypes are the m.room.message msgtypes that carry a downloadable file.
+var mediaMsgTypes = map[string]string{
+	"m.image": "image",
+	"m.audio": "audio",
+	"m.video": "video",
+	"m.file":  "file",
 }
 
 func (f *Frontend) deliver(m inbound) {
@@ -212,21 +233,43 @@ func (f *Frontend) deliver(m inbound) {
 	// separately so Send can route the reply back into it.
 	convID := m.sender
 	f.roomByConv.Store(convID, m.roomID)
+
+	text := m.body
+	meta := map[string]string{
+		// msg_id is this message's identity across the whole relay,
+		// stamped once at ingress like the other frontends do.
+		"msg_id":    eventlog.NewMsgID(),
+		"chat_id":   convID,
+		"from_id":   m.sender,
+		"from_name": m.sender,
+		"room_id":   m.roomID,
+		"source":    "matrix",
+		"event_id":  m.eventID,
+	}
+
+	// Media message: download the file and rewrite the text into a pointer the
+	// backend can act on (it can open the local path). The raw body of a media
+	// message is just the filename, which alone tells the model nothing.
+	if kind, isMedia := mediaMsgTypes[m.msgtype]; isMedia {
+		meta["media_kind"] = kind
+		meta["media_mimetype"] = m.mimetype
+		path, err := f.downloadMedia(m.mxcURL, m.filename, m.eventID)
+		if err != nil {
+			f.logger.Printf("matrix: failed to download %s %q: %v", kind, m.filename, err)
+			text = fmt.Sprintf("[%s received from Matrix: %q (%s) — download FAILED: %v]",
+				kind, m.filename, m.mimetype, err)
+		} else {
+			meta["media_path"] = path
+			text = fmt.Sprintf("[%s received from Matrix: %q (%s), saved to %s — open it to view]",
+				kind, m.filename, m.mimetype, path)
+		}
+	}
+
 	msg := relay.Message{
 		ConversationID: convID,
 		Role:           relay.User,
-		Text:           m.body,
-		Meta: map[string]string{
-			// msg_id is this message's identity across the whole relay,
-			// stamped once at ingress like the other frontends do.
-			"msg_id":    eventlog.NewMsgID(),
-			"chat_id":   convID,
-			"from_id":   m.sender,
-			"from_name": m.sender,
-			"room_id":   m.roomID,
-			"source":    "matrix",
-			"event_id":  m.eventID,
-		},
+		Text:           text,
+		Meta:           meta,
 	}
 	select {
 	case f.out <- msg:
@@ -236,6 +279,99 @@ func (f *Frontend) deliver(m inbound) {
 		f.recvDrops.Add(1)
 		f.logger.Printf("matrix: recv buffer full, dropped message from %s", m.sender)
 	}
+}
+
+// downloadMedia fetches an mxc:// URI into the media spool and returns the
+// local file path. It uses the authenticated v1 media endpoint (the legacy
+// unauthenticated v3 endpoint is removed on current homeservers). The file is
+// named with a short event-id prefix so repeated filenames don't collide.
+func (f *Frontend) downloadMedia(mxc, filename, eventID string) (string, error) {
+	if f.mediaSpool == "" {
+		return "", fmt.Errorf("media spool not configured")
+	}
+	server, mediaID, ok := parseMXC(mxc)
+	if !ok {
+		return "", fmt.Errorf("invalid mxc uri %q", mxc)
+	}
+	if err := os.MkdirAll(f.mediaSpool, 0o755); err != nil {
+		return "", err
+	}
+	local := filepath.Join(f.mediaSpool, safeFilename(eventID, filename))
+	u := fmt.Sprintf("%s/_matrix/client/v1/media/download/%s/%s",
+		f.homeserver, url.PathEscape(server), url.PathEscape(mediaID))
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+f.token)
+	resp, err := f.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("download %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	out, err := os.Create(local)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+	// Bound the write so a hostile/oversized response can't fill the disk. The
+	// homeserver's own upload limit is 20 MiB; 64 MiB is comfortable slack.
+	if _, err := io.Copy(out, io.LimitReader(resp.Body, 64<<20)); err != nil {
+		return "", err
+	}
+	return local, nil
+}
+
+// parseMXC splits an mxc://server/mediaID URI.
+func parseMXC(mxc string) (server, mediaID string, ok bool) {
+	rest, found := strings.CutPrefix(mxc, "mxc://")
+	if !found {
+		return "", "", false
+	}
+	server, mediaID, found = strings.Cut(rest, "/")
+	if !found || server == "" || mediaID == "" {
+		return "", "", false
+	}
+	return server, mediaID, true
+}
+
+// safeFilename builds a path-safe local name: a short unique tag from the event
+// id, an underscore, then the sanitized original filename. The tag prevents two
+// files with the same name (e.g. "IMG_0001.jpg" twice) from overwriting.
+func safeFilename(eventID, filename string) string {
+	base := sanitizeName(filepath.Base(filename))
+	if base == "" || base == "." {
+		base = "file"
+	}
+	tag := sanitizeName(strings.TrimPrefix(eventID, "$"))
+	if len(tag) > 10 {
+		tag = tag[len(tag)-10:]
+	}
+	if tag == "" {
+		tag = "media"
+	}
+	return tag + "_" + base
+}
+
+// sanitizeName maps anything outside [A-Za-z0-9._-] to '_' so the result is a
+// safe single path segment.
+func sanitizeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // Send delivers m into the Matrix room named by m.ConversationID (falling back
@@ -299,15 +435,24 @@ func (f *Frontend) syncOnce(ctx context.Context, since string) (string, []inboun
 			if ev.Type != "m.room.message" {
 				continue
 			}
-			if ev.Content.MsgType != "m.text" && ev.Content.MsgType != "m.notice" {
+			isText := ev.Content.MsgType == "m.text" || ev.Content.MsgType == "m.notice"
+			_, isMedia := mediaMsgTypes[ev.Content.MsgType]
+			if !isText && !isMedia {
 				continue
 			}
-			msgs = append(msgs, inbound{
+			in := inbound{
 				roomID:  roomID,
 				sender:  ev.Sender,
 				body:    ev.Content.Body,
 				eventID: ev.EventID,
-			})
+				msgtype: ev.Content.MsgType,
+			}
+			if isMedia {
+				in.mxcURL = ev.Content.URL
+				in.filename = ev.Content.Body
+				in.mimetype = ev.Content.Info.MimeType
+			}
+			msgs = append(msgs, in)
 		}
 		// Auto-join is handled below via invite state.
 	}
@@ -345,7 +490,12 @@ type event struct {
 	EventID string `json:"event_id"`
 	Content struct {
 		MsgType string `json:"msgtype"`
-		Body    string `json:"body"`
+		Body    string `json:"body"` // text body, or filename for media
+		URL     string `json:"url"`  // mxc:// URI for media messages
+		Info    struct {
+			MimeType string `json:"mimetype"`
+			Size     int64  `json:"size"`
+		} `json:"info"`
 	} `json:"content"`
 }
 

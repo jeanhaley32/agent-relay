@@ -782,7 +782,11 @@ func mustStartMatrix(cfg *config.Config, logger *log.Logger) *matrix.Frontend {
 	if len(cfg.Matrix.Admins) == 0 {
 		logger.Fatalf("matrix: at least one admin user id is required (fail-closed)")
 	}
-	front := matrix.New(cfg.Matrix.HomeserverURL, token, cfg.Matrix.Admins, logger)
+	mediaSpool := cfg.Matrix.MediaSpool
+	if mediaSpool == "" {
+		mediaSpool = "matrix-media"
+	}
+	front := matrix.New(cfg.Matrix.HomeserverURL, token, cfg.Matrix.Admins, mediaSpool, logger)
 
 	backoff := 2 * time.Second
 	connectDeadline := time.Now().Add(2 * time.Minute)
