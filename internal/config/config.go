@@ -19,6 +19,7 @@ type Config struct {
 	Telegram   TelegramConfig   `json:"telegram"`
 	Discord    DiscordConfig    `json:"discord"`
 	Matrix     MatrixConfig     `json:"matrix"`
+	Web        WebConfig        `json:"web"`
 	Claude     ClaudeConfig     `json:"claude"`
 	Budget     BudgetConfig     `json:"budget"`
 	Scheduler  SchedulerConfig  `json:"scheduler"`
@@ -130,6 +131,23 @@ type MatrixConfig struct {
 	HomeserverURL string   `json:"homeserver_url"` // e.g. https://rodin.tailf50bd.ts.net:8448
 	TokenEnv      string   `json:"token_env"`      // env var holding the bot access token
 	Admins        []string `json:"admins"`         // Matrix user ids whose messages are relayed
+}
+
+// WebConfig configures the optional self-hosted web frontend (a browser chat
+// pane, e.g. in vessel-writer). Like Matrix it is fully optional and
+// fail-closed: Enabled=false (the zero value) means the server never starts.
+// The page is reachable only over the tailnet, and every request is verified by
+// `tailscale whois` against TailnetOwner, so reachability + whois is the
+// authentication — this path is deliberately exempt from the session/approval
+// gate (its ConvID is NOT added to SessionGatedUsers) exactly like Matrix. The
+// single ConvID is treated as chat_id AND from_id (a 1:1 channel) and is
+// registered as a relay admin.
+type WebConfig struct {
+	Enabled      bool   `json:"enabled"`
+	ListenAddr   string `json:"listen_addr"`   // localhost bind, e.g. 127.0.0.1:8792 (nginx proxies it)
+	ConvID       string `json:"conv_id"`       // the channel's chat_id == from_id, e.g. "web-jean"
+	FromName     string `json:"from_name"`     // display name for the sender, e.g. "Jean"
+	TailnetOwner string `json:"tailnet_owner"` // required whois LoginName, e.g. jeanhaley32@gmail.com
 }
 
 // AdminIDs parses Discord.Admins as snowflake ids, returning a clear error on
