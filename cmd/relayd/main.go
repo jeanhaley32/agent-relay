@@ -45,6 +45,7 @@ import (
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/matrix"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/web"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
 	"github.com/jeanhaley32/agent-relay/internal/eventlog"
@@ -192,6 +193,16 @@ func main() {
 		}
 	}
 
+	// webAdmins holds the web frontend's single ConvID (non-numeric, e.g.
+	// "web-jean"), treated as a relay admin. Like Matrix it lives outside the
+	// int64 access.Manager and is consulted by the IsAdmin closure. Deliberately
+	// NOT added to SessionGatedUsers: the tailnet whois check on every request
+	// is the gate — see internal/endpoint/web.
+	webAdmins := make(map[string]bool, 1)
+	if cfg.Web.Enabled && cfg.Web.ConvID != "" {
+		webAdmins[cfg.Web.ConvID] = true
+	}
+
 	// Budget + shared control-plane commands + the admin /handshake command.
 	meter := budget.New(cfg.Budget.Tier, nil)
 	cmds := relay.StandardCommands(meter)
@@ -202,6 +213,9 @@ func main() {
 	cmds.IsAdmin = func(senderID string) bool {
 		if matrixAdmins[senderID] {
 			return true // Matrix admin ids are non-numeric (@user:server)
+		}
+		if webAdmins[senderID] {
+			return true // web frontend ConvID (non-numeric), tailnet-whois verified
 		}
 		id, err := strconv.ParseInt(senderID, 10, 64)
 		if err != nil {
@@ -304,6 +318,11 @@ func main() {
 	if cfg.Matrix.Enabled {
 		matrixFront = mustStartMatrix(cfg, logger)
 		frontends = append(frontends, matrixFront)
+	}
+	var webFront *web.Frontend
+	if cfg.Web.Enabled {
+		webFront = mustStartWeb(cfg, logger)
+		frontends = append(frontends, webFront)
 	}
 	if len(frontends) > 1 {
 		frontendEndpoint = relay.NewMultiFrontend(frontends...)
@@ -524,7 +543,13 @@ func main() {
 			// A Matrix room id (starts with '!') is a legitimate outbound
 			// target: the model only ever gets a Matrix conversation from an
 			// authorized admin's inbound message, so replying into it is safe.
-			return matrixFront != nil && matrixFront.OwnsConversationID(id)
+			if matrixFront != nil && matrixFront.OwnsConversationID(id) {
+				return true
+			}
+			// The web pane's ConvID is a legitimate outbound target for the same
+			// reason as Matrix: the model only ever sees it from a whois-verified
+			// admin inbound, so replying back into it is safe.
+			return webFront != nil && webFront.OwnsConversationID(id)
 		}
 		if outboundAllowed(chatID, acc, discordAcc, known) {
 			return true
@@ -807,6 +832,33 @@ func mustStartMatrix(cfg *config.Config, logger *log.Logger) *matrix.Frontend {
 	go front.Run(context.Background(), selfID)
 	logger.Printf("connected to Matrix as %s (homeserver=%s, admins=%d)",
 		selfID, cfg.Matrix.HomeserverURL, len(cfg.Matrix.Admins))
+	return front
+}
+
+// mustStartWeb constructs and starts the web frontend (SSE+POST chat over the
+// tailnet). Fatal on misconfiguration (missing conv_id / tailnet_owner) so a
+// half-configured channel fails loudly rather than silently accepting nothing —
+// or, worse, accepting everything.
+func mustStartWeb(cfg *config.Config, logger *log.Logger) *web.Frontend {
+	addr := cfg.Web.ListenAddr
+	if addr == "" {
+		addr = "127.0.0.1:8792"
+	}
+	if cfg.Web.ConvID == "" {
+		logger.Fatalf("web: conv_id is required (fail-closed)")
+	}
+	if cfg.Web.TailnetOwner == "" {
+		logger.Fatalf("web: tailnet_owner is required (fail-closed)")
+	}
+	name := cfg.Web.FromName
+	if name == "" {
+		name = "web"
+	}
+	front, err := web.New(addr, cfg.Web.ConvID, name, cfg.Web.TailnetOwner, logger)
+	if err != nil {
+		logger.Fatalf("web: %v", err)
+	}
+	logger.Printf("web frontend listening on %s (conv=%s owner=%s)", addr, cfg.Web.ConvID, cfg.Web.TailnetOwner)
 	return front
 }
 

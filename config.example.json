@@ -22,6 +22,13 @@
     "token_env": "MATRIX_ACCESS_TOKEN",
     "admins": ["@admin:example.org"]
   },
+  "web": {
+    "enabled": false,
+    "listen_addr": "127.0.0.1:8792",
+    "conv_id": "web-user",
+    "from_name": "You",
+    "tailnet_owner": "you@example.com"
+  },
   "claude": {
     "socket": "/tmp/agent-relay.sock"
   },
