@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,8 +27,11 @@ func (r *recordRevoke) fn(id string) { r.got = append(r.got, id) }
 func TestForceReauthDeniedDoesNotRevoke(t *testing.T) {
 	gate := newReauthGate()
 	var rev recordRevoke
+	// prompt is written by handleReauth's goroutine (via notify) and read by this
+	// test goroutine before <-done, so it needs its own guard against the race.
+	var mu sync.Mutex
 	var prompt string
-	notify := func(text string) error { prompt = text; return nil }
+	notify := func(text string) error { mu.Lock(); prompt = text; mu.Unlock(); return nil }
 
 	done := make(chan struct{})
 	var result, errText string
@@ -38,7 +42,10 @@ func TestForceReauthDeniedDoesNotRevoke(t *testing.T) {
 	}()
 
 	id := waitForPending(t, gate)
-	if prompt == "" {
+	mu.Lock()
+	sentPrompt := prompt
+	mu.Unlock()
+	if sentPrompt == "" {
 		t.Fatal("expected admins to be notified with an approval prompt")
 	}
 	if !gate.decide(id, false) {
