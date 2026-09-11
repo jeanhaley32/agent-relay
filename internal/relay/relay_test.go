@@ -1214,15 +1214,34 @@ func TestLedgerLifecycleLinked(t *testing.T) {
 		t.Fatal("reply never delivered to frontend")
 	}
 
+	// SendOK is logged just after the reply is dispatched, which can lag the
+	// front.sent signal — poll the ledger until every expected event lands
+	// rather than racing that async write against Close (a flaky-test source).
+	wants := []string{eventlog.Received, eventlog.Injected, eventlog.Reply, eventlog.SendOK}
+	var s string
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s = string(data)
+		missing := false
+		for _, want := range wants {
+			if !strings.Contains(s, `"event":"`+want+`"`) {
+				missing = true
+				break
+			}
+		}
+		if !missing || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err := ev.Close(); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(data)
-	for _, want := range []string{eventlog.Received, eventlog.Injected, eventlog.Reply, eventlog.SendOK} {
+	for _, want := range wants {
 		if !strings.Contains(s, `"event":"`+want+`"`) {
 			t.Fatalf("expected a %q event in the ledger, got:\n%s", want, s)
 		}
