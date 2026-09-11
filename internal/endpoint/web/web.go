@@ -81,7 +81,7 @@ func New(listenAddr, convID, fromName, owner string, logger *log.Logger) (*Front
 
 // --- relay.Endpoint / relay.Claimer ---
 
-func (f *Frontend) Name() string                     { return "web" }
+func (f *Frontend) Name() string                      { return "web" }
 func (f *Frontend) Recv() <-chan relay.Message        { return f.out }
 func (f *Frontend) OwnsConversationID(id string) bool { return id == f.convID }
 
