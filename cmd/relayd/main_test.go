@@ -462,3 +462,100 @@ func TestWebhookGrafanaReachesDiscordAdmin(t *testing.T) {
 		t.Errorf("discord-only admin: got status %d, want %d (alert must not be dropped)", rec.Code, http.StatusOK)
 	}
 }
+
+func TestWebhookAnnotateValidation(t *testing.T) {
+	mux, _ := newTestMux(t, nil)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook/annotate", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: got %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+
+	// An annotation without a file has nowhere to render, and one without text
+	// says nothing; both are caller bugs worth surfacing rather than dropping.
+	for _, body := range []string{`{"line":3}`, `{"file":"/tmp/x.go"}`, `{"file":"/tmp/x.go","text":"   "}`, `not json`} {
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/annotate", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST %s: got %d, want %d", body, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+func TestAnnotationHubDelivers(t *testing.T) {
+	hub := newAnnotationHub()
+	sub := hub.subscribe()
+	defer hub.unsubscribe(sub)
+
+	want := annotation{File: "/tmp/x.go", Line: 12, Text: "check this", Kind: "note"}
+	if n := hub.publish(want); n != 1 {
+		t.Fatalf("publish: delivered to %d, want 1", n)
+	}
+	select {
+	case got := <-sub:
+		if got != want {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	default:
+		t.Fatal("subscriber received nothing")
+	}
+}
+
+func TestAnnotationHubDoesNotBlockOnFullSubscriber(t *testing.T) {
+	hub := newAnnotationHub()
+	sub := hub.subscribe()
+	defer hub.unsubscribe(sub)
+
+	// A wedged editor must not be able to stall the publisher: past the buffer,
+	// its annotations are dropped rather than blocking the model's turn.
+	for i := 0; i < 200; i++ {
+		hub.publish(annotation{File: "/tmp/x.go", Text: "flood"})
+	}
+	if n := hub.publish(annotation{File: "/tmp/x.go", Text: "one more"}); n != 0 {
+		t.Errorf("publish to a full subscriber: delivered to %d, want 0", n)
+	}
+}
+
+func TestAnnotationHubUnsubscribeStopsDelivery(t *testing.T) {
+	hub := newAnnotationHub()
+	sub := hub.subscribe()
+	hub.unsubscribe(sub)
+
+	if n := hub.publish(annotation{File: "/tmp/x.go", Text: "after unsubscribe"}); n != 0 {
+		t.Errorf("publish after unsubscribe: delivered to %d, want 0", n)
+	}
+	// Unsubscribe closes the channel, so a second call must not double-close.
+	hub.unsubscribe(sub)
+}
+
+func TestWebhookInjectValidation(t *testing.T) {
+	mux, _ := newTestMux(t, []adminTarget{{chatID: "chat1"}})
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/webhook/inject", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: got %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+
+	for _, body := range []string{`{"text":"   "}`, `{}`, `not json`} {
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/inject", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST %s: got %d, want %d", body, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+func TestWebhookInjectWithoutAdminIsUnavailable(t *testing.T) {
+	// With no admin configured there is no conversation to inject into, so the
+	// caller is told the feature is unavailable rather than having its text
+	// silently dropped.
+	mux, _ := newTestMux(t, nil)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/inject", strings.NewReader(`{"text":"hello"}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("got %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}

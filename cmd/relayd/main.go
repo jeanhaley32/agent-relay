@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -935,6 +936,63 @@ func listenWithRetry(network, addr string, timeout time.Duration, logger *log.Lo
 // grafanaWebhookPayload is the subset of Grafana's unified-alerting webhook
 // contact-point JSON we actually use. See:
 // https://grafana.com/docs/grafana/latest/alerting/configure-notifications/manage-contact-points/integrations/webhook-notifier/
+// annotation is one piece of feedback aimed at a place in a file rather than at
+// a conversation. Line is 1-indexed; 0 means "the file as a whole".
+type annotation struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+	Text string `json:"text"`
+	// "note" renders as a comment thread and persists; "urgent" also raises a
+	// toast, for the cases worth interrupting over.
+	Kind string `json:"kind"`
+}
+
+// annotationHub fans annotations out to every connected editor. Sends are
+// non-blocking: an editor that has stopped reading gets its annotation dropped
+// rather than stalling the publisher, because a wedged subscriber must not be
+// able to block the model's turn.
+type annotationHub struct {
+	mu   sync.Mutex
+	subs map[chan annotation]struct{}
+}
+
+func newAnnotationHub() *annotationHub {
+	return &annotationHub{subs: make(map[chan annotation]struct{})}
+}
+
+func (h *annotationHub) subscribe() chan annotation {
+	ch := make(chan annotation, 16)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.subs[ch] = struct{}{}
+	return ch
+}
+
+func (h *annotationHub) unsubscribe(ch chan annotation) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.subs[ch]; ok {
+		delete(h.subs, ch)
+		close(ch)
+	}
+}
+
+func (h *annotationHub) publish(note annotation) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sent := 0
+	for ch := range h.subs {
+		select {
+		case ch <- note:
+			sent++
+		default:
+		}
+	}
+	return sent
+}
+
+var annotations = newAnnotationHub()
+
 type grafanaWebhookPayload struct {
 	Status string `json:"status"`
 	Alerts []struct {
@@ -1180,6 +1238,130 @@ func newRelaydMux(back *claudebk.Endpoint, admins []adminTarget, acc *access.Man
 		b.SetCaps(fresh.Budget.ConversationCaps, fresh.Budget.DefaultConversationCap)
 		logger.Printf("reload-caps: applied %d explicit cap(s), default=%d",
 			len(fresh.Budget.ConversationCaps), fresh.Budget.DefaultConversationCap)
+		w.WriteHeader(http.StatusOK)
+	})
+	// /webhook/annotate and /annotations/stream are the outbound half of the
+	// VS Code channel. The model posts an annotation ({file, line, text}); the
+	// editor extension holds an SSE connection and renders it as a comment
+	// thread at that line, or a toast when it's urgent.
+	//
+	// This is a frontend like Telegram or the web pane, but it is the first one
+	// whose messages are not plain text: rendering at a line needs the position,
+	// so the payload is structured. Keeping that structure here rather than
+	// parsing it out of prose in the extension is what lets the extension stay a
+	// dumb renderer, with every judgment about what's worth saying staying with
+	// the model.
+	mux.HandleFunc("/webhook/annotate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var note annotation
+		if err := json.Unmarshal(body, &note); err != nil {
+			logger.Printf("annotate webhook: bad payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(note.File) == "" || strings.TrimSpace(note.Text) == "" {
+			http.Error(w, "file and text are required", http.StatusBadRequest)
+			return
+		}
+		if note.Kind == "" {
+			note.Kind = "note"
+		}
+		delivered := annotations.publish(note)
+		// Report the subscriber count so a caller can tell the difference
+		// between "sent" and "sent into the void with the editor closed".
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"delivered_to":%d}`, delivered)
+	})
+	mux.HandleFunc("/annotations/stream", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher.Flush()
+
+		sub := annotations.subscribe()
+		defer annotations.unsubscribe(sub)
+
+		// A periodic comment frame keeps the connection from being reaped by an
+		// idle timeout during the long gaps between annotations.
+		ping := time.NewTicker(25 * time.Second)
+		defer ping.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case note := <-sub:
+				payload, err := json.Marshal(note)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "data: %s\n\n", payload)
+				flusher.Flush()
+			case <-ping.C:
+				fmt.Fprint(w, ": keepalive\n\n")
+				flusher.Flush()
+			}
+		}
+	})
+	// /webhook/inject hands arbitrary text from a local tool to the model as a
+	// user message, the same buffered-inject path the scheduler and the Grafana
+	// webhook use. It exists because loopback tools previously had no way to
+	// start a turn: the web frontend's /send authenticates by tailscale whois on
+	// the client IP, so a process on this box is 127.0.0.1 and always denied.
+	// The text reaches the model, never the user directly - so the model decides
+	// whether any of it is worth surfacing, and a chatty watcher can't page
+	// anyone on its own.
+	mux.HandleFunc("/webhook/inject", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if len(admins) == 0 {
+			logger.Printf("inject webhook: no admin target configured, dropping")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var payload struct {
+			Text   string `json:"text"`
+			Source string `json:"source"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			logger.Printf("inject webhook: bad payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(payload.Text) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		source := payload.Source
+		if source == "" {
+			source = "local tool"
+		}
+		// One admin, not a fan-out. Every admin target feeds the same model
+		// session, so sending to all of them starts the same turn once per
+		// frontend - the Grafana path fans out because each copy is a separate
+		// alert the user may need on that frontend, but an inject is just work
+		// handed to the model.
+		adm := admins[0]
+		_ = back.Send(context.Background(), relay.Message{
+			ConversationID: adm.chatID,
+			Role:           relay.User,
+			Text:           fmt.Sprintf("[injected by %s on this box]\n\n%s", source, payload.Text),
+			Meta:           map[string]string{"chat_id": adm.chatID, "injected": "1"},
+		})
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/webhook/grafana", func(w http.ResponseWriter, r *http.Request) {
