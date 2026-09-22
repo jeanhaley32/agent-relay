@@ -33,4 +33,4 @@ session_id=$(cat .relay_session_id)
 # env is sufficient.
 exec env SESSION_ID="$session_id" UNATTENDED=1 ISOLATE=0 MODEL=opus \
 	CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=2000 \
-	CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION=1000 bash scripts/run.sh
+	CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION=10000 bash scripts/run.sh
