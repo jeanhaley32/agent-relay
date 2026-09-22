@@ -75,7 +75,7 @@ type Endpoint struct {
 
 	// Resolve, if set, is consulted for every ChatID carried on a reply or
 	// schedule frame from the shim — turning a contacts-directory name
-	// (e.g. "discord.alice", "person:jean") into the live chat_id it
+	// (e.g. "discord.alice", "person:alice") into the live chat_id it
 	// should actually be delivered to. ok=false (including nil Resolve)
 	// leaves the ChatID unchanged, so this is backward compatible with
 	// literal chat_ids the model already knows. Set once before Run(); not

@@ -237,7 +237,7 @@ func main() {
 
 	// Contacts directory: relayd-maintained record of platform identities,
 	// built automatically from inbound traffic. Resolves names like
-	// "discord.alice" or "person:jean" to a live chat_id, so schedules and
+	// "discord.alice" or "person:alice" to a live chat_id, so schedules and
 	// replies don't hardcode raw chat_ids that go stale when someone switches
 	// which app they're using (see ~/vessel-log/notes/relay-contacts-protocol.md).
 	contactsPath := filepath.Join(filepath.Dir(cfg.Telegram.AllowlistFile), "contacts.json")

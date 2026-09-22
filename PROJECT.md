@@ -24,7 +24,8 @@ either side is swappable by config. It runs on an always-on, Tailscale-only Thin
 metered API), gated by the budget/command control plane. Ollama offload is **deferred** —
 designed for, not built. The MVP is `cmd/relayd` wiring Telegram ⇄ broker ⇄ Claude backend.
 
-Repo: `github.com/jeanhaley32/agent-relay` (private). Local: `~/agent-relay`. Go 1.24.
+Repo: `github.com/jeanhaley32/agent-relay` (public — never commit real
+chat ids, handles, or tokens). Local: `~/agent-relay`. Go 1.24.
 
 ## 2. Status snapshot
 

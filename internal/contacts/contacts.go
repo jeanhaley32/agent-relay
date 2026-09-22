@@ -2,7 +2,7 @@
 // (one record per {platform, chat_id}) and optional person groups linking
 // multiple identities together. It exists to replace hardcoded chat_ids in
 // schedules and replies with resolvable names like "discord.alice" or
-// "person:jean" — see ~/vessel-log/notes/relay-contacts-protocol.md for the
+// "person:alice" — see ~/vessel-log/notes/relay-contacts-protocol.md for the
 // full design.
 //
 // Record creation/observation (last_seen, display_name, message_count) is
