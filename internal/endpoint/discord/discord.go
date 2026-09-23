@@ -110,7 +110,10 @@ type Frontend struct {
 	allowedGuildIDs       map[snowflake.ID]bool
 	requireMentionInGuild bool
 
-	selfID snowflake.ID // this bot's own user id, for mention/reply-to-bot checks
+	// selfID is this bot's own user id, for mention/reply-to-bot checks.
+	// Atomic because it is written from the Ready gateway event and read by
+	// onMessageCreate, both on gateway goroutines.
+	selfID atomic.Uint64
 
 	channels   rest.Channels // outbound REST (Send) — injectable for tests
 	users      rest.Users    // outbound REST (DM channel resolution) — injectable for tests
@@ -273,7 +276,7 @@ func WithRequireMentionInGuild(on bool) Option {
 // WithSelfID sets the bot's own user id directly, primarily for tests that
 // don't go through a real gateway handshake (where selfID is normally
 // discovered from client.ID() after connecting).
-func WithSelfID(id snowflake.ID) Option { return func(f *Frontend) { f.selfID = id } }
+func WithSelfID(id snowflake.ID) Option { return func(f *Frontend) { f.selfID.Store(uint64(id)) } }
 
 // New builds a Discord frontend and opens the gateway connection. Close stops
 // it. token must be a real bot token to connect for real; tests that only
@@ -367,6 +370,13 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		// does, so it's deliberately not counted either (see field doc).
 		bot.WithEventListenerFunc(func(e *events.Ready) {
 			f.lastGatewayEventAt.Store(time.Now().Unix())
+			// The self user is only in the cache once Ready has landed, so
+			// this is the first point where the bot's own id is knowable.
+			// Reading it before OpenGateway yields 0, which makes every
+			// mention and reply-author comparison false and silently drops
+			// every guild message as unaddressed. CompareAndSwap so an
+			// explicit WithSelfID still wins.
+			f.selfID.CompareAndSwap(0, uint64(e.User.ID))
 			if f.sawReady.Swap(true) {
 				f.gatewayReconnects.Add(1)
 			}
@@ -379,18 +389,14 @@ func (f *Frontend) Connect(ctx context.Context) error {
 		return fmt.Errorf("discord: build client: %w", err)
 	}
 	f.client = client
-	// Only fill selfID from the real client if WithSelfID wasn't already
-	// supplied — otherwise Connect would silently void that option's
-	// contract for any caller that also connects (e.g. a test wiring a fake
-	// transport but still exercising Connect). client.ID() is authoritative
-	// in production, where selfID starts zero-valued.
-	if f.selfID == 0 {
-		f.selfID = client.ID()
-	}
-
 	if err := client.OpenGateway(ctx); err != nil {
 		return fmt.Errorf("discord: open gateway: %w", err)
 	}
+	// After the gateway is open the self user is cached, so client.ID() is
+	// meaningful. The Ready listener normally gets there first; this covers
+	// the case where it does not. CompareAndSwap so an explicit WithSelfID
+	// still wins.
+	f.selfID.CompareAndSwap(0, uint64(client.ID()))
 	go f.watchHeartbeat(client)
 	return nil
 }
@@ -447,14 +453,15 @@ func (f *Frontend) onMessageCreate(e *events.MessageCreate) {
 	f.lastGatewayEventAt.Store(time.Now().Unix())
 	m := e.Message
 
+	self := f.selfID.Load()
 	mentionsBot := false
 	for _, u := range m.Mentions {
-		if u.ID == f.selfID {
+		if uint64(u.ID) == self {
 			mentionsBot = true
 			break
 		}
 	}
-	isReplyToBot := m.ReferencedMessage != nil && m.ReferencedMessage.Author.ID == f.selfID
+	isReplyToBot := m.ReferencedMessage != nil && uint64(m.ReferencedMessage.Author.ID) == self
 
 	in := inboundMessage{
 		messageID:    m.ID,

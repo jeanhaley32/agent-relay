@@ -481,15 +481,16 @@ func TestOnMessageCreateMentionAndReplyExtraction(t *testing.T) {
 	allowedGuild := snowflake.ID(500)
 
 	newFrontend := func() *Frontend {
-		return &Frontend{
+		f := &Frontend{
 			auth:                  &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
 			logger:                testLogger(t),
-			selfID:                selfID,
 			allowGuildMessages:    true,
 			allowedGuildIDs:       map[snowflake.ID]bool{allowedGuild: true},
 			requireMentionInGuild: true,
 			recv:                  make(chan relay.Message, 1),
 		}
+		f.selfID.Store(uint64(selfID))
+		return f
 	}
 
 	// A guild message that @-mentions the bot (via Mentions, not a direct
@@ -774,5 +775,59 @@ func TestGateDeniedLogsAttempt(t *testing.T) {
 	}
 	if cap.platform != "discord" || cap.id != 999 || cap.chatID != "9002" || cap.text != "spam" {
 		t.Fatalf("wrong denied entry: %+v", cap)
+	}
+}
+
+// TestSelfIDZeroDropsGuildMessages pins the behaviour that made #60 invisible:
+// with selfID still 0, every mention and reply-author comparison is false, so
+// require_mention_in_guild drops each guild message as unaddressed. The feature
+// is not broken loudly — it just never fires.
+func TestSelfIDZeroDropsGuildMessages(t *testing.T) {
+	const bot = snowflake.ID(777)
+	const guild = snowflake.ID(500)
+
+	build := func(withSelf bool) *Frontend {
+		f := &Frontend{
+			auth:                  &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+			logger:                testLogger(t),
+			allowGuildMessages:    true,
+			allowedGuildIDs:       map[snowflake.ID]bool{guild: true},
+			requireMentionInGuild: true,
+			recv:                  make(chan relay.Message, 1),
+		}
+		if withSelf {
+			f.selfID.Store(uint64(bot))
+		}
+		return f
+	}
+
+	mention := func() *events.MessageCreate {
+		return &events.MessageCreate{GenericMessage: &events.GenericMessage{
+			GuildID: &[]snowflake.ID{guild}[0],
+			Message: discord.Message{
+				ID:        1,
+				ChannelID: 42,
+				GuildID:   &[]snowflake.ID{guild}[0],
+				Author:    discord.User{ID: 111},
+				Content:   "hey bot",
+				Mentions:  []discord.User{{ID: bot}},
+			},
+		}}
+	}
+
+	unset := build(false)
+	unset.onMessageCreate(mention())
+	select {
+	case m := <-unset.recv:
+		t.Fatalf("selfID unset should drop the message, but delivered %q", m.Text)
+	default:
+	}
+
+	set := build(true)
+	set.onMessageCreate(mention())
+	select {
+	case <-set.recv:
+	default:
+		t.Fatal("selfID set should deliver a message that mentions the bot")
 	}
 }
