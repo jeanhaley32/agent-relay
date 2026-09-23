@@ -24,6 +24,7 @@ import (
 type testGate struct {
 	mayReceive func(string) bool
 	needsProof map[string]bool
+	isAdmin    func(string) bool
 }
 
 func (g testGate) MayReceive(conversationID string) bool {
@@ -31,6 +32,10 @@ func (g testGate) MayReceive(conversationID string) bool {
 }
 
 func (g testGate) NeedsLivenessProof(senderID string) bool { return g.needsProof[senderID] }
+
+func (g testGate) MayAdmin(senderID string) bool {
+	return g.isAdmin != nil && g.isAdmin(senderID)
+}
 
 // capFrontend captures everything Send'd to it.
 type capFrontend struct {
@@ -237,8 +242,10 @@ func TestLockdown(t *testing.T) {
 	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
 	back := &recordBackend{got: make(chan Message, 8), recv: make(chan Message, 8)}
 	cmds := command.NewRegistry()
-	cmds.IsAdmin = func(id string) bool { return id == "admin-id" }
-	b := &Broker{Frontend: front, Backend: back, Commands: cmds, Meter: budget.New("pro", nil)}
+	isAdmin := func(id string) bool { return id == "admin-id" }
+	cmds.IsAdmin = isAdmin
+	b := &Broker{Frontend: front, Backend: back, Commands: cmds, Meter: budget.New("pro", nil),
+		Gate: testGate{isAdmin: isAdmin}}
 	b.Lockdown.Store(true)
 	go b.Run(context.Background())
 	defer close(front.recv)
@@ -555,7 +562,7 @@ func TestAnomalyGate_AdminRevokesSession(t *testing.T) {
 		Meter:            budget.New("pro", nil),
 		Session:          sess,
 		Approval:         appr,
-		Gate:             testGate{needsProof: map[string]bool{"admin-chat": true}},
+		Gate:             testGate{needsProof: map[string]bool{"admin-chat": true}, isAdmin: func(string) bool { return true }},
 		SessionTTL:       2 * time.Second,
 		Anomaly:          &stubAnomalyDetector{score: 0.99},
 		AnomalyThreshold: 0.5,

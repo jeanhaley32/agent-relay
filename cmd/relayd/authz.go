@@ -34,14 +34,12 @@ func (l lateDirectory) IsAdmin(id int64) bool {
 // ids (Matrix user ids, the web pane's ConvID); acc and discordAcc are the two
 // numeric directories, consulted in that order; owns reports whether a
 // frontend claims a conversation id.
-func newAuthorizer(named []map[string]bool, acc *access.Manager, discordAcc func() *access.Manager, owns func(string) bool, livenessRequired map[string]bool) *authz.Authorizer {
+func newAuthorizer(named []map[string]bool, acc *access.Manager, discordAcc func() *access.Manager, owns func(string) bool, gated func() map[string]bool) *authz.Authorizer {
 	opts := []authz.Option{
 		authz.WithNumericDirectory(lateDirectory{get: func() *access.Manager { return acc }}),
 		authz.WithNumericDirectory(lateDirectory{get: discordAcc}),
 		authz.WithConversationOwnership(owns),
-	}
-	for id := range livenessRequired {
-		opts = append(opts, authz.WithLivenessRequired(id))
+		authz.WithLivenessSource(gated),
 	}
 	for _, set := range named {
 		for id := range set {
@@ -51,9 +49,10 @@ func newAuthorizer(named []map[string]bool, acc *access.Manager, discordAcc func
 	return authz.New(opts...)
 }
 
-// newIsAdmin builds the admin predicate the command registry gates on.
-func newIsAdmin(matrixAdmins, webAdmins map[string]bool, acc *access.Manager, discordAcc func() *access.Manager) func(string) bool {
-	a := newAuthorizer([]map[string]bool{matrixAdmins, webAdmins}, acc, discordAcc, nil, nil)
+// adminPredicate exposes an Authorizer as the func the command registry wants,
+// so the registry and the Broker cannot disagree about who is an admin: both
+// consult the same Authorizer rather than two that happen to be built alike.
+func adminPredicate(a *authz.Authorizer) func(string) bool {
 	return func(senderID string) bool { return a.MayAdmin(senderID).Allowed }
 }
 

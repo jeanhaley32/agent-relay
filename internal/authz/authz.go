@@ -70,9 +70,10 @@ type Authorizer struct {
 	// by the caller because ownership is a routing fact the frontends hold.
 	owns func(conversationID string) bool
 
-	// livenessRequired are sender ids that owe a liveness proof, derived by
-	// the caller from each transport's Assurance rather than listed by hand.
-	livenessRequired map[string]bool
+	// livenessRequired reports the sender ids that owe a liveness proof. It
+	// is a func rather than a map because the set is derived from the live
+	// frontends, which do not exist when the Authorizer is built.
+	livenessRequired func() map[string]bool
 }
 
 // Option configures an Authorizer.
@@ -106,7 +107,7 @@ func WithConversationOwnership(owns func(string) bool) Option {
 }
 
 func New(opts ...Option) *Authorizer {
-	a := &Authorizer{namedAdmins: map[string]bool{}, livenessRequired: map[string]bool{}}
+	a := &Authorizer{namedAdmins: map[string]bool{}}
 	for _, o := range opts {
 		o(a)
 	}
@@ -181,13 +182,19 @@ type Assured interface {
 // gate; the Broker owns the mechanism. Callers derive the set from each
 // transport's Assurance rather than listing ids by hand — see NeedsLivenessProof.
 func WithLivenessRequired(ids ...string) Option {
-	return func(a *Authorizer) {
-		for _, id := range ids {
-			if id != "" {
-				a.livenessRequired[id] = true
-			}
+	set := map[string]bool{}
+	for _, id := range ids {
+		if id != "" {
+			set[id] = true
 		}
 	}
+	return WithLivenessSource(func() map[string]bool { return set })
+}
+
+// WithLivenessSource supplies the gated set lazily, for a caller that builds
+// the Authorizer before the frontends it derives the set from exist.
+func WithLivenessSource(f func() map[string]bool) Option {
+	return func(a *Authorizer) { a.livenessRequired = f }
 }
 
 // Gate adapts an Authorizer to the yes/no questions a message broker asks per
@@ -210,14 +217,24 @@ func (g *Gate) MayReceive(conversationID string) bool {
 	return d.Allowed
 }
 
+// MayAdmin reports whether this sender holds admin authority.
+func (g *Gate) MayAdmin(senderID string) bool { return g.a.MayAdmin(senderID).Allowed }
+
 // NeedsLivenessProof reports whether this specific sender owes a proof. The
 // package-level function of the same name answers the more general question
 // of whether an Assurance level requires one; this answers it for one id,
 // using the set the caller derived from those levels.
 func (g *Gate) NeedsLivenessProof(senderID string) bool {
-	return g.a.livenessRequired[senderID]
+	return g.a.gatedSet()[senderID]
+}
+
+func (a *Authorizer) gatedSet() map[string]bool {
+	if a.livenessRequired == nil {
+		return nil
+	}
+	return a.livenessRequired()
 }
 
 // LivenessRequired reports how many senders owe a proof. Callers use it to
 // decide whether to install the session machinery at all.
-func (a *Authorizer) LivenessRequired() int { return len(a.livenessRequired) }
+func (a *Authorizer) LivenessRequired() int { return len(a.gatedSet()) }

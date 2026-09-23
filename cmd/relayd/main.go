@@ -202,7 +202,24 @@ func main() {
 	// Telegram and (if enabled) Discord access managers — each frontend's
 	// admin ids live in its own manager, so a Discord admin's id is only
 	// ever found in discordAcc, and would otherwise never satisfy IsAdmin.
-	cmds.IsAdmin = newIsAdmin(matrixAdmins, webAdmins, acc, func() *access.Manager { return discordAcc })
+	// One authorizer answers every authorization question in relayd: who may
+	// run admin commands, who owes a liveness proof, and where the model may
+	// reply. The command registry and the Broker both consult it, so they
+	// cannot disagree about who is an admin.
+	//
+	// Two inputs are late-bound because they do not exist yet at this point:
+	// conversation ownership and the liveness-gated set both come from the
+	// frontends, which are constructed further down.
+	var ownsConversation func(string) bool
+	var livenessGatedSet map[string]bool
+	authorizer := newAuthorizer(
+		[]map[string]bool{matrixAdmins, webAdmins},
+		acc,
+		func() *access.Manager { return discordAcc },
+		func(id string) bool { return ownsConversation != nil && ownsConversation(id) },
+		func() map[string]bool { return livenessGatedSet },
+	)
+	cmds.IsAdmin = adminPredicate(authorizer)
 	cmds.Register(command.Command{
 		Name:  "handshake",
 		Help:  "admin: list/approve/deny access requests",
@@ -543,7 +560,7 @@ func main() {
 	// about, and so are legitimate outbound targets. Consumed by the
 	// authorizer's outbound gate below -- see outboundAllowed's doc comment
 	// for the full rationale.
-	ownsConversation := func(id string) bool {
+	ownsConversation = func(id string) bool {
 		if discordFront != nil && discordFront.KnownConversation(id) {
 			return true
 		}
@@ -619,21 +636,12 @@ func main() {
 		if webFront != nil {
 			fs = append(fs, frontendAdmins{webFront, []string{cfg.Web.ConvID}})
 		}
-		gated := livenessGated(fs)
-
-		// One authorizer answers both questions the Broker asks: may a reply
-		// go to this conversation, and does this sender owe a liveness proof.
-		// It replaces two Broker fields that expressed one policy between
-		// them with nothing owning it.
-		brokerAuthz := newAuthorizer(nil, acc,
-			func() *access.Manager { return discordAcc },
-			ownsConversation,
-			gated)
-		gate := brokerAuthz.Gate()
+		livenessGatedSet = livenessGated(fs)
+		gate := authorizer.Gate()
 		gate.Log = logger.Printf
 		b.Gate = gate
 
-		if len(gated) > 0 {
+		if len(livenessGatedSet) > 0 {
 			b.Session = session.NewManager(30 * time.Minute)
 			b.Approval = appr
 			b.SessionTTL = 10 * time.Minute
@@ -657,7 +665,7 @@ func main() {
 			// gated admin and only after a human approves via /allow — so a
 			// manipulated model session can't force-revoke an admin unilaterally.
 			go serveReauth(back, reauth,
-				func(id string) bool { return gated[id] },
+				func(id string) bool { return livenessGatedSet[id] },
 				b.Session.Revoke,
 				func(text string) error { return notifyAdmins(context.Background(), admins, text) },
 				logger)

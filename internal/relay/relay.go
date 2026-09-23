@@ -74,6 +74,13 @@ type Gatekeeper interface {
 	// prove they are live — an approved session, or a bound device that is
 	// currently present — before any message from them is processed.
 	NeedsLivenessProof(senderID string) bool
+
+	// MayAdmin reports whether this sender holds admin authority. The Broker
+	// asks for its own decisions — who passes lockdown, and whose session an
+	// anomaly revokes. It used to borrow the answer from Commands.IsAdmin,
+	// which made the command registry the de facto owner of an identity fact
+	// it only needed for dispatch.
+	MayAdmin(senderID string) bool
 }
 
 // mayReceive defaults to allowing delivery when no Gate is set, which is what
@@ -89,6 +96,13 @@ func (b *Broker) mayReceive(conversationID string) bool {
 // with an empty SessionGatedUsers map: nobody owed a proof.
 func (b *Broker) needsLivenessProof(senderID string) bool {
 	return b.Gate != nil && b.Gate.NeedsLivenessProof(senderID)
+}
+
+// mayAdmin defaults to false when no Gate is set, matching a Broker whose
+// Commands registry had no IsAdmin. Fail-closed: an unconfigured Broker grants
+// nobody admin authority.
+func (b *Broker) mayAdmin(senderID string) bool {
+	return b.Gate != nil && b.Gate.MayAdmin(senderID)
 }
 
 // Estimator approximates the token cost of a piece of text. The default is a
@@ -128,16 +142,14 @@ type Broker struct {
 	Meter    *budget.Meter
 	Estimate Estimator
 	// Gate answers the authorization questions the Broker asks. It replaces
-	// two fields that between them expressed one policy with no single owner:
-	// an outbound predicate, and a set of senders who owed a liveness proof.
+	// three mechanisms that between them expressed one policy with no single
+	// owner: an outbound predicate, a set of senders who owed a liveness
+	// proof, and an admin lookup borrowed from the command registry.
 	//
 	// internal/authz implements it; the Broker deliberately does not know
 	// that. nil ⇒ no outbound gating and no liveness requirement, which is
-	// what a Broker with neither field set used to do.
+	// what a Broker with none of them set used to do.
 	//
-	// Admin identity is not here yet — the Broker still borrows it from
-	// Commands.IsAdmin for lockdown and anomaly handling. Folding that in is
-	// the next step, and it is deliberately not bundled with this one.
 	Gate Gatekeeper
 
 	// OnBackendReply, if set, fires after a reply is actually delivered -
@@ -184,14 +196,14 @@ type Broker struct {
 	AdminDevicePresent func(senderID string) (required, online bool)
 
 	// Lockdown, when set, blocks every message from a non-admin sender
-	// before it reaches slash commands or the model - only b.Commands.IsAdmin
-	// senders get through. Admin-only to toggle (enforced by the /lockdown
+	// before it reaches slash commands or the model - only senders Gate
+	// recognizes as admins get through. Admin-only to toggle (enforced by the /lockdown
 	// command itself being Admin: true), affects only non-admins.
 	Lockdown atomic.Bool
 
 	// Anomaly, if set, scores each inbound message against AnomalyThreshold
 	// before it's processed. Crossing it means "this doesn't look like the
-	// sender" - for an admin (per b.Commands.IsAdmin) that revokes their
+	// sender" - for an admin (per Gate) that revokes their
 	// session and blocks the message, same as an idle-expired session; for
 	// anyone else it just warns AnomalyWarnChatID and lets the message
 	// through, since a non-admin has no session to revoke. nil Anomaly ⇒ no
@@ -593,8 +605,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 		// -1. Lockdown: non-admin senders are blocked entirely while active.
 		if b.Lockdown.Load() {
-			isAdmin := b.Commands != nil && b.Commands.IsAdmin != nil && b.Commands.IsAdmin(m.Meta["from_id"])
-			if !isAdmin {
+			if !b.mayAdmin(m.Meta["from_id"]) {
 				b.logEvent(m, eventlog.GateBlocked, "lockdown", "")
 				_ = b.Frontend.Send(ctx, AssistantMsg(m.ConversationID, LockdownMessage))
 				continue
@@ -649,7 +660,7 @@ func (b *Broker) Run(ctx context.Context) error {
 				// auditable instead of skipping quietly.
 				b.logEvent(m, eventlog.AnomalyErr, "anomaly detector failed to score - gate blind, failing open", err.Error())
 			case score > b.AnomalyThreshold:
-				isAdmin := b.Commands != nil && b.Commands.IsAdmin != nil && b.Commands.IsAdmin(m.Meta["from_id"])
+				isAdmin := b.mayAdmin(m.Meta["from_id"])
 				switch {
 				case isAdmin && b.Session != nil:
 					b.logEvent(m, eventlog.GateBlocked, "anomaly: admin session revoked, re-auth required", "")

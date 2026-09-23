@@ -37,12 +37,12 @@ func testManagers(t *testing.T) (tg, dc *access.Manager) {
 
 func TestIsAdminAcrossEveryIDNamespace(t *testing.T) {
 	tg, dc := testManagers(t)
-	isAdmin := newIsAdmin(
-		map[string]bool{matrixAdmin: true},
-		map[string]bool{webConvID: true},
+	isAdmin := adminPredicate(newAuthorizer(
+		[]map[string]bool{{matrixAdmin: true}, {webConvID: true}},
 		tg,
 		func() *access.Manager { return dc },
-	)
+		nil, nil,
+	))
 
 	cases := []struct {
 		name   string
@@ -76,8 +76,8 @@ func TestIsAdminAcrossEveryIDNamespace(t *testing.T) {
 // predicate is built. A nil manager must deny rather than panic.
 func TestIsAdminWithDiscordDisabled(t *testing.T) {
 	tg, _ := testManagers(t)
-	isAdmin := newIsAdmin(map[string]bool{}, map[string]bool{}, tg,
-		func() *access.Manager { return nil })
+	isAdmin := adminPredicate(newAuthorizer([]map[string]bool{{}, {}}, tg,
+		func() *access.Manager { return nil }, nil, nil))
 
 	if !isAdmin("111") {
 		t.Fatal("telegram admin should still be admin with Discord off")
