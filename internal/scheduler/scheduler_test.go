@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -372,5 +373,53 @@ func TestFileWatchDoesNotDisarmOnExternalRemoval(t *testing.T) {
 	list := s.List()
 	if len(list) != 1 || list[0].ID != sc.ID {
 		t.Fatalf("schedule was disarmed by an external file edit: %+v", list)
+	}
+}
+
+// A one-shot whose delivery fails used to be orphaned: its timer had already
+// fired and nothing re-armed it, so the reminder was never delivered for the
+// rest of the process lifetime while List() still showed it pending. A briefly
+// unavailable backend socket is enough to trigger it.
+func TestOneShotRetriesAfterFailedDelivery(t *testing.T) {
+	var attempts int32
+	failed := make(chan struct{})
+
+	deliver := func(scheduleID, chatID, text string) error {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			close(failed)
+			return errors.New("backend socket unavailable")
+		}
+		return nil
+	}
+	s, err := New(filepath.Join(t.TempDir(), "sched.json"), time.UTC, deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	sc, err := s.Create("the reminder", "", 40*time.Millisecond, "42")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := sc.ID
+
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first delivery never attempted")
+	}
+	// Let fire() finish re-arming after deliver returned.
+	time.Sleep(100 * time.Millisecond)
+
+	s.mu.Lock()
+	_, stillThere := s.items[id]
+	_, armed := s.timers[id]
+	s.mu.Unlock()
+
+	if !stillThere {
+		t.Fatal("schedule was dropped after a failed delivery")
+	}
+	if !armed {
+		t.Fatal("schedule left with no timer: it would never retry in this process")
 	}
 }

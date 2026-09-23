@@ -91,6 +91,7 @@ type Scheduler struct {
 	items   map[string]*Schedule
 	entries map[string]cron.EntryID // recurring: schedule id -> cron entry
 	timers  map[string]*time.Timer  // one-shot: schedule id -> timer
+	retries map[string]int          // one-shot: schedule id -> failed delivery attempts
 
 	watcher   *fsnotify.Watcher
 	watchDone chan struct{}
@@ -292,6 +293,37 @@ func (s *Scheduler) disarm(id string) {
 	}
 }
 
+// oneShotRetry is how long after a failed delivery a one-shot tries again, and
+// how many times before it is left for the next process start. Bounded so a
+// permanently failing delivery does not retry forever, and long enough that a
+// backend restart has time to complete.
+const (
+	oneShotRetry    = 30 * time.Second
+	oneShotRetryMax = 10
+)
+
+// rearmOneShot schedules another attempt at a one-shot whose delivery failed.
+// Callers must not hold s.mu.
+func (s *Scheduler) rearmOneShot(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.items[id]; !ok {
+		return // cancelled while we were delivering
+	}
+	if s.retries == nil {
+		s.retries = map[string]int{}
+	}
+	if s.retries[id] >= oneShotRetryMax {
+		s.logger.Printf("schedule %s: giving up after %d delivery attempts; it will retry on next start", id, s.retries[id])
+		return
+	}
+	s.retries[id]++
+	if t, ok := s.timers[id]; ok {
+		t.Stop()
+	}
+	s.timers[id] = time.AfterFunc(oneShotRetry, func() { s.fire(id) })
+}
+
 // fire delivers a schedule. One-shots are removed after firing; recurring stay
 // armed. Runs on a cron/timer goroutine, so it takes the lock itself.
 func (s *Scheduler) fire(id string) {
@@ -312,10 +344,14 @@ func (s *Scheduler) fire(id string) {
 	if err := s.deliver(schedID, chatID, text); err != nil {
 		// The pending event was NOT durably recorded. Keep the schedule intact
 		// rather than deleting it and losing the event. Recurring schedules
-		// retry on their next cron tick; a one-shot's timer has already fired
-		// and is not re-armed here, so it only retries if the process
-		// restarts (load re-arms missed one-shots).
+		// retry on their next cron tick; a one-shot's timer has already fired,
+		// so re-arm it here or the reminder is silently never delivered for
+		// the rest of the process lifetime while /schedules still lists it as
+		// pending. A backend socket that is briefly unavailable is enough.
 		s.logger.Printf("warning: deliver of schedule %s failed, keeping it for retry: %v", id, err)
+		if oneShot {
+			s.rearmOneShot(id)
+		}
 		return
 	}
 
@@ -323,6 +359,7 @@ func (s *Scheduler) fire(id string) {
 		s.mu.Lock()
 		s.disarm(id)
 		delete(s.items, id)
+		delete(s.retries, id)
 		if err := s.save(); err != nil {
 			s.logger.Printf("warning: persist failed: %v", err)
 		}
