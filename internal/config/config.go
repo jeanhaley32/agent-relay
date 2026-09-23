@@ -65,6 +65,12 @@ type SchedulerConfig struct {
 
 // TelegramConfig configures the Telegram frontend.
 type TelegramConfig struct {
+	// EnabledRaw is a pointer so an omitted key keeps the historical
+	// behaviour — Telegram was mandatory, so every existing config has a
+	// populated block and expects it to run. nil means "enabled if the block
+	// is configured"; an explicit false turns it off. Use Enabled().
+	EnabledRaw *bool `json:"enabled"`
+
 	TokenEnv      string  `json:"token_env"`      // env var holding the bot token
 	Admins        []int64 `json:"admins"`         // ids that may run /handshake (also allowed)
 	Allowlist     []int64 `json:"allowlist"`      // permitted sender user ids
@@ -124,6 +130,17 @@ type DiscordConfig struct {
 	// the default as true. Use RequireMentionInGuild() to read the resolved
 	// value.
 	RequireMentionInGuildRaw *bool `json:"require_mention_in_guild"`
+}
+
+// Enabled resolves whether relayd should start the Telegram frontend. An
+// omitted key means "yes if this block names anyone", which preserves the
+// behaviour from when Telegram was mandatory; an explicit false turns it off
+// even with a populated block.
+func (t TelegramConfig) Enabled() bool {
+	if t.EnabledRaw != nil {
+		return *t.EnabledRaw
+	}
+	return len(t.Admins) > 0 || len(t.Allowlist) > 0
 }
 
 // PollTimeout resolves the effective long-poll timeout: the configured value
@@ -285,8 +302,21 @@ func Load(path string) (*Config, error) {
 // validate checks the config after defaults are applied and returns a clear
 // error rather than letting a mistake surface as confusing downstream behavior.
 func (c *Config) validate() error {
-	if len(c.Telegram.Admins) == 0 && len(c.Telegram.Allowlist) == 0 {
-		return fmt.Errorf("telegram: no admins or allowlist — the bot would serve nobody; add your Telegram user id to \"admins\"")
+	// Telegram's own error comes first when the block looks like an attempt
+	// to configure it, so "you forgot the admins" beats the vaguer "nothing
+	// is enabled" for the operator who was clearly setting up Telegram.
+	// TokenEnv is deliberately not a signal here: applyDefaults fills it in,
+	// so it is never empty and cannot distinguish intent. Naming people, or
+	// saying enabled explicitly, is what shows the operator meant Telegram.
+	telegramConfigured := c.Telegram.EnabledRaw != nil ||
+		len(c.Telegram.Admins) > 0 || len(c.Telegram.Allowlist) > 0
+	telegramNotDisabled := c.Telegram.EnabledRaw == nil || *c.Telegram.EnabledRaw
+	if telegramConfigured && telegramNotDisabled && len(c.Telegram.Admins) == 0 && len(c.Telegram.Allowlist) == 0 {
+		return fmt.Errorf("telegram: enabled but no admins or allowlist — the bot would serve nobody; add your Telegram user id to \"admins\", or set telegram.enabled: false")
+	}
+	// At least one way in, or relayd would start and serve nobody.
+	if !c.Telegram.Enabled() && !c.Discord.Enabled && !c.Matrix.Enabled && !c.Web.Enabled {
+		return fmt.Errorf("no frontend is enabled: set one of telegram, discord, matrix or web")
 	}
 	for _, id := range c.Telegram.Admins {
 		if id <= 0 {

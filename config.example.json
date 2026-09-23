@@ -1,6 +1,7 @@
 {
   "state_dir": "",
   "telegram": {
+    "enabled": true,
     "token_env": "TELEGRAM_BOT_TOKEN",
     "admins": [
       123456789

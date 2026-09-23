@@ -111,9 +111,11 @@ func notifyAdmins(ctx context.Context, targets []adminTarget, text string) error
 // Discord frontend). discordFront is nil when Discord is disabled.
 func buildAdminTargets(cfg *config.Config, front *telegram.Frontend, discordFront *discord.Frontend, logger *log.Logger) []adminTarget {
 	var targets []adminTarget
-	for _, admin := range cfg.Telegram.Admins {
-		id := strconv.FormatInt(admin, 10)
-		targets = append(targets, adminTarget{chatID: id, send: front.Send})
+	if front != nil {
+		for _, admin := range cfg.Telegram.Admins {
+			id := strconv.FormatInt(admin, 10)
+			targets = append(targets, adminTarget{chatID: id, send: front.Send})
+		}
 	}
 	if discordFront != nil {
 		ids, err := cfg.Discord.AdminIDs()
@@ -246,15 +248,9 @@ func main() {
 	defer back.Close()
 	back.Resolve = dir.Resolve
 
-	// Telegram frontend, authorized via the access manager.
-	telegramOpts := []telegram.Option{
-		telegram.WithAuthorizer(acc),
-		telegram.WithPollTimeout(cfg.Telegram.PollTimeout()),
-		telegram.WithOffsetStore(cfg.StatePath("telegram_offset")),
-		telegram.WithLogger(logger),
-	}
-	// One denied-sender log, shared across every frontend (Telegram + Discord),
-	// so unauthorized attempts on any platform land in a single audit file.
+	// One denied-sender log, shared across every frontend, so unauthorized
+	// attempts on any platform land in a single audit file. Built before the
+	// Telegram block because Discord uses it too and Telegram may be off.
 	var deniedLog deniedlog.Logger = deniedlog.Noop{}
 	if cfg.Telegram.DeniedLogPath != "" {
 		dl, err := deniedlog.NewFileDeniedLogger(cfg.Telegram.DeniedLogPath)
@@ -263,47 +259,65 @@ func main() {
 		}
 		defer dl.Close()
 		deniedLog = dl
-		telegramOpts = append(telegramOpts, telegram.WithDeniedLogger(deniedLog))
 	}
-	front := telegram.New(token, telegramOpts...)
 
-	// Handshake: verify the token and identify the bot before serving. Retries
-	// with backoff for up to ~2 minutes before giving up - a bare Fatalf here
-	// made relayd fatally fragile against a boot-time DNS race (this process
-	// can start before network-online.target is meaningfully ready,
-	// especially as a systemd --user unit where that target doesn't gate
-	// anything), even though getUpdates() below already retries forever.
-	// Still fails fast with a clear message for a genuinely bad token/config -
-	// just not on the very first attempt.
-	var info telegram.BotInfo
-	handshakeDeadline := time.Now().Add(2 * time.Minute)
-	backoff := time.Second
-	for {
-		hctx, hcancel := context.WithTimeout(context.Background(), 15*time.Second)
-		info, err = front.Me(hctx)
-		hcancel()
-		if err == nil {
-			break
+	// Telegram frontend, authorized via the access manager. Optional: nil
+	// front means "not configured", and every downstream use is guarded.
+	var front *telegram.Frontend
+	if cfg.Telegram.Enabled() {
+		telegramOpts := []telegram.Option{
+			telegram.WithAuthorizer(acc),
+			telegram.WithPollTimeout(cfg.Telegram.PollTimeout()),
+			telegram.WithOffsetStore(cfg.StatePath("telegram_offset")),
+			telegram.WithLogger(logger),
 		}
-		if time.Now().After(handshakeDeadline) {
-			logger.Fatalf("bot connection failed after retrying for 2m (check the %s env var): %s", cfg.Telegram.TokenEnv, front.SafeErr(err))
+		if cfg.Telegram.DeniedLogPath != "" {
+			telegramOpts = append(telegramOpts, telegram.WithDeniedLogger(deniedLog))
 		}
-		logger.Printf("bot handshake failed, retrying in %s: %s", backoff, front.SafeErr(err))
-		time.Sleep(backoff)
-		if backoff < 15*time.Second {
-			backoff *= 2
+		front = telegram.New(token, telegramOpts...)
+
+		// Handshake: verify the token and identify the bot before serving. Retries
+		// with backoff for up to ~2 minutes before giving up - a bare Fatalf here
+		// made relayd fatally fragile against a boot-time DNS race (this process
+		// can start before network-online.target is meaningfully ready,
+		// especially as a systemd --user unit where that target doesn't gate
+		// anything), even though getUpdates() below already retries forever.
+		// Still fails fast with a clear message for a genuinely bad token/config -
+		// just not on the very first attempt.
+		var info telegram.BotInfo
+		handshakeDeadline := time.Now().Add(2 * time.Minute)
+		backoff := time.Second
+		for {
+			hctx, hcancel := context.WithTimeout(context.Background(), 15*time.Second)
+			info, err = front.Me(hctx)
+			hcancel()
+			if err == nil {
+				break
+			}
+			if time.Now().After(handshakeDeadline) {
+				logger.Fatalf("bot connection failed after retrying for 2m (check the %s env var): %s", cfg.Telegram.TokenEnv, front.SafeErr(err))
+			}
+			logger.Printf("bot handshake failed, retrying in %s: %s", backoff, front.SafeErr(err))
+			time.Sleep(backoff)
+			if backoff < 15*time.Second {
+				backoff *= 2
+			}
 		}
+		logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
+	} else {
+		logger.Printf("telegram: disabled")
 	}
-	logger.Printf("connected to Telegram as @%s (bot id %d)", info.Username, info.ID)
 
 	// Discord frontend (optional, per DESIGN.md's wiring/startup design):
 	// Discord has its own snowflake id namespace and access manager, so it
 	// gets its own New/Connect handshake, then fans into the Broker's single
 	// Frontend slot via relay.MultiFrontend alongside Telegram.
-	frontendEndpoint := relay.Endpoint(front)
 	var discordFront *discord.Frontend
 	var matrixFront *matrix.Frontend
-	frontends := []relay.Endpoint{front}
+	var frontends []relay.Endpoint
+	if front != nil {
+		frontends = append(frontends, front)
+	}
 	if cfg.Discord.Enabled {
 		discordFront, discordAcc = mustStartDiscord(cfg, logger, deniedLog)
 		frontends = append(frontends, discordFront)
@@ -317,7 +331,15 @@ func main() {
 		webFront = mustStartWeb(cfg, logger)
 		frontends = append(frontends, webFront)
 	}
-	if len(frontends) > 1 {
+	// validate() guarantees at least one frontend is configured, so this is
+	// never empty.
+	var frontendEndpoint relay.Endpoint
+	switch len(frontends) {
+	case 0:
+		logger.Fatalf("no frontend started — check the telegram/discord/matrix/web config")
+	case 1:
+		frontendEndpoint = frontends[0]
+	default:
 		frontendEndpoint = relay.NewMultiFrontend(frontends...)
 	}
 

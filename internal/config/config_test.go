@@ -22,7 +22,14 @@ func TestValidation(t *testing.T) {
 	cases := []struct {
 		name, body, wantErr string
 	}{
-		{"no admins or allowlist", `{"telegram":{}}`, "serve nobody"},
+		// An empty telegram block no longer implies "you meant Telegram":
+		// Telegram is opt-in now, so the honest answer is that nothing is
+		// enabled. The telegram-specific error is still produced when the
+		// block shows intent — the next two cases.
+		{"empty telegram block, nothing else on", `{"telegram":{}}`, "no frontend is enabled"},
+		{"telegram explicitly on with no admins", `{"telegram":{"enabled":true}}`, "serve nobody"},
+		{"telegram off, another frontend on", `{"telegram":{"enabled":false},"matrix":{"enabled":true,"homeserver_url":"http://100.64.0.1:8008","admins":["@a:b"]}}`, ""},
+		{"telegram off and nothing else on", `{"telegram":{"enabled":false}}`, "no frontend is enabled"},
 		{"unknown tier", `{"telegram":{"admins":[1]},"budget":{"tier":"mega"}}`, "unknown"},
 		{"negative admin id", `{"telegram":{"admins":[-1]}}`, "invalid id"},
 		{"zero allowlist id", `{"telegram":{"allowlist":[0]}}`, "invalid id"},

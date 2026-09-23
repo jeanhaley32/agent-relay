@@ -44,9 +44,9 @@ general-purpose, provider-agnostic relay.)
 
 At least one of Telegram or Discord must be configured; both can run at once.
 
-> **Known gap:** the table above says Telegram is optional, and it is not yet — config
-> validation currently requires Telegram admins even when another frontend is enabled.
-> Tracked as issue #51.
+Telegram is opt-in like the others: omit `telegram.enabled` and it runs if the block
+names anyone, or set `"enabled": false` to turn it off entirely. At least one of
+telegram, discord, matrix or web must be enabled.
 
 ---
 
