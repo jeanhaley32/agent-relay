@@ -104,29 +104,6 @@ func notifyAdmins(ctx context.Context, targets []adminTarget, text string) error
 	return firstErr
 }
 
-// buildAdminTargets fans out to every Telegram admin (via the Telegram
-// frontend) plus, when Discord is enabled, every Discord admin (via the
-// Discord frontend). discordFront is nil when Discord is disabled.
-func buildAdminTargets(cfg *config.Config, front *telegram.Frontend, discordFront *discord.Frontend, logger *log.Logger) []adminTarget {
-	var targets []adminTarget
-	if front != nil {
-		for _, admin := range cfg.Telegram.Admins {
-			id := strconv.FormatInt(admin, 10)
-			targets = append(targets, adminTarget{chatID: id, send: front.Send})
-		}
-	}
-	if discordFront != nil {
-		ids, err := cfg.Discord.AdminIDs()
-		if err != nil {
-			logger.Printf("admin targets: discord admin ids: %v", err)
-		}
-		for _, id := range ids {
-			targets = append(targets, adminTarget{chatID: id.String(), send: discordFront.Send})
-		}
-	}
-	return targets
-}
-
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to JSON config file")
 	flag.Parse()
@@ -338,6 +315,35 @@ func main() {
 		webFront = mustStartWeb(cfg, logger)
 		frontends = append(frontends, webFront)
 	}
+	// Every running frontend, paired with its admin ids and the way to reach
+	// them. Built once and used for both admin escalation and the liveness
+	// gate, so the two cannot disagree about which platforms exist.
+	var liveFrontends []frontendAdmins
+	if front != nil {
+		tgIDs := make([]string, 0, len(cfg.Telegram.Admins))
+		for _, admin := range cfg.Telegram.Admins {
+			tgIDs = append(tgIDs, strconv.FormatInt(admin, 10))
+		}
+		liveFrontends = append(liveFrontends, frontendAdmins{front, front.Send, tgIDs})
+	}
+	if discordFront != nil {
+		var dcIDs []string
+		if discordAdminIDs, err := cfg.Discord.AdminIDs(); err != nil {
+			logger.Printf("admin targets: discord admin ids: %v", err)
+		} else {
+			for _, admin := range discordAdminIDs {
+				dcIDs = append(dcIDs, admin.String())
+			}
+		}
+		liveFrontends = append(liveFrontends, frontendAdmins{discordFront, discordFront.Send, dcIDs})
+	}
+	if matrixFront != nil {
+		liveFrontends = append(liveFrontends, frontendAdmins{matrixFront, matrixFront.Send, cfg.Matrix.Admins})
+	}
+	if webFront != nil {
+		liveFrontends = append(liveFrontends, frontendAdmins{webFront, webFront.Send, []string{cfg.Web.ConvID}})
+	}
+
 	// validate() guarantees at least one frontend is configured, so this is
 	// never empty.
 	var frontendEndpoint relay.Endpoint
@@ -360,7 +366,10 @@ func main() {
 	// Admin escalation targets: every configured admin on whichever
 	// frontend(s) they live on (Telegram and/or Discord). A Discord-only-admin
 	// deployment must be reachable exactly like a Telegram one.
-	admins := buildAdminTargets(cfg, front, discordFront, logger)
+	admins := adminTargets(liveFrontends)
+	if len(admins) == 0 {
+		logger.Printf("WARNING: no admin targets on any running frontend — tool-approval prompts and escalations have nowhere to go")
+	}
 
 	// Forward Claude's tool-approval prompts to every admin's chat.
 	go func() {
@@ -613,30 +622,7 @@ func main() {
 	// their transport and so are not. Adding a frontend means implementing
 	// Assurance on it, not remembering to edit this block.
 	{
-		var fs []frontendAdmins
-		if front != nil {
-			tgIDs := make([]string, 0, len(cfg.Telegram.Admins))
-			for _, admin := range cfg.Telegram.Admins {
-				tgIDs = append(tgIDs, strconv.FormatInt(admin, 10))
-			}
-			fs = append(fs, frontendAdmins{front, tgIDs})
-		}
-		if discordFront != nil {
-			var dcIDs []string
-			if discordAdminIDs, err := cfg.Discord.AdminIDs(); err == nil {
-				for _, admin := range discordAdminIDs {
-					dcIDs = append(dcIDs, admin.String())
-				}
-			}
-			fs = append(fs, frontendAdmins{discordFront, dcIDs})
-		}
-		if matrixFront != nil {
-			fs = append(fs, frontendAdmins{matrixFront, cfg.Matrix.Admins})
-		}
-		if webFront != nil {
-			fs = append(fs, frontendAdmins{webFront, []string{cfg.Web.ConvID}})
-		}
-		livenessGatedSet = livenessGated(fs)
+		livenessGatedSet = livenessGated(liveFrontends)
 		gate := authorizer.Gate()
 		gate.Log = logger.Printf
 		b.Gate = gate

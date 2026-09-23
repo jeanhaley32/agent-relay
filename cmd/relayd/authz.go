@@ -11,8 +11,11 @@
 package main
 
 import (
+	"context"
+
 	"github.com/jeanhaley32/agent-relay/internal/access"
 	"github.com/jeanhaley32/agent-relay/internal/authz"
+	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
 // lateDirectory reads a directory through a func, so a manager assigned after
@@ -71,10 +74,34 @@ func outboundAllowed(chatID string, acc *access.Manager, discordAcc *access.Mana
 	return a.MayReceive(chatID).Allowed
 }
 
-// frontendAdmins pairs a live frontend with the admin ids configured for it.
+// frontendAdmins pairs a live frontend with the admin ids configured for it,
+// and with the way to reach them.
+//
+// One list serves every question relayd used to answer per platform: who owes
+// a liveness proof (via Assurance), and where an admin escalation should be
+// delivered. Before this, admin escalation knew only about Telegram and
+// Discord, so a Matrix-only or web-only deployment silently had no path for
+// tool-approval prompts -- the model waited forever for an /allow nobody was
+// ever shown.
 type frontendAdmins struct {
 	front authz.Assured
+	send  func(context.Context, relay.Message) error
 	ids   []string
+}
+
+// adminTargets is every admin on every running frontend, reached through the
+// frontend they actually live on.
+func adminTargets(fs []frontendAdmins) []adminTarget {
+	var targets []adminTarget
+	for _, f := range fs {
+		if f.send == nil {
+			continue
+		}
+		for _, id := range f.ids {
+			targets = append(targets, adminTarget{chatID: id, send: f.send})
+		}
+	}
+	return targets
 }
 
 // livenessGated returns the admin ids that must additionally prove they are
