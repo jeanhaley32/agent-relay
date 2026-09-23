@@ -355,6 +355,9 @@ type client struct {
 	seq     atomic.Uint64
 	waitMu  sync.Mutex
 	waiters map[string]chan ipc.Frame // correlation id -> response channel
+	// abandoned holds RequestIDs whose caller already gave up waiting.
+	// writeLoop drops them instead of flushing on reconnect — see request().
+	abandoned map[string]bool
 }
 
 // request sends a frame and blocks until the daemon answers with a frame
@@ -383,6 +386,12 @@ func (c *client) request(f ipc.Frame, timeout time.Duration) (ipc.Frame, error) 
 	case resp := <-ch:
 		return resp, nil
 	case <-time.After(timeout):
+		// The error below tells the caller to re-send, so this frame must not
+		// also go out by itself when the daemon returns. Otherwise a 20s
+		// outage produces two deliveries: the re-send, plus this frame
+		// flushing from the queue on reconnect. For schedule_message that is
+		// two armed schedules.
+		c.abandon(id)
 		// Be explicit that this is UNCONFIRMED, not a success. A bare "timed
 		// out" reads as a transient hiccup, so the model has repeatedly assumed
 		// the message went out and told the user "sent" when nothing was
@@ -390,6 +399,41 @@ func (c *client) request(f ipc.Frame, timeout time.Duration) (ipc.Frame, error) 
 		return ipc.Frame{}, errors.New(
 			"no delivery confirmation from relayd - the message may NOT have been delivered; do not report it as sent, and re-send if the user has not acknowledged it")
 	}
+}
+
+// abandon marks a RequestID as no longer wanted, so writeLoop drops it rather
+// than delivering a message whose caller was already told it may not arrive.
+func (c *client) abandon(id string) {
+	c.waitMu.Lock()
+	defer c.waitMu.Unlock()
+	if c.abandoned == nil {
+		c.abandoned = map[string]bool{}
+	}
+	c.abandoned[id] = true
+}
+
+// takeAbandoned reports whether a frame was abandoned, clearing the record.
+func (c *client) takeAbandoned(id string) bool {
+	if id == "" {
+		return false
+	}
+	c.waitMu.Lock()
+	defer c.waitMu.Unlock()
+	if !c.abandoned[id] {
+		return false
+	}
+	delete(c.abandoned, id)
+	return true
+}
+
+// forget clears an abandonment record, used once a frame has actually gone out.
+func (c *client) forget(id string) {
+	if id == "" {
+		return
+	}
+	c.waitMu.Lock()
+	defer c.waitMu.Unlock()
+	delete(c.abandoned, id)
 }
 
 // resolve delivers a response frame to a pending request waiter, if any.
@@ -462,9 +506,21 @@ func (c *client) send(f ipc.Frame) error {
 // wait in the queue while disconnected and flush on reconnect.
 func (c *client) writeLoop() {
 	for f := range c.out {
+		// Re-checked on every retry, not just on dequeue: the common case is
+		// that this frame is already in hand, spinning on a dead connection,
+		// when its caller's timeout fires. Checking once would miss exactly
+		// the outage this is meant to handle.
 		for {
+			if c.takeAbandoned(f.RequestID) {
+				c.logger.Printf("dropping %s frame %s: caller already gave up waiting", f.Kind, f.RequestID)
+				break
+			}
 			if conn := c.get(); conn != nil && conn.Send(f) == nil {
-				break // delivered
+				// Sent before the caller gave up. Clear any record that
+				// arrives late so the map does not accumulate entries for
+				// frames that already went out.
+				c.forget(f.RequestID)
+				break
 			}
 			time.Sleep(200 * time.Millisecond) // wait for (re)connection
 		}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"io"
+	"log"
 	"strings"
 	"testing"
 
@@ -80,5 +82,65 @@ func TestReplyHandlerSuccessReturnsNilError(t *testing.T) {
 
 	if err := handler(context.Background(), "555000111", "hello"); err != nil {
 		t.Fatalf("expected nil error on a successful ack, got %v", err)
+	}
+}
+
+// A request that times out tells the caller the message may not have been
+// delivered and to re-send. The queued frame must therefore not also flush
+// when the daemon returns — otherwise a brief outage produces two deliveries,
+// or two armed schedules for schedule_message.
+func TestAbandonedFrameIsDroppedNotFlushedOnReconnect(t *testing.T) {
+	c := &client{logger: log.New(io.Discard, "", 0), out: make(chan ipc.Frame, 4)}
+
+	// One frame whose caller gave up, one that is still wanted.
+	c.abandon("7")
+	c.out <- ipc.Frame{Kind: "reply", RequestID: "7", Text: "duplicate"}
+	c.out <- ipc.Frame{Kind: "reply", RequestID: "8", Text: "wanted"}
+	close(c.out)
+
+	var sent []ipc.Frame
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for f := range c.out {
+			if c.takeAbandoned(f.RequestID) {
+				continue
+			}
+			sent = append(sent, f)
+		}
+	}()
+	<-done
+
+	if len(sent) != 1 {
+		t.Fatalf("sent %d frame(s), want 1: %+v", len(sent), sent)
+	}
+	if sent[0].RequestID != "8" {
+		t.Fatalf("sent frame %q, want the one still wanted (8)", sent[0].RequestID)
+	}
+}
+
+func TestTakeAbandonedIsOneShotAndIgnoresEmptyIDs(t *testing.T) {
+	c := &client{logger: log.New(io.Discard, "", 0)}
+
+	// Frames with no RequestID are fire-and-forget; they must never be
+	// mistaken for abandoned.
+	if c.takeAbandoned("") {
+		t.Fatal("empty RequestID reported as abandoned")
+	}
+
+	c.abandon("3")
+	if !c.takeAbandoned("3") {
+		t.Fatal("first take should report abandoned")
+	}
+	if c.takeAbandoned("3") {
+		t.Fatal("second take should not: the record is consumed")
+	}
+
+	// forget clears a record for a frame that went out before its caller
+	// gave up, so the map does not accumulate.
+	c.abandon("4")
+	c.forget("4")
+	if c.takeAbandoned("4") {
+		t.Fatal("forget should have cleared the record")
 	}
 }
