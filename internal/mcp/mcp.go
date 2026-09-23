@@ -172,7 +172,18 @@ func (s *Server) handleRequest(ctx context.Context, msg inbound) {
 	case "tools/list":
 		s.write(response{JSONRPC: "2.0", ID: msg.ID, Result: s.toolsListResult()})
 	case "tools/call":
-		s.write(s.callTool(ctx, msg))
+		// Dispatched off the read loop: handlers block for as long as their
+		// work takes (force_reauth up to 3 minutes, reply 15s, schedule 10s),
+		// and running them here stops the shim reading from Claude Code for
+		// that whole window. Parallel tool calls stall, ping goes unanswered,
+		// and permission_request notifications are not forwarded — so a
+		// permission prompt waits on an unrelated slow tool. write() is
+		// mutex-protected, so concurrent responses are safe.
+		//
+		// The closure matters: `go s.write(s.callTool(...))` evaluates its
+		// arguments in the calling goroutine, so callTool would still run on
+		// the read loop and only the write would be deferred.
+		go func() { s.write(s.callTool(ctx, msg)) }()
 	case "ping":
 		s.write(response{JSONRPC: "2.0", ID: msg.ID, Result: map[string]any{}})
 	default:
