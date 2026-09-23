@@ -72,6 +72,23 @@ func Load(path string) (*Config, error) {
 	if c.Mode != ModeFull && c.Mode != ModeRestricted {
 		return nil, fmt.Errorf("invalid mode %q (want full|restricted)", c.Mode)
 	}
+	// A tool in both lists used to be dropped from deny, inverting the
+	// author's stricter intent with no error. Claude Code gives deny
+	// precedence, so silently resolving it the other way makes the rendered
+	// profile weaker than the file says. Refuse instead.
+	inAllow := map[string]bool{}
+	for _, t := range c.Allow {
+		inAllow[t] = true
+	}
+	var both []string
+	for _, t := range c.Deny {
+		if inAllow[t] {
+			both = append(both, t)
+		}
+	}
+	if len(both) > 0 {
+		return nil, fmt.Errorf("%s: %v listed in both allow and deny - remove from one (deny takes precedence, so an overlap makes the profile weaker than it reads)", path, both)
+	}
 	return &c, nil
 }
 
@@ -98,7 +115,7 @@ func (c *Config) Settings() map[string]any {
 	deny := []string{}
 	denied := map[string]bool{}
 	for _, t := range c.Deny {
-		if !seen[t] && !denied[t] { // never both allow and deny the same tool
+		if !denied[t] { // Load rejects allow/deny overlap, so only dedupe here
 			denied[t] = true
 			deny = append(deny, t)
 		}

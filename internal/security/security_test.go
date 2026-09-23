@@ -3,6 +3,7 @@ package security
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -100,4 +101,23 @@ func contains(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// A tool in both allow and deny used to be dropped from deny, which inverts
+// the author's intent: Claude Code gives deny precedence, so resolving the
+// overlap the other way renders a profile weaker than the file reads.
+func TestLoadRejectsAllowDenyOverlap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "security.yaml")
+	body := "mode: restricted\nallow:\n  - Read\n  - Bash\ndeny:\n  - Bash\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a profile listing Bash in both allow and deny")
+	}
+	if !strings.Contains(err.Error(), "Bash") {
+		t.Fatalf("error should name the offending tool, got: %v", err)
+	}
 }

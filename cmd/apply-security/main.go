@@ -91,7 +91,76 @@ func mergeSettings(existing []byte, own map[string]any) (map[string]any, error) 
 		}
 	}
 	for k, v := range own {
+		if k == "permissions" {
+			merged[k] = mergePermissions(merged[k], v)
+			continue
+		}
 		merged[k] = v // this command's keys win; operator keys are preserved
 	}
 	return merged, nil
+}
+
+// mergePermissions folds the profile's permissions into whatever is already in
+// settings.json instead of replacing the block. Wholesale replacement discarded
+// any operator-added deny entries and additionalDirectories on every launch —
+// the same shape as the earlier hooks overwrite, and it fails open: a deny the
+// operator added by hand simply stopped existing.
+//
+// deny is unioned, because a deny from either source is intended. allow is
+// taken from the profile, which owns it. Any other sub-key the operator has
+// set is left alone.
+func mergePermissions(existing, own any) any {
+	ownMap, ok := own.(map[string]any)
+	if !ok {
+		return own
+	}
+	existingMap, ok := existing.(map[string]any)
+	if !ok {
+		return own
+	}
+	out := map[string]any{}
+	for k, v := range existingMap {
+		out[k] = v
+	}
+	for k, v := range ownMap {
+		if k == "deny" {
+			out[k] = unionStrings(existingMap[k], v)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// unionStrings merges two JSON string arrays, preserving order and dropping
+// duplicates.
+func unionStrings(a, b any) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, list := range []any{a, b} {
+		items, ok := list.([]any)
+		if !ok {
+			if strs, ok := list.([]string); ok {
+				for _, s := range strs {
+					if !seen[s] {
+						seen[s] = true
+						out = append(out, s)
+					}
+				}
+			}
+			continue
+		}
+		for _, it := range items {
+			s, ok := it.(string)
+			if !ok || seen[s] {
+				continue
+			}
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out
 }

@@ -47,3 +47,59 @@ func TestMergeSettingsRefusesGarbage(t *testing.T) {
 		t.Fatal("expected an error for invalid JSON so the caller refuses to overwrite")
 	}
 }
+
+// The permissions block used to be replaced wholesale on every launch, so an
+// operator-added deny entry or additionalDirectories vanished silently — and
+// it failed open: the deny they added by hand simply stopped existing.
+func TestMergeSettingsPreservesOperatorPermissions(t *testing.T) {
+	existing := []byte(`{
+	  "permissions": {
+	    "allow": ["Read"],
+	    "deny": ["Bash(rm -rf:*)"],
+	    "additionalDirectories": ["/srv/data"]
+	  },
+	  "somethingElse": true
+	}`)
+	own := map[string]any{
+		"permissions": map[string]any{
+			"allow": []string{"Read", "Grep"},
+			"deny":  []string{"WebFetch"},
+		},
+	}
+
+	merged, err := mergeSettings(existing, own)
+	if err != nil {
+		t.Fatalf("mergeSettings: %v", err)
+	}
+	perms, ok := merged["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("permissions missing or wrong type: %#v", merged["permissions"])
+	}
+
+	// The operator's deny must survive alongside the profile's.
+	deny, _ := perms["deny"].([]string)
+	var sawOperator, sawProfile bool
+	for _, d := range deny {
+		switch d {
+		case "Bash(rm -rf:*)":
+			sawOperator = true
+		case "WebFetch":
+			sawProfile = true
+		}
+	}
+	if !sawOperator {
+		t.Fatalf("operator's deny entry was discarded: %v", deny)
+	}
+	if !sawProfile {
+		t.Fatalf("profile's deny entry missing: %v", deny)
+	}
+
+	// An unrelated sub-key the profile says nothing about must be left alone.
+	if _, ok := perms["additionalDirectories"]; !ok {
+		t.Fatal("additionalDirectories was discarded")
+	}
+	// Keys outside permissions are still preserved.
+	if merged["somethingElse"] != true {
+		t.Fatal("unrelated top-level key was lost")
+	}
+}
