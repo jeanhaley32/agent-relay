@@ -34,11 +34,14 @@ func (l lateDirectory) IsAdmin(id int64) bool {
 // ids (Matrix user ids, the web pane's ConvID); acc and discordAcc are the two
 // numeric directories, consulted in that order; owns reports whether a
 // frontend claims a conversation id.
-func newAuthorizer(named []map[string]bool, acc *access.Manager, discordAcc func() *access.Manager, owns func(string) bool) *authz.Authorizer {
+func newAuthorizer(named []map[string]bool, acc *access.Manager, discordAcc func() *access.Manager, owns func(string) bool, livenessRequired map[string]bool) *authz.Authorizer {
 	opts := []authz.Option{
 		authz.WithNumericDirectory(lateDirectory{get: func() *access.Manager { return acc }}),
 		authz.WithNumericDirectory(lateDirectory{get: discordAcc}),
 		authz.WithConversationOwnership(owns),
+	}
+	for id := range livenessRequired {
+		opts = append(opts, authz.WithLivenessRequired(id))
 	}
 	for _, set := range named {
 		for id := range set {
@@ -50,7 +53,7 @@ func newAuthorizer(named []map[string]bool, acc *access.Manager, discordAcc func
 
 // newIsAdmin builds the admin predicate the command registry gates on.
 func newIsAdmin(matrixAdmins, webAdmins map[string]bool, acc *access.Manager, discordAcc func() *access.Manager) func(string) bool {
-	a := newAuthorizer([]map[string]bool{matrixAdmins, webAdmins}, acc, discordAcc, nil)
+	a := newAuthorizer([]map[string]bool{matrixAdmins, webAdmins}, acc, discordAcc, nil, nil)
 	return func(senderID string) bool { return a.MayAdmin(senderID).Allowed }
 }
 
@@ -65,7 +68,7 @@ func newIsAdmin(matrixAdmins, webAdmins map[string]bool, acc *access.Manager, di
 // replies into a conversation the model was legitimately talking in, while
 // still failing closed for anything never seen inbound.
 func outboundAllowed(chatID string, acc *access.Manager, discordAcc *access.Manager, known func(string) bool) bool {
-	a := newAuthorizer(nil, acc, func() *access.Manager { return discordAcc }, known)
+	a := newAuthorizer(nil, acc, func() *access.Manager { return discordAcc }, known, nil)
 	return a.MayReceive(chatID).Allowed
 }
 

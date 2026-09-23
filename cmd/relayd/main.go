@@ -539,28 +539,24 @@ func main() {
 			logger.Printf("reply ack for %s: %v", reqID, err)
 		}
 	}
-	// Outbound gate: see outboundAllowed's doc comment for the full rationale.
-	b.OutboundAllowed = func(chatID string) bool {
-		known := func(id string) bool {
-			if discordFront != nil && discordFront.KnownConversation(id) {
-				return true
-			}
-			// A Matrix room id (starts with '!') is a legitimate outbound
-			// target: the model only ever gets a Matrix conversation from an
-			// authorized admin's inbound message, so replying into it is safe.
-			if matrixFront != nil && matrixFront.OwnsConversationID(id) {
-				return true
-			}
-			// The web pane's ConvID is a legitimate outbound target for the same
-			// reason as Matrix: the model only ever sees it from a whois-verified
-			// admin inbound, so replying back into it is safe.
-			return webFront != nil && webFront.OwnsConversationID(id)
-		}
-		if outboundAllowed(chatID, acc, discordAcc, known) {
+	// Conversation ownership: which conversations a frontend already knows
+	// about, and so are legitimate outbound targets. Consumed by the
+	// authorizer's outbound gate below -- see outboundAllowed's doc comment
+	// for the full rationale.
+	ownsConversation := func(id string) bool {
+		if discordFront != nil && discordFront.KnownConversation(id) {
 			return true
 		}
-		logger.Printf("blocked outbound reply to non-allowlisted chat %q", chatID)
-		return false
+		// A Matrix room id (starts with '!') is a legitimate outbound
+		// target: the model only ever gets a Matrix conversation from an
+		// authorized admin's inbound message, so replying into it is safe.
+		if matrixFront != nil && matrixFront.OwnsConversationID(id) {
+			return true
+		}
+		// The web pane's ConvID is a legitimate outbound target for the same
+		// reason as Matrix: the model only ever sees it from a whois-verified
+		// admin inbound, so replying back into it is safe.
+		return webFront != nil && webFront.OwnsConversationID(id)
 	}
 
 	cmds.Register(command.Command{
@@ -624,10 +620,22 @@ func main() {
 			fs = append(fs, frontendAdmins{webFront, []string{cfg.Web.ConvID}})
 		}
 		gated := livenessGated(fs)
+
+		// One authorizer answers both questions the Broker asks: may a reply
+		// go to this conversation, and does this sender owe a liveness proof.
+		// It replaces two Broker fields that expressed one policy between
+		// them with nothing owning it.
+		brokerAuthz := newAuthorizer(nil, acc,
+			func() *access.Manager { return discordAcc },
+			ownsConversation,
+			gated)
+		gate := brokerAuthz.Gate()
+		gate.Log = logger.Printf
+		b.Gate = gate
+
 		if len(gated) > 0 {
 			b.Session = session.NewManager(30 * time.Minute)
 			b.Approval = appr
-			b.SessionGatedUsers = gated
 			b.SessionTTL = 10 * time.Minute
 
 			// Admin device-presence gate (on top of the session gate above): an

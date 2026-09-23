@@ -69,6 +69,10 @@ type Authorizer struct {
 	// owns reports whether any frontend claims a conversation id. Supplied
 	// by the caller because ownership is a routing fact the frontends hold.
 	owns func(conversationID string) bool
+
+	// livenessRequired are sender ids that owe a liveness proof, derived by
+	// the caller from each transport's Assurance rather than listed by hand.
+	livenessRequired map[string]bool
 }
 
 // Option configures an Authorizer.
@@ -102,7 +106,7 @@ func WithConversationOwnership(owns func(string) bool) Option {
 }
 
 func New(opts ...Option) *Authorizer {
-	a := &Authorizer{namedAdmins: map[string]bool{}}
+	a := &Authorizer{namedAdmins: map[string]bool{}, livenessRequired: map[string]bool{}}
 	for _, o := range opts {
 		o(a)
 	}
@@ -171,3 +175,49 @@ func (a *Authorizer) MayReceive(conversationID string) Decision {
 type Assured interface {
 	Assurance() Assurance
 }
+
+// WithLivenessRequired marks sender ids that must prove they are live before
+// any message from them is processed. It is the policy half of the session
+// gate; the Broker owns the mechanism. Callers derive the set from each
+// transport's Assurance rather than listing ids by hand — see NeedsLivenessProof.
+func WithLivenessRequired(ids ...string) Option {
+	return func(a *Authorizer) {
+		for _, id := range ids {
+			if id != "" {
+				a.livenessRequired[id] = true
+			}
+		}
+	}
+}
+
+// Gate adapts an Authorizer to the yes/no questions a message broker asks per
+// message. It exists because those call sites want a plain bool, while the
+// Authorizer's own answers carry a reason worth logging. Reasons for denials
+// go to Log when set.
+type Gate struct {
+	a   *Authorizer
+	Log func(format string, args ...any)
+}
+
+// Gate returns the broker-facing view of this Authorizer.
+func (a *Authorizer) Gate() *Gate { return &Gate{a: a} }
+
+func (g *Gate) MayReceive(conversationID string) bool {
+	d := g.a.MayReceive(conversationID)
+	if !d.Allowed && g.Log != nil {
+		g.Log("blocked outbound reply to %q: %s", conversationID, d.Reason)
+	}
+	return d.Allowed
+}
+
+// NeedsLivenessProof reports whether this specific sender owes a proof. The
+// package-level function of the same name answers the more general question
+// of whether an Assurance level requires one; this answers it for one id,
+// using the set the caller derived from those levels.
+func (g *Gate) NeedsLivenessProof(senderID string) bool {
+	return g.a.livenessRequired[senderID]
+}
+
+// LivenessRequired reports how many senders owe a proof. Callers use it to
+// decide whether to install the session machinery at all.
+func (a *Authorizer) LivenessRequired() int { return len(a.livenessRequired) }

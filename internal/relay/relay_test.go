@@ -18,6 +18,20 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/session"
 )
 
+// testGate is the test-side Gatekeeper. It exists only so a test can state its
+// policy inline. Every assertion these tests make is unchanged from when the
+// Broker held this policy as two separate fields -- only the wiring moved.
+type testGate struct {
+	mayReceive func(string) bool
+	needsProof map[string]bool
+}
+
+func (g testGate) MayReceive(conversationID string) bool {
+	return g.mayReceive == nil || g.mayReceive(conversationID)
+}
+
+func (g testGate) NeedsLivenessProof(senderID string) bool { return g.needsProof[senderID] }
+
 // capFrontend captures everything Send'd to it.
 type capFrontend struct {
 	recv chan Message
@@ -105,11 +119,11 @@ func TestOutboundGate(t *testing.T) {
 	front := &capFrontend{recv: make(chan Message), sent: make(chan Message, 8)}
 	back := &emitBackend{recv: make(chan Message, 8)}
 	b := &Broker{
-		Frontend:        front,
-		Backend:         back,
-		Commands:        command.NewRegistry(),
-		Meter:           budget.New("pro", nil),
-		OutboundAllowed: func(chatID string) bool { return chatID == "111" }, // only 111 allowed
+		Frontend: front,
+		Backend:  back,
+		Commands: command.NewRegistry(),
+		Meter:    budget.New("pro", nil),
+		Gate:     testGate{mayReceive: func(chatID string) bool { return chatID == "111" }}, // only 111 allowed
 	}
 	go b.Run(context.Background())
 	defer close(front.recv) // ends Run
@@ -186,12 +200,12 @@ func TestOnBackendReplyGated(t *testing.T) {
 	back := &emitBackend{recv: make(chan Message, 8)}
 	seen := make(chan string, 8)
 	b := &Broker{
-		Frontend:        front,
-		Backend:         back,
-		Commands:        command.NewRegistry(),
-		Meter:           budget.New("pro", nil),
-		OutboundAllowed: func(chatID string) bool { return chatID == "111" },
-		OnBackendReply:  func(m Message) { seen <- m.Meta["chat_id"] },
+		Frontend:       front,
+		Backend:        back,
+		Commands:       command.NewRegistry(),
+		Meter:          budget.New("pro", nil),
+		Gate:           testGate{mayReceive: func(chatID string) bool { return chatID == "111" }},
+		OnBackendReply: func(m Message) { seen <- m.Meta["chat_id"] },
 	}
 	go b.Run(context.Background())
 	defer close(front.recv)
@@ -324,14 +338,14 @@ func TestSessionGate(t *testing.T) {
 	appr := approval.NewManager("http://tailnet.example")
 
 	b := &Broker{
-		Frontend:          front,
-		Backend:           back,
-		Commands:          cmds,
-		Meter:             budget.New("pro", nil),
-		Session:           session.NewManager(30 * time.Minute),
-		Approval:          appr,
-		SessionGatedUsers: map[string]bool{"admin-chat": true},
-		SessionTTL:        2 * time.Second,
+		Frontend:   front,
+		Backend:    back,
+		Commands:   cmds,
+		Meter:      budget.New("pro", nil),
+		Session:    session.NewManager(30 * time.Minute),
+		Approval:   appr,
+		Gate:       testGate{needsProof: map[string]bool{"admin-chat": true}},
+		SessionTTL: 2 * time.Second,
 	}
 	go b.Run(context.Background())
 	defer close(front.recv)
@@ -430,14 +444,14 @@ func TestAdminDevicePresentGate(t *testing.T) {
 
 	deviceOnline := false
 	b := &Broker{
-		Frontend:          front,
-		Backend:           back,
-		Commands:          cmds,
-		Meter:             budget.New("pro", nil),
-		Session:           session.NewManager(30 * time.Minute),
-		Approval:          appr,
-		SessionGatedUsers: map[string]bool{"admin-chat": true, "device-online-chat": true},
-		SessionTTL:        2 * time.Second,
+		Frontend:   front,
+		Backend:    back,
+		Commands:   cmds,
+		Meter:      budget.New("pro", nil),
+		Session:    session.NewManager(30 * time.Minute),
+		Approval:   appr,
+		Gate:       testGate{needsProof: map[string]bool{"admin-chat": true, "device-online-chat": true}},
+		SessionTTL: 2 * time.Second,
 		AdminDevicePresent: func(senderID string) (bool, bool) {
 			return true, deviceOnline // always "required", online toggled by the test
 		},
@@ -535,16 +549,16 @@ func TestAnomalyGate_AdminRevokesSession(t *testing.T) {
 	sess.Activate("admin-chat") // starts with a valid session
 
 	b := &Broker{
-		Frontend:          front,
-		Backend:           back,
-		Commands:          cmds,
-		Meter:             budget.New("pro", nil),
-		Session:           sess,
-		Approval:          appr,
-		SessionGatedUsers: map[string]bool{"admin-chat": true},
-		SessionTTL:        2 * time.Second,
-		Anomaly:           &stubAnomalyDetector{score: 0.99},
-		AnomalyThreshold:  0.5,
+		Frontend:         front,
+		Backend:          back,
+		Commands:         cmds,
+		Meter:            budget.New("pro", nil),
+		Session:          sess,
+		Approval:         appr,
+		Gate:             testGate{needsProof: map[string]bool{"admin-chat": true}},
+		SessionTTL:       2 * time.Second,
+		Anomaly:          &stubAnomalyDetector{score: 0.99},
+		AnomalyThreshold: 0.5,
 	}
 	go b.Run(context.Background())
 	defer close(front.recv)
@@ -776,14 +790,14 @@ func TestSessionGateDenied(t *testing.T) {
 	appr := approval.NewManager("http://tailnet.example")
 
 	b := &Broker{
-		Frontend:          front,
-		Backend:           back,
-		Commands:          cmds,
-		Meter:             budget.New("pro", nil),
-		Session:           session.NewManager(30 * time.Minute),
-		Approval:          appr,
-		SessionGatedUsers: map[string]bool{"admin-chat": true},
-		SessionTTL:        2 * time.Second,
+		Frontend:   front,
+		Backend:    back,
+		Commands:   cmds,
+		Meter:      budget.New("pro", nil),
+		Session:    session.NewManager(30 * time.Minute),
+		Approval:   appr,
+		Gate:       testGate{needsProof: map[string]bool{"admin-chat": true}},
+		SessionTTL: 2 * time.Second,
 	}
 	go b.Run(context.Background())
 	defer close(front.recv)

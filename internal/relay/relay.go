@@ -58,6 +58,39 @@ type Endpoint interface {
 	Close() error
 }
 
+// Gatekeeper answers the authorization questions the Broker asks of traffic
+// crossing it. One interface replaces two fields because both were asking the
+// same underlying thing: what is this sender or conversation entitled to.
+//
+// Nil-safety and the defaults for an unset Gate live on the Broker's private
+// helpers below, so every call site reads as a plain question.
+type Gatekeeper interface {
+	// MayReceive reports whether the Broker may deliver a model reply to
+	// this conversation. The inbound allowlist decides who reaches the
+	// model; this decides who the model can reach back.
+	MayReceive(conversationID string) bool
+
+	// NeedsLivenessProof reports whether this sender must additionally
+	// prove they are live — an approved session, or a bound device that is
+	// currently present — before any message from them is processed.
+	NeedsLivenessProof(senderID string) bool
+}
+
+// mayReceive defaults to allowing delivery when no Gate is set, which is what
+// a Broker with no OutboundAllowed did. Fail-open is correct here only because
+// the caller that omits a Gate has opted out of outbound gating entirely; a
+// configured Gate that errors must say no, which is why the interface returns
+// a bool rather than (bool, error).
+func (b *Broker) mayReceive(conversationID string) bool {
+	return b.Gate == nil || b.Gate.MayReceive(conversationID)
+}
+
+// needsLivenessProof defaults to false when no Gate is set, matching a Broker
+// with an empty SessionGatedUsers map: nobody owed a proof.
+func (b *Broker) needsLivenessProof(senderID string) bool {
+	return b.Gate != nil && b.Gate.NeedsLivenessProof(senderID)
+}
+
 // Estimator approximates the token cost of a piece of text. The default is a
 // rough chars/4 heuristic; swap in a real tokenizer later.
 type Estimator func(text string) int
@@ -94,11 +127,18 @@ type Broker struct {
 	Commands *command.Registry
 	Meter    *budget.Meter
 	Estimate Estimator
-	// OutboundAllowed, if set, gates backend (model) replies: a reply whose
-	// target chat is not allowed is dropped, never delivered to the frontend.
-	// This stops the model from messaging non-allowlisted chats even though the
-	// allowlist only gates inbound. nil ⇒ no outbound gating.
-	OutboundAllowed func(chatID string) bool
+	// Gate answers the authorization questions the Broker asks. It replaces
+	// two fields that between them expressed one policy with no single owner:
+	// an outbound predicate, and a set of senders who owed a liveness proof.
+	//
+	// internal/authz implements it; the Broker deliberately does not know
+	// that. nil ⇒ no outbound gating and no liveness requirement, which is
+	// what a Broker with neither field set used to do.
+	//
+	// Admin identity is not here yet — the Broker still borrows it from
+	// Commands.IsAdmin for lockdown and anomaly handling. Folding that in is
+	// the next step, and it is deliberately not bundled with this one.
+	Gate Gatekeeper
 
 	// OnBackendReply, if set, fires after a reply is actually delivered -
 	// used to auto-resolve fired triggers. nil ⇒ no hook.
@@ -116,21 +156,24 @@ type Broker struct {
 	// contacts directory. nil ⇒ no observation, zero overhead.
 	OnInboundObserved func(m Message)
 
-	// Session gate: if Session and Approval are both set, inbound messages
-	// from any user_id (from_id) in SessionGatedUsers require an active,
-	// non-idle-expired session before being processed, keyed on the
-	// sender's permanent account id (not chat_id, which only equals
-	// from_id by convention). An expired/missing session triggers a
+	// Session gate: if Session and Approval are both set, an inbound message
+	// from a sender Gate says owes a liveness proof requires an active,
+	// non-idle-expired session before being processed. The question is asked
+	// of the sender's permanent account id (from_id), not chat_id, which only
+	// equals from_id by convention. An expired or missing session triggers a
 	// tailnet re-auth challenge (via Approval) instead of processing the
 	// message. nil Session ⇒ no gating.
-	Session           *session.Manager
-	Approval          *approval.Manager
-	SessionGatedUsers map[string]bool
-	SessionTTL        time.Duration // approval request validity window
+	//
+	// Session, Approval and SessionTTL are the mechanism; Gate decides who it
+	// applies to. That split is the point: which senders owe a proof is a
+	// policy question, and it used to be answered by a map this struct held.
+	Session    *session.Manager
+	Approval   *approval.Manager
+	SessionTTL time.Duration // approval request validity window
 
 	// AdminDevicePresent, if set, is consulted by the session gate above for
-	// every message (not just slash commands) from a SessionGatedUsers
-	// sender: for a sender with a bound device (required=true), live device
+	// every message (not just slash commands) from a sender who owes a
+	// liveness proof: for a sender with a bound device (required=true), live device
 	// presence (online=true) stands in for an approved session directly -
 	// frictionless while the device is actually online. If the device is
 	// offline (or unbound, required=false), the ordinary approved-session
@@ -499,7 +542,7 @@ func (b *Broker) Run(ctx context.Context) error {
 				m.Meta["in_reply_to"] = cause.(string)
 			}
 			b.logEvent(m, eventlog.Reply, "", "")
-			if b.OutboundAllowed != nil && !b.OutboundAllowed(m.Meta["chat_id"]) {
+			if !b.mayReceive(m.Meta["chat_id"]) {
 				b.logEvent(m, eventlog.Dropped, "outbound chat not allowlisted", "")
 				if b.AckBackendReply != nil {
 					b.AckBackendReply(m, senderr.Permanent{Err: fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"])})
@@ -563,8 +606,8 @@ func (b *Broker) Run(ctx context.Context) error {
 		// chat request can just as easily lead to a real tool call (Bash,
 		// Edit, a service restart) as a formal "/command" can, so the gate
 		// can't live at the command-dispatch layer alone.
-		// Keyed on from_id (see SessionGatedUsers doc comment above).
-		if b.Session != nil && b.Approval != nil && b.SessionGatedUsers[m.Meta["from_id"]] {
+		// Keyed on from_id (see the Session doc comment above).
+		if b.Session != nil && b.Approval != nil && b.needsLivenessProof(m.Meta["from_id"]) {
 			// Live device presence, if bound, stands in for session validity
 			// directly - frictionless while the bound device is actually
 			// online, no need to re-click an approval link every 30 min. If
