@@ -389,6 +389,14 @@ func (b *Broker) logEvent(m Message, event, detail, errText string) {
 // if a challenge for userID is already in flight, so a gated user sending
 // several messages before re-authing gets one link and one poller, not N.
 func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
+	// Approval is what turns a challenge into something the user can answer.
+	// Without it there is nothing to issue, and the dereference below would
+	// panic in the inbound loop and take the relay down. The session gate
+	// already requires both; the anomaly path only checked Session, so guard
+	// here and cover every caller.
+	if b.Approval == nil {
+		return
+	}
 	b.challengeMu.Lock()
 	if b.challengeInFlight == nil {
 		b.challengeInFlight = map[string]bool{}

@@ -1288,3 +1288,13 @@ func TestLedgerBuffered(t *testing.T) {
 		t.Fatalf("expected a buffered event for a disconnected backend, got:\n%s", string(data))
 	}
 }
+
+// A Broker with a Session but no Approval used to panic in the inbound loop:
+// the session gate required both, but the anomaly path checked only Session
+// and then dereferenced Approval. cmd/relayd happens to set them together, so
+// nothing enforced the pairing.
+func TestChallengeSessionWithoutApprovalDoesNotPanic(t *testing.T) {
+	b := &Broker{Session: session.NewManager(time.Minute)}
+	// Must return rather than panic; nothing to assert beyond surviving.
+	b.challengeSession(context.Background(), "conv", "user-1")
+}

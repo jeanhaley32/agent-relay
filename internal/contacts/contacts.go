@@ -339,13 +339,21 @@ func (d *Directory) save() {
 	d.saveMu.Lock()
 	defer d.saveMu.Unlock()
 
+	// Copy the values, not the pointers. Marshalling happens after the lock is
+	// released, so handing out pointers lets json read a record while Observe
+	// is writing LastSeen/MessageCount on another frontend's goroutine — a
+	// data race, and a torn record on disk. Members needs its own copy for the
+	// same reason: the slice header would otherwise be shared with Link.
 	d.mu.RLock()
 	p := persisted{}
 	for _, id := range d.identities {
-		p.Identities = append(p.Identities, id)
+		cp := *id
+		p.Identities = append(p.Identities, &cp)
 	}
 	for _, per := range d.people {
-		p.People = append(p.People, per)
+		cp := *per
+		cp.Members = append([]string(nil), per.Members...)
+		p.People = append(p.People, &cp)
 	}
 	d.mu.RUnlock()
 

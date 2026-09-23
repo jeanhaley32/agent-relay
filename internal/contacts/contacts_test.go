@@ -1,9 +1,14 @@
 package contacts
 
 import (
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestObserveCreatesAndResolves(t *testing.T) {
@@ -130,4 +135,54 @@ func TestUniqueAliasOnCollision(t *testing.T) {
 	if list[0].Alias == list[1].Alias {
 		t.Fatalf("expected distinct aliases on collision, both got %q", list[0].Alias)
 	}
+}
+
+// TestConcurrentObserveAndSaveIsRaceFree reproduces the shape that made the
+// save() race invisible: no existing test drove Observe and save at the same
+// time, so -race never had anything to catch. Two frontends observing traffic
+// while the directory persists is the ordinary case, not an exotic one.
+func TestConcurrentObserveAndSaveIsRaceFree(t *testing.T) {
+	d := New(filepath.Join(t.TempDir(), "contacts.json"), log.New(io.Discard, "", 0))
+	d.Observe("telegram", "111", "", "alice")
+	d.Observe("discord", "222", "g1", "bob")
+	if err := d.Link("alice", "telegram.111"); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Telegram's poll loop and Discord's dispatcher, both observing.
+	for i, plat := range []string{"telegram", "discord"} {
+		wg.Add(1)
+		go func(plat string, id int) {
+			defer wg.Done()
+			for n := 0; ; n++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				d.Observe(plat, strconv.Itoa(100+id), "g1", "name"+strconv.Itoa(n))
+			}
+		}(plat, i)
+	}
+
+	// The persister, reading those same records.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			d.save()
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
