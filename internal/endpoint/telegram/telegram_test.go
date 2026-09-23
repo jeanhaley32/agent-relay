@@ -25,7 +25,7 @@ func TestMeHandshake(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/bot"+testToken+"/getMe", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"ok":true,"result":{"id":8656983200,"username":"thinkpt480bot","first_name":"thinkbot"}}`)
+		fmt.Fprint(w, `{"ok":true,"result":{"id":1000000002,"username":"examplebot","first_name":"Example"}}`)
 	})
 	mux.HandleFunc("/botBADTOKEN/getMe", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -41,7 +41,7 @@ func TestMeHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Me: %v", err)
 	}
-	if info.Username != "thinkpt480bot" || info.ID != 8656983200 {
+	if info.Username != "examplebot" || info.ID != 1000000002 {
 		t.Fatalf("wrong bot info: %+v", info)
 	}
 
@@ -65,7 +65,7 @@ func TestPollGateAndSend(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Query().Get("offset") == "" {
 			fmt.Fprint(w, `{"ok":true,"result":[
-				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"jean"},"chat":{"id":222,"type":"private"},"text":"hello"}},
+				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"alice"},"chat":{"id":222,"type":"private"},"text":"hello"}},
 				{"update_id":11,"message":{"message_id":2,"from":{"id":999,"username":"stranger"},"chat":{"id":333,"type":"private"},"text":"spam"}}
 			]}`)
 			return
@@ -148,8 +148,8 @@ func TestGroupChatDropped(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Query().Get("offset") == "" {
 			fmt.Fprint(w, `{"ok":true,"result":[
-				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"jean"},"chat":{"id":555,"type":"group"},"text":"hello from a group"}},
-				{"update_id":11,"message":{"message_id":2,"from":{"id":111,"username":"jean"},"chat":{"id":111,"type":"private"},"text":"hello from DM"}}
+				{"update_id":10,"message":{"message_id":1,"from":{"id":111,"username":"alice"},"chat":{"id":555,"type":"group"},"text":"hello from a group"}},
+				{"update_id":11,"message":{"message_id":2,"from":{"id":111,"username":"alice"},"chat":{"id":111,"type":"private"},"text":"hello from DM"}}
 			]}`)
 			return
 		}

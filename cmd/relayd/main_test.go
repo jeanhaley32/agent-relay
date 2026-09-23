@@ -214,6 +214,20 @@ func TestHandleEventListAndAck(t *testing.T) {
 	}
 }
 
+// shortTempDir returns a temp dir short enough for a unix socket path.
+// t.TempDir() embeds the test name, and on macOS its /var/folders/... prefix
+// plus a long test name overruns sun_path's 104-byte limit, so binding fails
+// with "invalid argument" rather than anything that names the real cause.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "r")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // newTestMux builds a relayd webhook mux with minimal live dependencies
 // (a claude backend endpoint on a temp socket, an in-memory budget meter,
 // and the shared test tracker) - enough to drive the method-guard and
@@ -221,7 +235,7 @@ func TestHandleEventListAndAck(t *testing.T) {
 // process.
 func newTestMux(t *testing.T, admins []adminTarget) (*http.ServeMux, *relay.Broker) {
 	t.Helper()
-	back, err := claudebk.New(filepath.Join(t.TempDir(), "shim.sock"))
+	back, err := claudebk.New(filepath.Join(shortTempDir(t), "s.sock"))
 	if err != nil {
 		t.Fatalf("claudebk.New: %v", err)
 	}
