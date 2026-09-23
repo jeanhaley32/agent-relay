@@ -785,6 +785,10 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 		case f.retryQueue <- item:
 			f.queueDepth.Add(1)
 		default:
+			// Still full after making room: this new item is lost, and that
+			// is a permanent drop like any other.
+			f.logger.Printf("discord retry queue full again, dropping new item")
+			f.permanentDrops.Add(1)
 		}
 	}
 }
@@ -809,12 +813,23 @@ func (f *Frontend) startRetryWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-f.retryQueue:
-			// Deliberately not decremented here: the item is moving from the
-			// channel into the in-worker pending slice, not leaving the
-			// backlog. queueDepth is only decremented once an item is fully
-			// resolved (sent, dropped permanent, or exhausted), so the
-			// exported gauge reflects the whole retry backlog, not just
-			// what's still sitting in the channel buffer.
+			// pending is capped separately from the channel: draining the
+			// channel each iteration would otherwise make the channel's
+			// 200-slot bound illusory, letting the in-flight backlog grow at
+			// failure-rate x retry-exhaustion-time (~23 minutes of backoffs)
+			// while enqueueRetry never sees a full channel and the drop
+			// metric never reflects the pressure.
+			if len(pending) >= retryQueueCapacity {
+				f.logger.Printf("discord retry backlog full (%d), dropping oldest pending item", retryQueueCapacity)
+				f.queueDepth.Add(-1)
+				f.permanentDrops.Add(1)
+				pending = pending[1:]
+			}
+			// queueDepth is deliberately not decremented for the move itself:
+			// the item is going from the channel into pending, not leaving the
+			// backlog. It is decremented once an item is fully resolved (sent,
+			// dropped, or exhausted), so the gauge reflects the whole backlog
+			// rather than just the channel buffer.
 			pending = append(pending, item)
 		case <-ticker.C:
 			now := time.Now()
