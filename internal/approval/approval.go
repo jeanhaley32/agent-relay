@@ -57,12 +57,20 @@ func newToken() string {
 	return hex.EncodeToString(b)
 }
 
+// expire marks a request expired once past its deadline, whatever its current
+// status. An approval that was never consumed is not still good afterwards:
+// the deadline is the authorization window, not merely a limit on how long a
+// human has to answer. Callers hold m.mu.
+func (m *Manager) expire(req *request) {
+	if req.status != StatusExpired && time.Now().After(req.expires) {
+		req.status = StatusExpired
+	}
+}
+
 func (m *Manager) gc() {
 	now := time.Now()
 	for tok, req := range m.pending {
-		if req.status == StatusPending && now.After(req.expires) {
-			req.status = StatusExpired
-		}
+		m.expire(req)
 		// Drop terminal requests after they've sat for a while so the map
 		// doesn't grow unbounded.
 		if req.status != StatusPending && now.Sub(req.expires) > 10*time.Minute {
@@ -102,9 +110,7 @@ func (m *Manager) Status(token string) (status, bool) {
 	if !ok {
 		return "", false
 	}
-	if req.status == StatusPending && time.Now().After(req.expires) {
-		req.status = StatusExpired
-	}
+	m.expire(req)
 	return req.status, true
 }
 
@@ -121,9 +127,7 @@ func (m *Manager) Consume(token, actionHash string) (status, bool) {
 	if !ok {
 		return "", false
 	}
-	if req.status == StatusPending && time.Now().After(req.expires) {
-		req.status = StatusExpired
-	}
+	m.expire(req)
 	if req.status != StatusApproved {
 		return req.status, true
 	}

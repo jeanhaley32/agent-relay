@@ -224,3 +224,35 @@ func TestUnknownToken(t *testing.T) {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
+
+// An approval that is never consumed must stop being good at its deadline.
+// Previously only StatusPending was converted to Expired, so a request
+// approved at t=9m of a 10m TTL stayed consumable until gc deleted it at
+// expires+10m — a 2x authorization window that contradicted Status's own doc
+// comment.
+func TestApprovedButUnconsumedExpiresAtDeadline(t *testing.T) {
+	m := NewManager("http://example.invalid")
+	token, _ := m.CreateBound("do the risky thing", "hash-1", 40*time.Millisecond)
+
+	// Same shortcut the other tests use rather than driving the HTTP handler.
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	if st, _ := m.Status(token); st != StatusApproved {
+		t.Fatalf("before the deadline: status %q, want approved", st)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	if st, _ := m.Status(token); st != StatusExpired {
+		t.Fatalf("past the deadline: Status returned %q, want expired", st)
+	}
+	st, ok := m.Consume(token, "hash-1")
+	if !ok {
+		t.Fatal("Consume should still find the request")
+	}
+	if st == StatusApproved {
+		t.Fatal("Consume authorized an approval that was past its deadline")
+	}
+}
