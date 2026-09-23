@@ -121,7 +121,13 @@ type Frontend struct {
 	httpClient *http.Client  // injectable for tests
 	client     *bot.Client   // real gateway connection; nil when using a fake transport in tests
 
-	recv     chan relay.Message
+	recv chan relay.Message
+	// mu guards closing; dispatchWG counts dispatch callbacks that are past
+	// the closing check and may still send on recv.
+	mu         sync.Mutex
+	closing    bool
+	dispatchWG sync.WaitGroup
+
 	recvOnce sync.Once // guards close(recv) so Close() and any other closer
 	// can't double-close or race with sends — see Close's doc comment.
 	ctx    context.Context
@@ -331,11 +337,12 @@ func New(token string, opts ...Option) (*Frontend, error) {
 // without ever dialing Discord, keeping this endpoint unit-testable without
 // a real bot token.
 //
-// recv must not be closed until the gateway's dispatch loop has stopped,
-// or onMessageCreate can send-to-closed-channel; recv is therefore closed
-// from Close() only, after client.Close() has blocked until disgo's
-// callbacks have all returned — never from a goroutine racing ctx.Done()
-// against onMessageCreate's own `f.recv <- msg` sends.
+// recv must not be closed while a dispatch callback might still send on it.
+// disgo's client.Close() does NOT guarantee that: CloseWithCode closes the
+// socket and returns without joining the listen goroutine, which dispatches
+// listeners synchronously. Close() therefore tracks in-flight callbacks with
+// a WaitGroup and waits for them before closing recv, rather than relying on
+// the library to have drained them.
 //
 // IMPORTANT — Close() does NOT cancel the ctx given here. The ctx passed to
 // Connect is only used for the initial client.OpenGateway(ctx) dial; f.cancel
@@ -438,12 +445,30 @@ func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 // stopped, or onMessageCreate can still send-to-closed-channel. recvOnce
 // also guards against a double-close if Close is ever called twice.
 func (f *Frontend) Close() error {
+	// Mark closing first so no new dispatch callback starts a send, then stop
+	// the gateway, then wait for any callback already past that check.
+	f.mu.Lock()
+	f.closing = true
+	f.mu.Unlock()
 	if f.client != nil {
 		f.client.Close(context.Background())
 	}
+	f.dispatchWG.Wait()
 	f.recvOnce.Do(func() { close(f.recv) })
 	f.cancel()
 	return nil
+}
+
+// enterDispatch registers an in-flight dispatch callback, reporting false if
+// Close has already begun.
+func (f *Frontend) enterDispatch() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closing {
+		return false
+	}
+	f.dispatchWG.Add(1)
+	return true
 }
 
 // onMessageCreate is disgo's OnMessageCreate callback in real use: it
@@ -478,6 +503,12 @@ func (f *Frontend) onMessageCreate(e *events.MessageCreate) {
 	if !ok {
 		return
 	}
+	// Register before sending so Close cannot close recv underneath us; bail
+	// if Close has already started.
+	if !f.enterDispatch() {
+		return
+	}
+	defer f.dispatchWG.Done()
 	select {
 	case f.recv <- msg:
 	case <-time.After(5 * time.Second):

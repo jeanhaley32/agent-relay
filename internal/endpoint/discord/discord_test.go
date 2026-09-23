@@ -831,3 +831,56 @@ func TestSelfIDZeroDropsGuildMessages(t *testing.T) {
 		t.Fatal("selfID set should deliver a message that mentions the bot")
 	}
 }
+
+// Close used to close recv immediately after client.Close(), on the stated
+// assumption that disgo had drained its dispatch loop. It has not:
+// CloseWithCode closes the socket and returns without joining the listen
+// goroutine, which dispatches listeners synchronously. A callback blocked on
+// the recv send would then send on a closed channel.
+func TestCloseWaitsForInFlightDispatch(t *testing.T) {
+	f := &Frontend{
+		auth:               &recordingAuth{allowed: map[snowflake.ID]bool{111: true}},
+		logger:             testLogger(t),
+		allowGuildMessages: false,
+		// Unbuffered: the dispatch callback blocks in the send until someone
+		// reads, which is exactly the window Close has to respect.
+		recv: make(chan relay.Message),
+	}
+	f.cancel = func() {}
+
+	dispatching := make(chan struct{})
+	go func() {
+		close(dispatching)
+		f.onMessageCreate(&events.MessageCreate{GenericMessage: &events.GenericMessage{
+			Message: discord.Message{
+				ID:        1,
+				ChannelID: 42,
+				Author:    discord.User{ID: 111},
+				Content:   "hello",
+			},
+		}})
+	}()
+	<-dispatching
+	time.Sleep(50 * time.Millisecond) // let it reach the send
+
+	closed := make(chan error, 1)
+	go func() { closed <- f.Close() }()
+
+	// Close must not have finished while the callback is still blocked.
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a dispatch callback was still sending")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Drain, which unblocks the callback and lets Close finish.
+	<-f.recv
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the callback finished")
+	}
+}

@@ -112,6 +112,11 @@ func (f *Frontend) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = f.srv.Shutdown(ctx)
+	// Take the lock again before closing: any handler that got past the
+	// closed check before it was set is holding this mutex while it sends, so
+	// waiting here means the channel is only closed once no send is in flight.
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	close(f.out)
 	return nil
 }
@@ -268,6 +273,16 @@ func (f *Frontend) handleSend(w http.ResponseWriter, r *http.Request) {
 		full = "Selected passage:\n> " + strings.ReplaceAll(q, "\n", "\n> ") + "\n\n" + text
 	}
 	msg := inbound.Envelope("web", f.convID, full, f.convID, f.convID, f.fromName)
+	// Held across the send: Shutdown is given a bounded grace period and
+	// returns whether or not handlers have finished, so without this a handler
+	// still in flight can send on a channel Close has already closed — an
+	// unrecovered panic in the HTTP goroutine.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		http.Error(w, "relay shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	select {
 	case f.out <- msg:
 		w.WriteHeader(http.StatusNoContent)
