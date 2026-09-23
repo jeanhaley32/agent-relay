@@ -6,11 +6,10 @@
     },
     "relay": {
       "command": "./bin/relay-shim",
-      "args": ["--socket", "/tmp/agent-relay.sock"]
-    },
-    "hackrf": {
-      "command": "${HOME}/hackrf-proxy/bin/hackrf-mcp",
-      "args": ["-base", "http://127.0.0.1:8723"]
+      "args": [
+        "--socket",
+        "/tmp/agent-relay.sock"
+      ]
     }
   }
 }
