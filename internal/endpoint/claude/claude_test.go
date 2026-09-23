@@ -282,3 +282,54 @@ func TestCloseUnblocksReadReplies(t *testing.T) {
 		t.Fatal("Recv() never closed after Close(): acceptLoop still stuck in readReplies - shutdown would hang (regression)")
 	}
 }
+
+// A second shim used to dial successfully (the listen backlog accepts it) but
+// never be serviced: acceptLoop read the first connection inline, so Accept
+// was not reached again until that connection closed. Frames from the new
+// session were never read and every reply timed out, with nothing in the log
+// explaining it.
+func TestSecondShimConnectionIsServiced(t *testing.T) {
+	dir, err := os.MkdirTemp("", "c")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	e, err := New(filepath.Join(dir, "s.sock"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+
+	first, err := net.Dial("unix", e.socketPath)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
+	}
+	defer first.Close()
+	time.Sleep(50 * time.Millisecond) // let acceptLoop take it
+
+	second, err := net.Dial("unix", e.socketPath)
+	if err != nil {
+		t.Fatalf("second dial: %v", err)
+	}
+	defer second.Close()
+
+	// The real symptom is that nothing from the second connection is ever
+	// read, so assert on a frame crossing it rather than on internal state.
+	if err := ipc.NewConn(second).Send(ipc.Frame{
+		Kind:   ipc.KindReply,
+		ChatID: "conv-2",
+		Text:   "from the second shim",
+	}); err != nil {
+		t.Fatalf("send on second conn: %v", err)
+	}
+
+	select {
+	case m := <-e.Recv():
+		if m.Text != "from the second shim" {
+			t.Fatalf("got %q from Recv, want the second shim's frame", m.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("frame from the second shim was never read: that connection is not being serviced")
+	}
+}

@@ -205,10 +205,21 @@ func (e *Endpoint) acceptLoop() {
 			return // listener closed
 		}
 		c := ipc.NewConn(nc)
+		// The newest connection wins, which is the documented behaviour: a
+		// restarted shim must take over. Close the previous one explicitly so
+		// its owner sees EOF and stops writing into a socket nobody reads.
 		e.mu.Lock()
+		prev := e.conn
 		e.conn = c
 		e.mu.Unlock()
-		e.readReplies(c)
+		if prev != nil {
+			prev.Close()
+		}
+		// Read in its own goroutine, so Accept is reached again immediately.
+		// Reading inline meant a second shim's Dial succeeded on the listen
+		// backlog but was never serviced: no injects reached it and every
+		// reply timed out, with nothing in the log to say why.
+		go e.readReplies(c)
 	}
 }
 
