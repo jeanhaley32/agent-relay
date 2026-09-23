@@ -249,7 +249,7 @@ func main() {
 	// Telegram frontend, authorized via the access manager.
 	telegramOpts := []telegram.Option{
 		telegram.WithAuthorizer(acc),
-		telegram.WithPollTimeout(cfg.Telegram.PollTimeout),
+		telegram.WithPollTimeout(cfg.Telegram.PollTimeout()),
 		telegram.WithLogger(logger),
 	}
 	// One denied-sender log, shared across every frontend (Telegram + Discord),

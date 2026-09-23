@@ -83,3 +83,22 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// Escaped checked the untrimmed text while Dispatch trims first, so a leading
+// space meant neither path handled the escape: Escaped said no, Dispatch saw
+// no leading slash, and the backslash reached the model instead of the literal
+// /command the user was asking for.
+func TestEscapedMatchesDispatchOnLeadingWhitespace(t *testing.T) {
+	for _, in := range []string{`\/foo`, `  \/foo`, "\t\\/foo"} {
+		unescaped, ok := Escaped(in)
+		if !ok {
+			t.Fatalf("Escaped(%q) = false, want true", in)
+		}
+		if unescaped != "/foo" {
+			t.Fatalf("Escaped(%q) unescaped to %q, want %q", in, unescaped, "/foo")
+		}
+	}
+	if _, ok := Escaped("no slash here"); ok {
+		t.Fatal("plain text should not be reported as escaped")
+	}
+}

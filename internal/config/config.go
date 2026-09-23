@@ -69,7 +69,12 @@ type TelegramConfig struct {
 	Admins        []int64 `json:"admins"`         // ids that may run /handshake (also allowed)
 	Allowlist     []int64 `json:"allowlist"`      // permitted sender user ids
 	AllowlistFile string  `json:"allowlist_file"` // optional: persist approved ids here
-	PollTimeout   int     `json:"poll_timeout"`   // long-poll seconds
+	// PollTimeoutRaw is a pointer for the same reason as
+	// RequireMentionInGuildRaw below: a plain int cannot distinguish "key
+	// omitted" from "operator explicitly chose 0". Zero meant "use the
+	// default", so an operator asking for short polling silently got 30s
+	// long-polling instead. Use PollTimeout() to read the resolved value.
+	PollTimeoutRaw *int `json:"poll_timeout"` // long-poll seconds
 
 	// DeniedLogPath, if set, captures every message attempt from a
 	// non-allowlisted sender (full text, not just id/name) to this JSONL
@@ -119,6 +124,15 @@ type DiscordConfig struct {
 	// the default as true. Use RequireMentionInGuild() to read the resolved
 	// value.
 	RequireMentionInGuildRaw *bool `json:"require_mention_in_guild"`
+}
+
+// PollTimeout resolves the effective long-poll timeout: the configured value
+// if the operator set one (including an explicit 0), else the default.
+func (t TelegramConfig) PollTimeout() int {
+	if t.PollTimeoutRaw == nil {
+		return DefaultPollTimeout
+	}
+	return *t.PollTimeoutRaw
 }
 
 // RequireMentionInGuild resolves the effective value: the configured value
@@ -280,7 +294,7 @@ func (c *Config) validate() error {
 	if _, ok := budget.DefaultTiers[c.Budget.Tier]; !ok {
 		return fmt.Errorf("budget.tier %q is unknown (want one of: free, pro, max5, max20)", c.Budget.Tier)
 	}
-	if c.Telegram.PollTimeout < 0 {
+	if c.Telegram.PollTimeoutRaw != nil && *c.Telegram.PollTimeoutRaw < 0 {
 		return fmt.Errorf("telegram.poll_timeout must be >= 0")
 	}
 	if c.Claude.Socket == "" {
@@ -312,9 +326,7 @@ func (c *Config) applyDefaults() {
 	if c.Telegram.TokenEnv == "" {
 		c.Telegram.TokenEnv = DefaultTokenEnv
 	}
-	if c.Telegram.PollTimeout == 0 {
-		c.Telegram.PollTimeout = DefaultPollTimeout
-	}
+	// PollTimeout resolves its own default; nothing to do here.
 	if c.Claude.Socket == "" {
 		c.Claude.Socket = defaultSocket()
 	}

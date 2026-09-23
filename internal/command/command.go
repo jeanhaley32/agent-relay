@@ -71,8 +71,13 @@ func IsCommand(text string) bool {
 // unescaped text (the leading `\` removed) and true when text is escaped; the
 // caller forwards the unescaped text to the backend instead of dispatching.
 func Escaped(text string) (unescaped string, ok bool) {
-	if strings.HasPrefix(text, `\/`) {
-		return text[1:], true // drop the escape → "/..." goes to the model
+	// Trimmed to match Dispatch, which trims before its own prefix check.
+	// Without this, "  \/foo" is not recognised as escaped here but is also
+	// not a command there, so the backslash reaches the model instead of the
+	// literal /foo the user asked for.
+	trimmed := strings.TrimSpace(text)
+	if strings.HasPrefix(trimmed, `\/`) {
+		return trimmed[1:], true // drop the escape → "/..." goes to the model
 	}
 	return text, false
 }

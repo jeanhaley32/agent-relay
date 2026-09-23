@@ -12,6 +12,8 @@
 package ipc
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"sync"
@@ -78,17 +80,34 @@ type Frame struct {
 // be called from a single goroutine (one reader).
 type Conn struct {
 	rwc io.ReadWriteCloser
-	dec *json.Decoder
+	sc  *bufio.Scanner
 
 	mu  sync.Mutex // guards enc
 	enc *json.Encoder
 }
 
+// newFrameScanner returns a line scanner bounded at MaxFrameBytes, which is a
+// per-frame cap. io.LimitReader would bound the whole connection instead, so a
+// long-lived socket would simply stop working once it had carried that much.
+func newFrameScanner(r io.Reader) *bufio.Scanner {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), MaxFrameBytes)
+	return sc
+}
+
+// MaxFrameBytes caps how much a single frame may allocate. Defense in depth:
+// the socket is chmod 0600 in a private runtime dir, so only the owner's
+// processes can connect — but an unbounded decoder means any one of them can
+// force the daemon to allocate without limit, and nothing else here would
+// notice. Generous enough for real payloads, which are chat-sized text plus
+// small metadata.
+const MaxFrameBytes = 8 << 20 // 8 MiB
+
 // NewConn wraps a stream (e.g. a unix socket) in the framed protocol.
 func NewConn(rwc io.ReadWriteCloser) *Conn {
 	return &Conn{
 		rwc: rwc,
-		dec: json.NewDecoder(rwc),
+		sc:  newFrameScanner(rwc),
 		enc: json.NewEncoder(rwc), // Encode appends '\n' => framing
 	}
 }
@@ -104,8 +123,20 @@ func (c *Conn) Send(f Frame) error {
 // (io.EOF). Call from a single goroutine.
 func (c *Conn) Recv() (Frame, error) {
 	var f Frame
-	err := c.dec.Decode(&f)
-	return f, err
+	for {
+		if !c.sc.Scan() {
+			if err := c.sc.Err(); err != nil {
+				return f, err
+			}
+			return f, io.EOF
+		}
+		line := c.sc.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue // tolerate blank lines between frames
+		}
+		err := json.Unmarshal(line, &f)
+		return f, err
+	}
 }
 
 // Close closes the underlying stream.

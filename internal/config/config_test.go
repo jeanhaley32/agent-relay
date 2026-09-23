@@ -63,8 +63,8 @@ func TestLoadAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if c.Telegram.PollTimeout != DefaultPollTimeout {
-		t.Fatalf("poll timeout default: got %d", c.Telegram.PollTimeout)
+	if c.Telegram.PollTimeout() != DefaultPollTimeout {
+		t.Fatalf("poll timeout default: got %d", c.Telegram.PollTimeout())
 	}
 	if c.Claude.Socket != defaultSocket() {
 		t.Fatalf("socket default: got %q, want %q", c.Claude.Socket, defaultSocket())
@@ -174,5 +174,58 @@ func TestStatePath(t *testing.T) {
 	c.StateDir = "state"
 	if got := c.StatePath("contacts.json"); got != "state/contacts.json" {
 		t.Fatalf("relative StateDir: got %q", got)
+	}
+}
+
+// poll_timeout: 0 used to be indistinguishable from "key omitted", so an
+// operator choosing short polling silently got 30s long-polling.
+func TestPollTimeoutDistinguishesExplicitZero(t *testing.T) {
+	var omitted TelegramConfig
+	if got := omitted.PollTimeout(); got != DefaultPollTimeout {
+		t.Fatalf("omitted: got %d, want the default %d", got, DefaultPollTimeout)
+	}
+
+	zero := 0
+	explicit := TelegramConfig{PollTimeoutRaw: &zero}
+	if got := explicit.PollTimeout(); got != 0 {
+		t.Fatalf("explicit 0: got %d, want 0 — the operator's choice was overridden", got)
+	}
+
+	five := 5
+	set := TelegramConfig{PollTimeoutRaw: &five}
+	if got := set.PollTimeout(); got != 5 {
+		t.Fatalf("explicit 5: got %d, want 5", got)
+	}
+}
+
+// And it must survive an actual JSON round trip, which is where the
+// omitted-vs-zero distinction is really made.
+func TestPollTimeoutFromJSON(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return p
+	}
+	base := `"admins":[1],"token_env":"T"`
+
+	omitted := write("a.json", `{"telegram":{`+base+`},"claude":{"socket":"/tmp/s"}}`)
+	c, err := Load(omitted)
+	if err != nil {
+		t.Fatalf("load omitted: %v", err)
+	}
+	if got := c.Telegram.PollTimeout(); got != DefaultPollTimeout {
+		t.Fatalf("omitted from JSON: got %d, want %d", got, DefaultPollTimeout)
+	}
+
+	explicit := write("b.json", `{"telegram":{`+base+`,"poll_timeout":0},"claude":{"socket":"/tmp/s"}}`)
+	c2, err := Load(explicit)
+	if err != nil {
+		t.Fatalf("load explicit: %v", err)
+	}
+	if got := c2.Telegram.PollTimeout(); got != 0 {
+		t.Fatalf("explicit 0 in JSON: got %d, want 0", got)
 	}
 }

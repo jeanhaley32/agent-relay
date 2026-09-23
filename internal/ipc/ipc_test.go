@@ -1,7 +1,9 @@
 package ipc
 
 import (
+	"io"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -35,3 +37,44 @@ func TestFrameRoundTrip(t *testing.T) {
 		t.Fatalf("reply mismatch: %+v", got2)
 	}
 }
+
+// Frames were decoded with a bare json.Decoder, so a peer could force
+// unbounded allocation. The socket is 0600 in a private runtime dir, so this
+// is defense in depth rather than an exposed hole — but nothing else bounded
+// it.
+func TestFrameSizeIsCapped(t *testing.T) {
+	// One frame larger than the cap must fail rather than allocate.
+	huge := `{"kind":"reply","text":"` + strings.Repeat("a", MaxFrameBytes+1024) + `"}` + "\n"
+	c := NewConn(nopCloser{strings.NewReader(huge)})
+	if _, err := c.Recv(); err == nil {
+		t.Fatal("an oversized frame was accepted")
+	}
+}
+
+// The cap must be per frame, not per connection: io.LimitReader would bound
+// the whole stream, so a long-lived socket would stop carrying frames once it
+// had passed the limit in total.
+func TestCapIsPerFrameNotPerConnection(t *testing.T) {
+	// Each frame is ~1 MiB; several of them exceed any per-connection budget
+	// of the same size but are individually fine.
+	one := `{"kind":"reply","text":"` + strings.Repeat("b", 1<<20) + `"}` + "\n"
+	var sb strings.Builder
+	for i := 0; i < 12; i++ {
+		sb.WriteString(one)
+	}
+	c := NewConn(nopCloser{strings.NewReader(sb.String())})
+	for i := 0; i < 12; i++ {
+		f, err := c.Recv()
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		if f.Kind != KindReply {
+			t.Fatalf("frame %d: kind %q", i, f.Kind)
+		}
+	}
+}
+
+type nopCloser struct{ io.Reader }
+
+func (nopCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopCloser) Close() error                { return nil }
