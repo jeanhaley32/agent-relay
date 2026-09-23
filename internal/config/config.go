@@ -157,10 +157,17 @@ func (d DiscordConfig) RequireMentionInGuild() bool {
 // (e.g. "@admin:example.org"); only their messages are relayed, and they are treated
 // as relay admins (so the group-room from_id!=chat_id lockdown doesn't fire).
 type MatrixConfig struct {
-	Enabled       bool     `json:"enabled"`
-	HomeserverURL string   `json:"homeserver_url"` // e.g. https://host.example.ts.net:8448
-	TokenEnv      string   `json:"token_env"`      // env var holding the bot access token
-	Admins        []string `json:"admins"`         // Matrix user ids whose messages are relayed
+	Enabled       bool   `json:"enabled"`
+	HomeserverURL string `json:"homeserver_url"` // e.g. https://host.example.ts.net:8448
+	TokenEnv      string `json:"token_env"`      // env var holding the bot access token
+	// AllowNonTailnetHomeserver disables the startup check that the
+	// homeserver is only reachable over the tailnet. The Matrix path is
+	// exempt from the session and approval gates on exactly that basis, so
+	// turning this on removes the last control. Deliberate escape hatch;
+	// relayd logs loudly when it is set.
+	AllowNonTailnetHomeserver bool `json:"allow_non_tailnet_homeserver"`
+
+	Admins []string `json:"admins"` // Matrix user ids whose messages are relayed
 	// MediaSpool is a directory where inbound media (images/audio/video/files)
 	// are downloaded so the backend can open them. Empty ⇒ media is surfaced as
 	// a text note but not downloaded. Relative paths resolve against relayd's

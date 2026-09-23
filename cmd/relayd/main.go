@@ -800,6 +800,14 @@ func mustStartMatrix(cfg *config.Config, logger *log.Logger) *matrix.Frontend {
 	if len(cfg.Matrix.Admins) == 0 {
 		logger.Fatalf("matrix: at least one admin user id is required (fail-closed)")
 	}
+	if err := config.CheckTailnetHomeserver(cfg.Matrix.HomeserverURL, cfg.Matrix.AllowNonTailnetHomeserver); err != nil {
+		logger.Fatalf("matrix: %v", err)
+	}
+	if cfg.Matrix.AllowNonTailnetHomeserver && !config.IsTailnetHost(cfg.Matrix.HomeserverURL) {
+		logger.Printf("WARNING: matrix.allow_non_tailnet_homeserver is set and %s is not a tailnet address. "+
+			"The Matrix path bypasses the session and approval gates on the assumption that reaching the "+
+			"homeserver requires being on the tailnet. That assumption no longer holds.", cfg.Matrix.HomeserverURL)
+	}
 	mediaSpool := cfg.Matrix.MediaSpool
 	if mediaSpool == "" {
 		mediaSpool = "matrix-media"
