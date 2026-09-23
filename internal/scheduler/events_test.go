@@ -524,3 +524,45 @@ func TestMetricsAccessors(t *testing.T) {
 		t.Fatalf("oldest age unexpected: %v", age)
 	}
 }
+
+// Pruning keys off AckedAt, so an acknowledged event persisted without one
+// never satisfied the retention check and stayed in the file forever, growing
+// it across every restart.
+func TestLoadBackfillsMissingAckedAt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.json")
+
+	fired := time.Now().Add(-48 * time.Hour)
+	body := `[{"id":"e1","status":"acknowledged","fired_at":"` + fired.Format(time.RFC3339Nano) + `"},
+	          {"id":"e2","status":"pending","fired_at":"` + fired.Format(time.RFC3339Nano) + `"}]`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	h := &trackerHarness{}
+	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt,
+		TrackerConfig{TickEvery: time.Hour}, nil)
+	if err != nil {
+		t.Fatalf("NewTracker: %v", err)
+	}
+	defer tr.Close()
+
+	tr.mu.Lock()
+	acked := tr.events["e1"]
+	pending := tr.events["e2"]
+	tr.mu.Unlock()
+
+	if acked == nil || pending == nil {
+		t.Fatal("both events should load")
+	}
+	if acked.AckedAt.IsZero() {
+		t.Fatal("acknowledged event kept a zero AckedAt: it would never be pruned")
+	}
+	if !acked.AckedAt.Equal(acked.FiredAt) {
+		t.Fatalf("AckedAt should be backfilled from FiredAt, got %v vs %v", acked.AckedAt, acked.FiredAt)
+	}
+	// A pending event has nothing to backfill; it ages via FiredAt.
+	if !pending.AckedAt.IsZero() {
+		t.Fatal("pending event should not get an AckedAt")
+	}
+}

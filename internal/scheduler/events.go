@@ -529,6 +529,18 @@ func (t *Tracker) load() error {
 		if ev.Status == "" {
 			ev.Status = StatusPending
 		}
+		// Pruning keys off AckedAt, so a non-pending event with a zero
+		// AckedAt — written by an older version, or otherwise persisted
+		// without one — would never satisfy the retention check and would sit
+		// in the file forever, growing it across every restart. Backfill so
+		// it ages out normally from here.
+		if ev.Status != StatusPending && ev.AckedAt.IsZero() {
+			if !ev.FiredAt.IsZero() {
+				ev.AckedAt = ev.FiredAt
+			} else {
+				ev.AckedAt = time.Now()
+			}
+		}
 		t.events[ev.ID] = ev
 	}
 	t.logger.Printf("loaded %d pending event(s) from %s", len(t.events), t.path)
