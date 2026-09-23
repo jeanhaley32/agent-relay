@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -58,7 +59,8 @@ type Frontend struct {
 	http        *http.Client
 	auth        Authorizer
 	deniedLog   deniedlog.Logger
-	pollTimeout int // long-poll seconds
+	pollTimeout int    // long-poll seconds
+	offsetPath  string // where the acknowledged update offset is persisted (empty ⇒ not persisted)
 	logger      *log.Logger
 
 	recv   chan relay.Message
@@ -133,6 +135,48 @@ func WithDeniedLogger(l deniedlog.Logger) Option {
 
 // WithPollTimeout sets the long-poll timeout in seconds (default 30).
 func WithPollTimeout(sec int) Option { return func(f *Frontend) { f.pollTimeout = sec } }
+
+// WithOffsetStore persists the acknowledged update offset to path.
+//
+// Telegram acknowledges updates implicitly, via the offset sent on the NEXT
+// getUpdates. Without this, a restart between handling a batch and the next
+// poll means the offset is lost, Telegram re-delivers that batch, and the
+// broker relays the same user messages to the model a second time — with new
+// msg_ids, so downstream dedupe does not catch it.
+func WithOffsetStore(path string) Option { return func(f *Frontend) { f.offsetPath = path } }
+
+// loadOffset reads the persisted offset. A missing or unreadable file is not
+// an error: the worst case is the pre-existing behaviour.
+func (f *Frontend) loadOffset() int64 {
+	if f.offsetPath == "" {
+		return 0
+	}
+	b, err := os.ReadFile(f.offsetPath)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// saveOffset persists the offset, atomically so a crash mid-write cannot leave
+// a truncated file that parses as a smaller offset and replays updates.
+func (f *Frontend) saveOffset(offset int64) {
+	if f.offsetPath == "" || offset <= 0 {
+		return
+	}
+	tmp := f.offsetPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(offset, 10)), 0o600); err != nil {
+		f.logger.Printf("telegram: persist offset: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, f.offsetPath); err != nil {
+		f.logger.Printf("telegram: persist offset: %v", err)
+	}
+}
 
 // WithLogger sets a logger (default: discard). A nil logger is treated as
 // discard so every other f.logger.Printf call site can assume non-nil.
@@ -227,7 +271,7 @@ type tgUpdatesResp struct {
 // pollLoop long-polls getUpdates and emits allowed messages until ctx is done.
 func (f *Frontend) pollLoop(ctx context.Context) {
 	defer close(f.recv)
-	var offset int64
+	offset := f.loadOffset()
 	for {
 		if ctx.Err() != nil {
 			return
@@ -247,6 +291,7 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 			continue
 		}
 		f.lastPollSuccess.Store(time.Now().Unix())
+		batchStart := offset
 		for _, u := range updates {
 			offset = u.UpdateID + 1 // ack: never re-fetch this update
 			m := u.Message
@@ -288,6 +333,9 @@ func (f *Frontend) pollLoop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			}
+		}
+		if offset != batchStart {
+			f.saveOffset(offset)
 		}
 	}
 }

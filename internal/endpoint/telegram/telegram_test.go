@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -482,5 +485,48 @@ func TestSafeErrRedactsToken(t *testing.T) {
 	defer empty.Close()
 	if got := empty.SafeErr(err); got != err.Error() {
 		t.Fatalf("empty-token SafeErr should passthrough, got %q", got)
+	}
+}
+
+// Telegram acknowledges updates implicitly, via the offset on the next
+// getUpdates. Without persistence, a restart between handling a batch and the
+// next poll loses the offset: Telegram re-delivers the batch and the broker
+// relays the same user messages to the model again, with new msg_ids so
+// downstream dedupe does not catch it.
+func TestOffsetSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "telegram_offset")
+
+	f := &Frontend{offsetPath: path, logger: log.New(io.Discard, "", 0)}
+	if got := f.loadOffset(); got != 0 {
+		t.Fatalf("with no file: got %d, want 0", got)
+	}
+
+	f.saveOffset(4242)
+
+	// A fresh Frontend, as after a restart.
+	f2 := &Frontend{offsetPath: path, logger: log.New(io.Discard, "", 0)}
+	if got := f2.loadOffset(); got != 4242 {
+		t.Fatalf("after restart: got %d, want 4242 — the batch would be re-delivered", got)
+	}
+}
+
+func TestOffsetStoreIsOptionalAndFailsSoft(t *testing.T) {
+	// No path configured: behaves as before, no panic, no file.
+	f := &Frontend{logger: log.New(io.Discard, "", 0)}
+	f.saveOffset(99)
+	if got := f.loadOffset(); got != 0 {
+		t.Fatalf("unconfigured store: got %d, want 0", got)
+	}
+
+	// Garbage on disk must not be trusted as an offset.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "telegram_offset")
+	if err := os.WriteFile(path, []byte("not a number"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f2 := &Frontend{offsetPath: path, logger: log.New(io.Discard, "", 0)}
+	if got := f2.loadOffset(); got != 0 {
+		t.Fatalf("garbage file: got %d, want 0", got)
 	}
 }

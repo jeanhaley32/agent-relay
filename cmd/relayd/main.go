@@ -250,6 +250,7 @@ func main() {
 	telegramOpts := []telegram.Option{
 		telegram.WithAuthorizer(acc),
 		telegram.WithPollTimeout(cfg.Telegram.PollTimeout()),
+		telegram.WithOffsetStore(cfg.StatePath("telegram_offset")),
 		telegram.WithLogger(logger),
 	}
 	// One denied-sender log, shared across every frontend (Telegram + Discord),

@@ -41,3 +41,6 @@ relay-events.jsonl
 
 # Matrix inbound media spool (downloaded files, not source)
 matrix-media/
+
+# relay-managed Telegram update offset (runtime state, not source)
+telegram_offset
