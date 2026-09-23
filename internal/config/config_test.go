@@ -155,3 +155,24 @@ func TestDiscordDefaultTokenEnv(t *testing.T) {
 		t.Fatalf("discord token_env default: got %q, want %q", c.Discord.TokenEnv, DefaultDiscordTokenEnv)
 	}
 }
+
+func TestStatePath(t *testing.T) {
+	// Empty StateDir must keep resolving to the working directory: these files
+	// used to hang off filepath.Dir(telegram.allowlist_file), which for the
+	// common "allowlist.json" value was ".". Existing deployments must not have
+	// their state silently move.
+	var c Config
+	if got := c.StatePath("adminbind.json"); got != "adminbind.json" {
+		t.Fatalf("empty StateDir: got %q, want %q", got, "adminbind.json")
+	}
+
+	c.StateDir = "/var/lib/relayd"
+	if got := c.StatePath("contacts.json"); got != "/var/lib/relayd/contacts.json" {
+		t.Fatalf("set StateDir: got %q", got)
+	}
+
+	c.StateDir = "state"
+	if got := c.StatePath("contacts.json"); got != "state/contacts.json" {
+		t.Fatalf("relative StateDir: got %q", got)
+	}
+}

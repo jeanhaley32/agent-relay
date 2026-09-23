@@ -16,6 +16,13 @@ import (
 
 // Config is the top-level daemon configuration.
 type Config struct {
+	// StateDir is where relayd keeps the state it manages itself — the
+	// admin-device bindings and the contacts directory. Neither belongs to
+	// any one frontend, so neither should be derived from a frontend's
+	// config. Empty means the working directory, which is what the paths
+	// resolved to when they hung off telegram.allowlist_file.
+	StateDir string `json:"state_dir"`
+
 	Telegram   TelegramConfig   `json:"telegram"`
 	Discord    DiscordConfig    `json:"discord"`
 	Matrix     MatrixConfig     `json:"matrix"`
@@ -24,6 +31,15 @@ type Config struct {
 	Budget     BudgetConfig     `json:"budget"`
 	Scheduler  SchedulerConfig  `json:"scheduler"`
 	Stylometry StylometryConfig `json:"stylometry"`
+}
+
+// StatePath returns the path for a relayd-managed state file, rooted at
+// StateDir.
+func (c Config) StatePath(name string) string {
+	if c.StateDir == "" {
+		return name
+	}
+	return filepath.Join(c.StateDir, name)
 }
 
 // StylometryConfig configures the optional Qdrant-backed anomaly detector

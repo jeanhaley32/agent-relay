@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -175,11 +174,7 @@ func main() {
 	// Opt-in and admin-only (see internal/adminbind doc comment) - a sender
 	// with no binding is unaffected, so this is fully backward compatible
 	// until an admin explicitly binds their own device.
-	adminBindPath := filepath.Join(filepath.Dir(cfg.Telegram.AllowlistFile), "adminbind.json")
-	if cfg.Telegram.AllowlistFile == "" {
-		adminBindPath = "adminbind.json"
-	}
-	adminDevices := adminbind.New(adminBindPath, logger)
+	adminDevices := adminbind.New(cfg.StatePath("adminbind.json"), logger)
 	tailnetStatus := tailnet.New(5 * time.Second)
 
 	// matrixAdmins is the set of Matrix user ids (e.g. "@admin:example.org") treated
@@ -240,12 +235,8 @@ func main() {
 	// built automatically from inbound traffic. Resolves names like
 	// "discord.alice" or "person:alice" to a live chat_id, so schedules and
 	// replies don't hardcode raw chat_ids that go stale when someone switches
-	// which app they're using (see ~/vessel-log/notes/relay-contacts-protocol.md).
-	contactsPath := filepath.Join(filepath.Dir(cfg.Telegram.AllowlistFile), "contacts.json")
-	if cfg.Telegram.AllowlistFile == "" {
-		contactsPath = "contacts.json"
-	}
-	dir := contacts.New(contactsPath, logger)
+	// which app they're using.
+	dir := contacts.New(cfg.StatePath("contacts.json"), logger)
 
 	// Claude backend: listen on the socket for the shim.
 	back, err := claudebk.New(cfg.Claude.Socket)
