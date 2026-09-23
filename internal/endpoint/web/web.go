@@ -10,7 +10,7 @@
 //
 // Identity is a deterministic tailnet gate, not a claim. The page is reachable
 // only over Tailscale (nginx binds the tailnet IP; ufw opens :80 only on
-// tailscale0), and on every request this endpoint runs `tailscale whois` on the
+// the tailnet interface), and on every request this endpoint runs `tailscale whois` on the
 // real client address (forwarded by nginx as X-Real-IP) and requires it to
 // resolve to the configured tailnet owner. Only then is the message treated as
 // that verified user. Because the transport is itself authenticated this way,

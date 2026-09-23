@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strconv"
@@ -133,15 +134,14 @@ func main() {
 	logger := log.New(os.Stderr, "[relayd] ", log.LstdFlags)
 
 	// Tailscale is a hard dependency (see README Requirements) - relayd binds
-	// its admin re-auth/approval flow to the tailscale0 interface. Check for
-	// the interface's existence up front, before any other setup work, and
-	// fail with a clear "Tailscale isn't installed/running" message rather
-	// than letting the user discover it two minutes into an unrelated retry
-	// loop further down. Not having an IP assigned YET is a separate, normal
-	// boot-race case (handled later by tailscaleIPWithRetry) - this check is
-	// only for "the interface doesn't exist at all".
-	if _, err := net.InterfaceByName("tailscale0"); err != nil {
-		logger.Fatalf("Tailscale is required but not found (no tailscale0 interface): %v\n"+
+	// its admin re-auth/approval flow to the tailnet address. Check that the
+	// CLI is present up front, before any other setup work, and fail with a
+	// clear "Tailscale isn't installed" message rather than letting the user
+	// discover it two minutes into an unrelated retry loop further down. Not
+	// having an IP assigned YET is a separate, normal boot-race case, handled
+	// later by tailscaleIPWithRetry.
+	if _, err := exec.LookPath("tailscale"); err != nil {
+		logger.Fatalf("Tailscale is required but the `tailscale` CLI was not found on PATH: %v\n"+
 			"Install Tailscale and run `tailscale up` before starting relayd - see README Requirements.", err)
 	}
 
@@ -427,7 +427,7 @@ func main() {
 	// of tailnet membership - stronger than trusting a Telegram chat_id
 	// alone, which is spoofable if that account is ever compromised.
 	//
-	// The bind address is resolved from the tailscale0 interface at startup
+	// The bind address is resolved from the tailscale CLI at startup
 	// rather than hardcoded, so this doesn't silently break (wrong IP baked
 	// into a public binary/repo) if the tailnet IP ever changes. Retried with
 	// the same backoff as the listener below - tailscaled may not have
@@ -858,29 +858,29 @@ func mustStartWeb(cfg *config.Config, logger *log.Logger) *web.Frontend {
 	return front
 }
 
-// tailscaleIP resolves this host's current Tailscale IPv4 address from the
-// tailscale0 interface, so it never needs to be hardcoded (which previously
-// baked one specific IP into a public repo/binary and would silently break
-// if the tailnet IP ever changed).
+// tailscaleIP resolves this host's current Tailscale IPv4 address, so it never
+// needs to be hardcoded (which previously baked one specific IP into a public
+// repo/binary and would silently break if the tailnet IP ever changed).
+//
+// It asks the CLI rather than reading an interface by name. The interface is
+// "tailscale0" on Linux but a "utunN" on macOS, with the number varying per
+// boot, so a name lookup is a Linux-only assumption.
 func tailscaleIP() (string, error) {
-	iface, err := net.InterfaceByName("tailscale0")
+	out, err := exec.Command("tailscale", "ip", "-4").Output()
 	if err != nil {
-		return "", fmt.Errorf("tailscale0 interface: %w", err)
+		return "", fmt.Errorf("tailscale ip -4: %w", err)
 	}
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return "", fmt.Errorf("tailscale0 addresses: %w", err)
-	}
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok {
+	// Multiple addresses are possible; the first IPv4 is this node's.
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		if ip4 := ipNet.IP.To4(); ip4 != nil {
-			return ip4.String(), nil
+		if ip := net.ParseIP(line); ip != nil && ip.To4() != nil {
+			return ip.To4().String(), nil
 		}
 	}
-	return "", fmt.Errorf("no IPv4 address on tailscale0")
+	return "", fmt.Errorf("tailscale ip -4 returned no IPv4 address")
 }
 
 // tailscaleIPWithRetry retries tailscaleIP with a fixed 1s backoff until
@@ -899,7 +899,7 @@ func tailscaleIPWithRetry(timeout time.Duration, logger *log.Logger) (string, er
 		if time.Now().After(giveUp) {
 			return "", fmt.Errorf("giving up after %s: %w", timeout, lastErr)
 		}
-		logger.Printf("tailscale0 not ready yet, retrying: %v", err)
+		logger.Printf("tailscale address not ready yet, retrying: %v", err)
 		time.Sleep(1 * time.Second)
 	}
 }

@@ -39,9 +39,15 @@ general-purpose, provider-agnostic relay.)
 | **Telegram** | A bot token from [@BotFather](https://t.me/BotFather) and your numeric user id (get it from [@userinfobot](https://t.me/userinfobot)). Optional — you can run Discord-only. |
 | **Discord** | A bot application + token from the [Developer Portal](https://discord.com/developers/applications), and your numeric Discord user id (Settings → Advanced → enable Developer Mode, then right-click yourself → Copy User ID). Optional — you can run Telegram-only. |
 | **tmux** | Hosts the interactive Claude session that the launcher starts. |
-| **Tailscale** | **Required**, not optional. relayd binds its admin re-auth/approval flow to the `tailscale0` interface's IP — it will not start (fails after a retry window, then exits) if Tailscale isn't installed, running, and assigned an address before relayd launches. Install and connect Tailscale first: `tailscale up`, then confirm `tailscale ip -4` prints an address. |
+| **Tailscale** | **Required**, not optional. relayd binds its admin re-auth/approval flow to this host's tailnet IP, resolved with `tailscale ip -4` — it will not start (fails after a retry window, then exits) if Tailscale isn't installed, running, and assigned an address before relayd launches. Install and connect Tailscale first: `tailscale up`, then confirm `tailscale ip -4` prints an address. |
+
+| **OS** | Developed and run on Linux. It should work anywhere Go, tmux and Tailscale do, but nothing else is tested — `ops/` in particular is one box's systemd runbook. |
 
 At least one of Telegram or Discord must be configured; both can run at once.
+
+> **Known gap:** the table above says Telegram is optional, and it is not yet — config
+> validation currently requires Telegram admins even when another frontend is enabled.
+> Tracked as issue #51.
 
 ---
 
