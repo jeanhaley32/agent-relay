@@ -151,15 +151,49 @@ func (f *Frontend) Connect(ctx context.Context) (string, error) {
 // be started in its own goroutine after Connect succeeds. selfID is the bot's
 // own user id (from Connect); the loop skips the bot's own messages so replies
 // don't echo back as new inbound.
+// primeSince retries the priming sync until it succeeds, returning false if
+// the endpoint is shut down first. It never gives up and continues with an
+// empty token: an unprimed sync replays history as live input.
+func (f *Frontend) primeSince(ctx context.Context) (string, bool) {
+	backoff := time.Second
+	for {
+		tok, err := f.initialSync(ctx)
+		if err == nil {
+			return tok, true
+		}
+		if ctx.Err() != nil {
+			return "", false
+		}
+		f.syncFailures.Add(1)
+		f.logger.Printf("matrix: priming sync failed, retry in %s (not syncing until it succeeds): %v", backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-f.closed:
+			return "", false
+		case <-ctx.Done():
+			return "", false
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 func (f *Frontend) Run(ctx context.Context, selfID string) {
 	defer close(f.out)
-	var since string
-	// Prime the sync token so we don't replay the room's entire history on
-	// startup — we only want messages that arrive from now on.
-	if tok, err := f.initialSync(ctx); err == nil {
-		since = tok
-	} else {
-		f.logger.Printf("matrix: initial sync failed (will retry in loop): %v", err)
+	// Prime the sync token so we don't replay the room's history on startup —
+	// we only want messages that arrive from now on.
+	//
+	// This must succeed before the sync loop runs. syncOnce omits `since` when
+	// it is empty, which the homeserver reads as a fresh initial sync and
+	// answers with each room's recent timeline. Those events pass the message
+	// and admin filters, so they are delivered as new commands and re-executed.
+	// Matrix is the gate-bypass path, so they would run unchallenged. A
+	// homeserver that is still booting after a host restart is enough to
+	// trigger it, which is exactly when it is least likely to be noticed.
+	since, ok := f.primeSince(ctx)
+	if !ok {
+		return
 	}
 	backoff := time.Second
 	for {
