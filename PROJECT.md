@@ -20,9 +20,11 @@ backends** (Claude Code, Ollama, OpenAI) through **one symmetric `Endpoint` inte
 either side is swappable by config. It runs on an always-on, Tailscale-only ThinkPad
 (see the machine's `~/CLAUDE.md`).
 
-**MVP scope (current):** text a Telegram bot → driven by Claude Code (on a subscription, not
-metered API), gated by the budget/command control plane. Ollama offload is **deferred** —
-designed for, not built. The MVP is `cmd/relayd` wiring Telegram ⇄ broker ⇄ Claude backend.
+**Status (2026-09):** the MVP shipped and the project outgrew it. `relayd` runs continuously
+on the ThinkPad with **five live frontends** — Telegram, Discord, Matrix, a browser chat pane,
+and a loopback webhook mux — all brokered to a single Claude Code backend. What began as
+"text a Telegram bot" is now the machine's primary control surface. Ollama offload remains
+**deferred**: designed for, still not built.
 
 Repo: `github.com/jeanhaley32/agent-relay` (public — never commit real
 chat ids, handles, or tokens). Local: `~/agent-relay`. Go 1.24.
@@ -37,14 +39,25 @@ chat ids, handles, or tokens). Local: `~/agent-relay`. Go 1.24.
 | MCP: reusable stdio JSON-RPC server | ✅ done | `internal/mcp` |
 | **PoC-1: Go↔Claude Code channel dialect** | ✅ **validated live** | `internal/channel` + `cmd/channel-spike`; see §5 |
 | PoC-2: control-plane demo (CLI+echo) | ✅ done | `cmd/broker-demo` |
-| Telegram frontend endpoint | 🟡 built + unit-tested | `internal/endpoint/telegram`; live bot round-trip pending a token (§8 T1) |
-| Claude Code backend endpoint (daemon+shim) | 🟡 built + tested | `internal/ipc`, `internal/endpoint/claude`, `cmd/relay-shim`; live wiring pending (§8 C1) |
+| Telegram frontend endpoint | ✅ live | `internal/endpoint/telegram`; in daily use since 2026-07 |
+| Claude Code backend endpoint (daemon+shim) | ✅ live | `internal/ipc`, `internal/endpoint/claude`, `cmd/relay-shim` |
 | Ollama backend endpoint (+breaker fallback) | ⬜ todo | §8 item O1 |
-| **Config loader + `relayd` daemon (MVP)** | 🟡 built + tested | `internal/config`, `cmd/relayd`; Telegram⇄broker⇄Claude wired. Live run pending token (§8 D1) |
+| **Config loader + `relayd` daemon (MVP)** | ✅ live | `internal/config`, `cmd/relayd`; runs as a user systemd unit |
+| Discord frontend | ✅ live | `internal/endpoint/discord`; the default target for automated signals |
+| Matrix frontend | ✅ live | `internal/endpoint/matrix`; tailnet-only homeserver, gate-bypass path |
+| Web chat frontend | ✅ live | `internal/endpoint/web`; SSE+POST, authenticated by Tailscale whois per request |
+| Loopback webhook mux | ✅ live | `/webhook/inject`, `/webhook/annotate`, `/annotations/stream` in `cmd/relayd` — how on-box tools reach the model and the editor |
+| Tailnet-bound admin gate | ✅ live | `internal/tailnet` + `internal/adminbind`; admin commands require the bound device visibly online |
+| Contacts directory | ✅ live | `internal/contacts`; resolvable names instead of hardcoded chat ids |
+| Anomaly gate + session revoke | ✅ live | `internal/session`; fail-open by design |
+| Event log | ✅ live | `internal/eventlog` → `relay-events.jsonl` (gitignored; contains real ids) |
+| Scheduler | ✅ live | `internal/scheduler`; cron + one-shot, persisted |
+| Approval flow | ✅ live | `internal/approval`; loopback request API + tailnet-only approve page |
+| Denied-sender log | ✅ live | `internal/deniedlog` |
 | Ollama backend (+breaker fallback) | ⏸ deferred | out of MVP scope by decision |
-| CI (build+test on push) | ⬜ todo | §8 item X1 |
+| CI (build+test on push) | ✅ done | GitHub Actions; gofmt failures have blocked merges, so run `gofmt -l ./cmd ./internal` before pushing |
 
-Branch state: PoC-1 on `poc-1-channel` → **PR #1** (open). `main` has the core + control plane.
+Branch state: everything above is on `main`. `main` is what runs.
 
 ## 3. Architecture in brief (full detail in DESIGN.md)
 
@@ -84,6 +97,19 @@ Two backend control-flow shapes hidden behind the one interface:
 | `internal/config` | JSON config loader (dependency-free); token via env var name, not stored. | `Load`, `Config`, `Token` | platform |
 | `internal/access` | Allowlist + admins + pending-request queue; file-persisted. Backs `/handshake`. | `New`, `Allowed`, `IsAdmin`, `Record`, `Pending`, `Approve/Deny` | ✅ any allowlist/approval |
 | `cmd/relayd` | **MVP daemon**: wires Telegram ⇄ broker (budget+commands) ⇄ Claude from config. | `main`, `--config` | — |
+| `internal/endpoint/discord` | Discord frontend `Endpoint`. Note `channel_id` ≠ relay `chat_id`; file sends need the raw bot API. | `New(token, opts…)` | platform |
+| `internal/endpoint/matrix` | Matrix frontend `Endpoint` against a tailnet-only homeserver; downloads inbound media. | `New(...)` | platform |
+| `internal/endpoint/web` | Browser chat frontend: SSE stream + POST send, authorized by Tailscale whois on the client IP every request. | `New(...)` | platform |
+| `internal/tailnet` | Reads `tailscale status --json`; cached peer online / direct-vs-relayed state. Fails closed. | `New(ttl)` | ✅ any tailnet check |
+| `internal/adminbind` | Binds a sender id to a Tailscale device; admin-only, opt-in, JSON-persisted. | `New(path, logger)` | ✅ any device binding |
+| `internal/contacts` | Directory of `{platform, chat_id}` identities plus person groups, so schedules use names not raw ids. | `Observe`, `Resolve`, `Link`, `Unlink` | ✅ any identity map |
+| `internal/session` | Session state + revoke, and the `AnomalyDetector` hook the gate consults. | `Revoke`, `AnomalyDetector` | core |
+| `internal/eventlog` | Append-only JSONL audit of every message crossing the broker. | `New(path)` | ✅ any audit trail |
+| `internal/scheduler` | Persisted cron and one-shot reminders that inject back into the session. | `New`, `Schedule`, `Cancel` | ✅ any scheduler |
+| `internal/approval` | Loopback `/request`+`/status` API and a tailnet-only `/approve` page for high-risk actions. | `NewManager(baseURL)` | ✅ any human-in-loop gate |
+| `internal/deniedlog` | Records every message from a non-allowlisted sender, content included. | `LogDenied` | platform |
+| `internal/inbound` | Normalizes platform payloads into `relay.Message` envelopes. | `Envelope(...)` | core |
+| `internal/security` | Operator security profile applied by `cmd/apply-security`. | — | — |
 
 ## 5. Validated results
 
@@ -146,7 +172,7 @@ output.
 
 Ordered by the critical path. Each item names files to add and a "done when" bar.
 
-- **T1 — Telegram frontend endpoint** 🟡 *built + unit-tested; live round-trip pending token*
+- ~~**T1 — Telegram frontend endpoint**~~ ✅ *done 2026-07; live since.*
   `internal/endpoint/telegram` — long-polls `getUpdates`, normalizes to `relay.Message`
   (chat_id/from_id in Meta), sends via `sendMessage`, gates on the **sender allowlist**
   (`from.id`, fail-closed on empty). Injectable HTTP client + base URL; unit-tested against
@@ -155,7 +181,7 @@ Ordered by the critical path. Each item names files to add and a "done when" bar
   real DM round-trips with a non-allowlisted sender dropped. Bootstrap the allowlist via a
   pairing flow or config.
 
-- **C1 — Claude Code backend endpoint** (daemon + shim) 🟡 *built + tested; live wiring pending*
+- ~~**C1 — Claude Code backend endpoint** (daemon + shim)~~ ✅ *done 2026-07; live since.*
   `internal/ipc` (inject/reply frames), `internal/endpoint/claude` (daemon-side `Endpoint`:
   unix-socket listener, Send→inject, reply→Recv), `cmd/relay-shim` (stdio bridge Claude
   spawns, built on `internal/channel`). Socket-level integration test proves the daemon↔shim
@@ -171,14 +197,14 @@ Ordered by the critical path. Each item names files to add and a "done when" bar
   fallback**: when the Claude budget trips, route to Ollama instead of rejecting. *Done when:*
   `/backend ollama` (or an open breaker) routes a turn to a local model and replies.
 
-- **D1 — Config + `relayd` daemon (MVP)** 🟡 *built + tested; live run pending token*
+- ~~**D1 — Config + `relayd` daemon (MVP)**~~ ✅ *done 2026-07; runs as a user systemd unit.*
   `internal/config` (JSON, dependency-free) + `cmd/relayd` wiring Telegram ⇄ broker
   (budget+commands) ⇄ Claude backend, with graceful SIGINT/SIGTERM shutdown. Config test +
   `config.example.json` + `.mcp.json` registering `relay-shim`. **Remaining (the MVP finish
   line):** `export TELEGRAM_BOT_TOKEN`, run `relayd`, launch `claude … server:relay`, and
   confirm a Telegram DM round-trips through Claude. Decide reply-tool pre-approval.
 
-- **X1 — CI**: GitHub Actions running `go vet` + `go build` + `go test` on push/PR.
+- ~~**X1 — CI**~~ ✅ *done.* GitHub Actions on push/PR. gofmt failures have blocked merges — run `gofmt -l ./cmd ./internal` first.
 
 - **Nice-to-haves:** tests for `command`, `relay`, `mcp`; structured logging; `/backend`,
   `/tier`, `/help` commands surfaced through a real frontend; permission-relay (approve tool
@@ -207,6 +233,21 @@ Live test details and the manual 3-terminal flow are in `scripts/live-test.sh` a
 description.
 
 ## 11. Work log (newest first)
+
+- **2026-09-22** — Scrubbed real identifiers from the public repo and rewrote history to
+  remove them (195 commits, force-pushed). The worst was the maintainer's real Telegram
+  chat_id pinned as `adminID` in `cmd/relayd/reauth_test.go`, which also advertised which
+  account holds admin. A previous sanitize pass (2026-08-05, #44) had missed that file
+  because it predated the pass by ten days — the fix looked complete and was not. Also
+  corrected PROJECT.md, which described this public repo as private. **The old blobs remain
+  reachable through `refs/pull/*` refs GitHub will not let anyone rewrite; purging them needs
+  a GitHub Support request.**
+- **2026-09-22** — Loopback tools can now reach the model and the editor: `/webhook/inject`
+  (text → model as a user message, single admin target, not a fan-out), plus
+  `/webhook/annotate` and `/annotations/stream` (SSE) for the VS Code editor channel. The
+  annotation hub publishes non-blocking, so a wedged editor drops its annotations rather than
+  stalling a turn, and the response reports the subscriber count so callers can distinguish
+  "delivered" from "sent into the void".
 
 - **2026-07-03** — **MVP validated LIVE** end-to-end (Telegram DM → Claude → reply). Added
   **permission relay**: Claude's tool-approval prompts are forwarded down the pipeline to
