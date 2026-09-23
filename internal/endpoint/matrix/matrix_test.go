@@ -2,14 +2,18 @@ package matrix
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
 
 // TestRunDoesNotSyncUntilPrimed is the regression for the replay bug: an
@@ -82,5 +86,130 @@ func TestRunDoesNotSyncUntilPrimed(t *testing.T) {
 	case <-delivered:
 		t.Fatal("a historical message was delivered as a live command")
 	default:
+	}
+}
+
+// fakeHomeserver serves the handful of Client-Server endpoints this frontend
+// uses, so the tests exercise real request/response plumbing rather than
+// stubbing the frontend's own methods.
+type fakeHomeserver struct {
+	mu        sync.Mutex
+	sent      []sentMessage
+	syncBody  string
+	whoamiID  string
+	authSeen  []string
+	syncCalls int
+}
+
+type sentMessage struct{ room, body, txnID string }
+
+func (h *fakeHomeserver) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		h.authSeen = append(h.authSeen, r.Header.Get("Authorization"))
+		h.mu.Unlock()
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/account/whoami"):
+			_, _ = io.WriteString(w, `{"user_id":"`+h.whoamiID+`"}`)
+
+		case strings.Contains(r.URL.Path, "/send/m.room.message/"):
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			room, txn := parts[len(parts)-4], parts[len(parts)-1]
+			var body struct {
+				MsgType string `json:"msgtype"`
+				Body    string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			h.mu.Lock()
+			h.sent = append(h.sent, sentMessage{room: room, body: body.Body, txnID: txn})
+			h.mu.Unlock()
+			_, _ = io.WriteString(w, `{"event_id":"$evt"}`)
+
+		case strings.Contains(r.URL.Path, "/sync"):
+			h.mu.Lock()
+			h.syncCalls++
+			body := h.syncBody
+			h.mu.Unlock()
+			if body == "" {
+				body = `{"next_batch":"s1"}`
+			}
+			_, _ = io.WriteString(w, body)
+
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
+func (h *fakeHomeserver) sentMessages() []sentMessage {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]sentMessage(nil), h.sent...)
+}
+
+func TestConnectReturnsOwnUserIDAndAuthenticates(t *testing.T) {
+	h := &fakeHomeserver{whoamiID: "@relaybot:example.org"}
+	srv := httptest.NewServer(h.handler())
+	defer srv.Close()
+
+	f := New(srv.URL, "secret-token", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+	id, err := f.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if id != "@relaybot:example.org" {
+		t.Fatalf("Connect returned %q", id)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.authSeen) == 0 || h.authSeen[0] != "Bearer secret-token" {
+		t.Fatalf("token not sent as a bearer credential: %v", h.authSeen)
+	}
+}
+
+// Send has to resolve a room from the conversation id, and the DM-style
+// conversation id is not itself a room. These are the four routes it accepts.
+func TestSendResolvesRoomFromEveryAcceptedSource(t *testing.T) {
+	h := &fakeHomeserver{whoamiID: "@relaybot:example.org"}
+	srv := httptest.NewServer(h.handler())
+	defer srv.Close()
+	f := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	// 1. room id carried in Meta.
+	err := f.Send(context.Background(), relay.Message{
+		ConversationID: "@admin:example.org",
+		Text:           "via meta room_id",
+		Meta:           map[string]string{"room_id": "!a:example.org"},
+	})
+	if err != nil {
+		t.Fatalf("send via Meta room_id: %v", err)
+	}
+
+	// 2. a '!'-prefixed conversation id is itself the room.
+	if err := f.Send(context.Background(), relay.Message{
+		ConversationID: "!b:example.org", Text: "via conv id",
+	}); err != nil {
+		t.Fatalf("send via room-shaped ConversationID: %v", err)
+	}
+
+	// 3. unresolvable: no mapping, no room-shaped hint anywhere.
+	err = f.Send(context.Background(), relay.Message{
+		ConversationID: "@stranger:example.org", Text: "nowhere to put this",
+	})
+	if err == nil {
+		t.Fatal("send with no resolvable room should fail rather than guess")
+	}
+
+	got := h.sentMessages()
+	if len(got) != 2 {
+		t.Fatalf("sent %d message(s), want 2: %+v", len(got), got)
+	}
+	if got[0].room != "!a:example.org" || got[1].room != "!b:example.org" {
+		t.Fatalf("wrong rooms: %+v", got)
+	}
+	// Transaction ids must be unique, or Matrix dedupes the second send away.
+	if got[0].txnID == got[1].txnID {
+		t.Fatalf("duplicate transaction id %q — the homeserver would drop one", got[0].txnID)
 	}
 }
