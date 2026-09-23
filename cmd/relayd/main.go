@@ -149,11 +149,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("config: %v", err)
 	}
-	token, err := cfg.Token()
-	if err != nil {
-		logger.Fatalf("%v", err)
-	}
-	if len(cfg.Telegram.Admins) == 0 && len(cfg.Telegram.Allowlist) == 0 {
+	if cfg.Telegram.Enabled() && len(cfg.Telegram.Admins) == 0 && len(cfg.Telegram.Allowlist) == 0 {
 		logger.Printf("WARNING: no admins or allowlist — all inbound messages will be dropped (fail-closed)")
 	}
 
@@ -251,6 +247,14 @@ func main() {
 	// front means "not configured", and every downstream use is guarded.
 	var front *telegram.Frontend
 	if cfg.Telegram.Enabled() {
+		// Resolved here rather than at startup: a Discord-, Matrix- or web-only
+		// deployment has no Telegram token, and demanding one before knowing
+		// whether Telegram is even wanted made "telegram: disabled" impossible
+		// to actually reach.
+		token, err := cfg.Token()
+		if err != nil {
+			logger.Fatalf("%v", err)
+		}
 		telegramOpts := []telegram.Option{
 			telegram.WithAuthorizer(acc),
 			telegram.WithPollTimeout(cfg.Telegram.PollTimeout()),
