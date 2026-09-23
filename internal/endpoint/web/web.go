@@ -118,18 +118,34 @@ func (f *Frontend) Close() error {
 
 // --- identity gate ---
 
+// clientIP resolves the address this endpoint will hand to `tailscale whois`,
+// which decides whether the caller is the tailnet owner and therefore a relay
+// admin. Anything that can control this value can claim to be the owner.
+//
+// Forwarded headers are therefore honored only when the request arrived from
+// loopback, which is the nginx hop this endpoint is designed to sit behind.
+// A request from anywhere else gets its real RemoteAddr regardless of what it
+// claims, so setting X-Real-IP to the owner's tailnet address buys nothing.
 func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if !isLoopback(host) {
+		return host
+	}
 	if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
 		return ip
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		return strings.TrimSpace(strings.Split(xff, ",")[0])
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
 	return host
+}
+
+func isLoopback(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // tailscaleWhois resolves a tailnet IP to its owning account's LoginName by

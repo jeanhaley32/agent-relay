@@ -92,3 +92,59 @@ func TestExecErrorFallsBackToLastKnownGood(t *testing.T) {
 		t.Fatalf("expected stale-but-known result on exec failure, got %+v ok=%v", p, ok)
 	}
 }
+
+// A dead tailscaled must not leave the admin presence gate open. The gate
+// reads Online from this snapshot, so serving a cached Online:true forever
+// would mean taking the bound device off the tailnet — the documented
+// killswitch — no longer revokes anything.
+func TestStaleSnapshotIsDroppedAfterStalenessBound(t *testing.T) {
+	now := time.Now()
+	calls := 0
+	c := New(5 * time.Second)
+	c.now = func() time.Time { return now }
+	c.run = func() ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte(`{"Peer":{"k1":{"HostName":"laptop","Online":true}}}`), nil
+		}
+		return nil, errors.New("tailscaled is not running")
+	}
+
+	if p, ok := c.Peer("laptop"); !ok || !p.Online {
+		t.Fatalf("first fetch: got %+v ok=%v, want online", p, ok)
+	}
+
+	// Inside the bound: the cache still stands in, so a brief CLI blip does
+	// not flap the gate.
+	now = now.Add(10 * time.Second)
+	if p, ok := c.Peer("laptop"); !ok || !p.Online {
+		t.Fatalf("within staleness bound: got %+v ok=%v, want the cached entry", p, ok)
+	}
+
+	// Past it: the cache is discarded and the peer reads as offline.
+	now = now.Add(10 * time.Second)
+	if p, ok := c.Peer("laptop"); ok || p.Online {
+		t.Fatalf("past staleness bound: got %+v ok=%v, want offline", p, ok)
+	}
+}
+
+func TestUnparsableOutputAlsoExpires(t *testing.T) {
+	now := time.Now()
+	calls := 0
+	c := New(time.Second)
+	c.now = func() time.Time { return now }
+	c.run = func() ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte(`{"Peer":{"k1":{"HostName":"laptop","Online":true}}}`), nil
+		}
+		return []byte("not json"), nil
+	}
+	if _, ok := c.Peer("laptop"); !ok {
+		t.Fatal("first fetch should populate the cache")
+	}
+	now = now.Add(10 * time.Second)
+	if p, ok := c.Peer("laptop"); ok || p.Online {
+		t.Fatalf("garbage output past the bound: got %+v ok=%v, want offline", p, ok)
+	}
+}

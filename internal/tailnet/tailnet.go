@@ -11,6 +11,7 @@
 package tailnet
 
 import (
+	"context"
 	"encoding/json"
 	"os/exec"
 	"sync"
@@ -50,7 +51,17 @@ type Checker struct {
 	fetched time.Time
 	// run is overridden in tests; nil ⇒ actually exec `tailscale status --json`.
 	run func() ([]byte, error)
+	// now is overridden in tests.
+	now func() time.Time
 }
+
+// staleFactor bounds how long a cached snapshot may stand in for a live one
+// when the CLI is failing. Past ttl*staleFactor the cache is discarded and
+// every lookup reports offline, because the admin presence gate treats
+// "online" as authorization: serving a stale Online:true forever turns a dead
+// tailscaled into an open gate, and the documented killswitch (take the
+// device off the tailnet) stops working.
+const staleFactor = 3
 
 // New builds a Checker with the given cache TTL. ttl <= 0 defaults to 5s.
 func New(ttl time.Duration) *Checker {
@@ -74,25 +85,16 @@ func (c *Checker) Peer(hostname string) (Peer, bool) {
 func (c *Checker) snapshot() map[string]Peer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.cached != nil && time.Since(c.fetched) < c.ttl {
+	if c.cached != nil && c.clock().Sub(c.fetched) < c.ttl {
 		return c.cached
 	}
 	out, err := c.exec()
 	if err != nil {
-		// Fail closed: on a read error, return the last-known snapshot if we
-		// have one (better than nothing), else an empty map (every lookup
-		// then reports ok=false, which callers treat as offline).
-		if c.cached != nil {
-			return c.cached
-		}
-		return map[string]Peer{}
+		return c.stale()
 	}
 	var sj statusJSON
 	if err := json.Unmarshal(out, &sj); err != nil {
-		if c.cached != nil {
-			return c.cached
-		}
-		return map[string]Peer{}
+		return c.stale()
 	}
 	m := make(map[string]Peer, len(sj.Peer))
 	for _, p := range sj.Peer {
@@ -105,7 +107,7 @@ func (c *Checker) snapshot() map[string]Peer {
 		}
 	}
 	c.cached = m
-	c.fetched = time.Now()
+	c.fetched = c.clock()
 	return m
 }
 
@@ -113,5 +115,26 @@ func (c *Checker) exec() ([]byte, error) {
 	if c.run != nil {
 		return c.run()
 	}
-	return exec.Command("tailscale", "status", "--json").Output()
+	// Bounded: this runs under c.mu, so a hung CLI would otherwise block every
+	// gated command in the broker.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "tailscale", "status", "--json").Output()
+}
+
+func (c *Checker) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// stale returns the cached snapshot if it is still within the staleness bound,
+// and otherwise drops it. Callers hold c.mu.
+func (c *Checker) stale() map[string]Peer {
+	if c.cached != nil && c.clock().Sub(c.fetched) < c.ttl*staleFactor {
+		return c.cached
+	}
+	c.cached = nil
+	return map[string]Peer{}
 }
