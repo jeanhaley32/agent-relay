@@ -40,7 +40,7 @@ import (
 type Frontend struct {
 	convID   string // the single 1:1 conversation id (== chat_id == from_id)
 	fromName string
-	owner    string // required tailnet login (whois LoginName), e.g. jeanhaley32@gmail.com
+	owner    string // required tailnet login (whois LoginName), e.g. you@example.com
 	logger   *log.Logger
 
 	out chan relay.Message

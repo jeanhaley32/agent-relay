@@ -35,7 +35,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 TOKEN_USAGE_WEBHOOK = "http://127.0.0.1:9210/webhook/token-usage"
-CONFIG_PATH = os.environ.get("RELAY_CONFIG", "/home/jeanh/agent-relay/config.json")
+CONFIG_PATH = os.environ.get("RELAY_CONFIG",
+                            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json"))
 CHANNEL_RE = re.compile(r'<channel source="relay"[^>]*\bchat_id="(\d+)"')
 DEFAULT_WINDOW_HOURS = 3
 

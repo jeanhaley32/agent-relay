@@ -14,7 +14,7 @@
 #     modal, since there's no human at boot to press Enter.
 set -eu
 
-cd /home/jeanh/agent-relay
+cd "$(dirname "$(dirname "$(readlink -f "$0")")")"
 session_id=$(cat .relay_session_id)
 
 # Per-session runtime ceilings, both raised from their small defaults. These are

@@ -57,7 +57,7 @@ const httpTimeout = syncTimeout + 15*time.Second
 // /sync stream for messages from authorized admins, and delivers replies back
 // into the originating room.
 type Frontend struct {
-	homeserver string // base URL, e.g. https://rodin.tailf50bd.ts.net:8448
+	homeserver string // base URL, e.g. https://host.example.ts.net:8448
 	token      string // bot access token
 	admins     map[string]bool
 	mediaSpool string // dir where inbound media files are saved (empty ⇒ media ignored)

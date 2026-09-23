@@ -128,7 +128,7 @@ func (d DiscordConfig) RequireMentionInGuild() bool {
 // as relay admins (so the group-room from_id!=chat_id lockdown doesn't fire).
 type MatrixConfig struct {
 	Enabled       bool     `json:"enabled"`
-	HomeserverURL string   `json:"homeserver_url"` // e.g. https://rodin.tailf50bd.ts.net:8448
+	HomeserverURL string   `json:"homeserver_url"` // e.g. https://host.example.ts.net:8448
 	TokenEnv      string   `json:"token_env"`      // env var holding the bot access token
 	Admins        []string `json:"admins"`         // Matrix user ids whose messages are relayed
 	// MediaSpool is a directory where inbound media (images/audio/video/files)
@@ -152,7 +152,7 @@ type WebConfig struct {
 	ListenAddr   string `json:"listen_addr"`   // localhost bind, e.g. 127.0.0.1:8792 (nginx proxies it)
 	ConvID       string `json:"conv_id"`       // the channel's chat_id == from_id, e.g. "web-jean"
 	FromName     string `json:"from_name"`     // display name for the sender, e.g. "Jean"
-	TailnetOwner string `json:"tailnet_owner"` // required whois LoginName, e.g. jeanhaley32@gmail.com
+	TailnetOwner string `json:"tailnet_owner"` // required whois LoginName, e.g. you@example.com
 }
 
 // AdminIDs parses Discord.Admins as snowflake ids, returning a clear error on

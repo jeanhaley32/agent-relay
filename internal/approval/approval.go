@@ -40,7 +40,7 @@ type request struct {
 type Manager struct {
 	mu          sync.Mutex
 	pending     map[string]*request
-	approveBase string // e.g. http://100.99.212.119:9212, the tailnet-only base URL
+	approveBase string // e.g. http://100.x.y.z:9212, the tailnet-only base URL
 }
 
 func NewManager(approveBase string) *Manager {
