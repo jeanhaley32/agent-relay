@@ -163,3 +163,11 @@ func (a *Authorizer) MayReceive(conversationID string) Decision {
 	}
 	return deny("not allowlisted and owned by no frontend")
 }
+
+// Assured is implemented by a transport that can state how strongly it
+// establishes a sender's identity. Every frontend implements it, so the
+// liveness requirement is read off the transport rather than inferred from
+// which ids someone remembered to put in a map.
+type Assured interface {
+	Assurance() Assurance
+}

@@ -583,64 +583,83 @@ func main() {
 		},
 	})
 
-	// Admin session gate: every admin user_id (from_id) must re-prove
-	// tailnet presence (via the approval page) after 30 min idle, closing
-	// the gap where a compromised messenger account alone would otherwise be
-	// trusted. Keyed on user_id, not chat_id - see SessionGatedUsers doc
-	// comment in internal/relay/relay.go. Tracked independently per admin.
-	// Covers both Telegram admins (int64 ids) and, when enabled, Discord
-	// admins (snowflake ids) - the gate is the guard against a compromised
-	// admin account on EITHER frontend, so both id spaces must feed it or a
-	// Discord admin could run /handshake approve, /allow, /lockdown etc
-	// indefinitely with zero tailnet proof.
-	if len(cfg.Telegram.Admins) > 0 || len(cfg.Discord.Admins) > 0 {
-		gated := make(map[string]bool, len(cfg.Telegram.Admins)+len(cfg.Discord.Admins))
-		for _, admin := range cfg.Telegram.Admins {
-			gated[strconv.FormatInt(admin, 10)] = true
-		}
-		if discordAdminIDs, err := cfg.Discord.AdminIDs(); err == nil {
-			for _, admin := range discordAdminIDs {
-				gated[admin.String()] = true
+	// Admin session gate: an admin whose identity the transport only *claims*
+	// must re-prove tailnet presence (via the approval page) after 30 min
+	// idle, closing the gap where a compromised messenger account alone would
+	// otherwise be trusted. Keyed on user_id, not chat_id - see
+	// SessionGatedUsers doc comment in internal/relay/relay.go. Tracked
+	// independently per admin.
+	//
+	// Which admins that covers is decided by livenessGated from each
+	// frontend's own Assurance, not by an id list maintained here: Telegram
+	// and Discord are Claimed and so are gated, Matrix and web are Proved by
+	// their transport and so are not. Adding a frontend means implementing
+	// Assurance on it, not remembering to edit this block.
+	{
+		var fs []frontendAdmins
+		if front != nil {
+			tgIDs := make([]string, 0, len(cfg.Telegram.Admins))
+			for _, admin := range cfg.Telegram.Admins {
+				tgIDs = append(tgIDs, strconv.FormatInt(admin, 10))
 			}
+			fs = append(fs, frontendAdmins{front, tgIDs})
 		}
-		b.Session = session.NewManager(30 * time.Minute)
-		b.Approval = appr
-		b.SessionGatedUsers = gated
-		b.SessionTTL = 10 * time.Minute
-
-		// Admin device-presence gate (on top of the session gate above): an
-		// admin who has bound a Tailscale device to their id must have that
-		// device online for their Admin-flagged commands specifically, or a
-		// fresh re-auth approval (same Session/Approval machinery) standing
-		// in for it - see AdminDevicePresent's doc comment on Broker.
-		b.AdminDevicePresent = func(senderID string) (required, online bool) {
-			device, bound := adminDevices.Device(senderID)
-			if !bound {
-				return false, false
+		if discordFront != nil {
+			var dcIDs []string
+			if discordAdminIDs, err := cfg.Discord.AdminIDs(); err == nil {
+				for _, admin := range discordAdminIDs {
+					dcIDs = append(dcIDs, admin.String())
+				}
 			}
-			peer, ok := tailnetStatus.Peer(device)
-			return true, ok && peer.Online
+			fs = append(fs, frontendAdmins{discordFront, dcIDs})
 		}
+		if matrixFront != nil {
+			fs = append(fs, frontendAdmins{matrixFront, cfg.Matrix.Admins})
+		}
+		if webFront != nil {
+			fs = append(fs, frontendAdmins{webFront, []string{cfg.Web.ConvID}})
+		}
+		gated := livenessGated(fs)
+		if len(gated) > 0 {
+			b.Session = session.NewManager(30 * time.Minute)
+			b.Approval = appr
+			b.SessionGatedUsers = gated
+			b.SessionTTL = 10 * time.Minute
 
-		// force_reauth tool: the model can trigger a targeted re-auth challenge
-		// (the single-admin counterpart of /reauth's ExpireAll), but only for a
-		// gated admin and only after a human approves via /allow — so a
-		// manipulated model session can't force-revoke an admin unilaterally.
-		go serveReauth(back, reauth,
-			func(id string) bool { return gated[id] },
-			b.Session.Revoke,
-			func(text string) error { return notifyAdmins(context.Background(), admins, text) },
-			logger)
+			// Admin device-presence gate (on top of the session gate above): an
+			// admin who has bound a Tailscale device to their id must have that
+			// device online for their Admin-flagged commands specifically, or a
+			// fresh re-auth approval (same Session/Approval machinery) standing
+			// in for it - see AdminDevicePresent's doc comment on Broker.
+			b.AdminDevicePresent = func(senderID string) (required, online bool) {
+				device, bound := adminDevices.Device(senderID)
+				if !bound {
+					return false, false
+				}
+				peer, ok := tailnetStatus.Peer(device)
+				return true, ok && peer.Online
+			}
 
-		cmds.Register(command.Command{
-			Name:  "reauth",
-			Help:  "admin: force every admin session (including yours) to expire, requiring tailnet re-approval",
-			Admin: true,
-			Run: func(command.Context, []string) string {
-				b.Session.ExpireAll()
-				return "All admin sessions expired. Your next message (including this reply's delivery) will trigger a tailnet re-auth challenge."
-			},
-		})
+			// force_reauth tool: the model can trigger a targeted re-auth challenge
+			// (the single-admin counterpart of /reauth's ExpireAll), but only for a
+			// gated admin and only after a human approves via /allow — so a
+			// manipulated model session can't force-revoke an admin unilaterally.
+			go serveReauth(back, reauth,
+				func(id string) bool { return gated[id] },
+				b.Session.Revoke,
+				func(text string) error { return notifyAdmins(context.Background(), admins, text) },
+				logger)
+
+			cmds.Register(command.Command{
+				Name:  "reauth",
+				Help:  "admin: force every admin session (including yours) to expire, requiring tailnet re-approval",
+				Admin: true,
+				Run: func(command.Context, []string) string {
+					b.Session.ExpireAll()
+					return "All admin sessions expired. Your next message (including this reply's delivery) will trigger a tailnet re-auth challenge."
+				},
+			})
+		}
 	}
 
 	if cfg.Stylometry.Enabled {
@@ -1110,34 +1129,6 @@ func describeSchedule(sched *scheduler.Scheduler, sc *scheduler.Schedule) string
 		return fmt.Sprintf("recurring %q, next %s", sc.Cron, next.Format("Mon 2006-01-02 15:04 MST"))
 	}
 	return "once at " + next.Format("Mon 2006-01-02 15:04 MST")
-}
-
-// outboundAllowed implements the outbound gate: the model can only reply to
-// allowlisted chats. The inbound allowlist gates who reaches Claude; this
-// stops Claude messaging strangers. Checks both the Telegram (int64) and,
-// when enabled, Discord (snowflake) allowlists — chatID is a Telegram chat
-// id (== user id) or, for Discord, gate()'s convID (== user id for DMs, ==
-// channel id for guild messages). Guild channels are inherently multi-party
-// so acc-style single-id allowlisting doesn't apply there; instead known
-// reports whether the Discord frontend has already seen and gated this
-// chatID inbound — i.e. a guild channel from an allowed guild, or a DM user
-// id. That covers scheduled reminders / relayd-originated replies into a
-// channel the model was legitimately talking in, while still failing closed
-// for anything never seen inbound. discordAcc and known may be nil/absent
-// when the Discord frontend is disabled.
-func outboundAllowed(chatID string, acc *access.Manager, discordAcc *access.Manager, known func(string) bool) bool {
-	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil && acc.Allowed(id) {
-		return true
-	}
-	if discordAcc != nil {
-		if id, err := snowflake.Parse(chatID); err == nil && discordAcc.Allowed(int64(id)) {
-			return true
-		}
-	}
-	if known != nil && known(chatID) {
-		return true
-	}
-	return false
 }
 
 // verdict returns an /allow or /deny handler that answers a pending tool-approval

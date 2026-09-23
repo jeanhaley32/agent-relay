@@ -39,6 +39,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/authz"
 	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
@@ -109,7 +110,12 @@ func New(homeserver, token string, admins []string, mediaSpool string, logger *l
 	}
 }
 
-func (f *Frontend) Name() string               { return "matrix" }
+func (f *Frontend) Name() string { return "matrix" }
+
+// Assurance is Proved: the homeserver is reachable only over the tailnet, so
+// a message arriving here already established who sent it. See the package
+// comment. This is why Matrix admins are not liveness-gated.
+func (f *Frontend) Assurance() authz.Assurance { return authz.Proved }
 func (f *Frontend) Recv() <-chan relay.Message { return f.out }
 
 // OwnsConversationID reports whether id belongs to this frontend: either a

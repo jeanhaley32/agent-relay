@@ -27,6 +27,7 @@ import (
 	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/snowflake/v2"
 
+	"github.com/jeanhaley32/agent-relay/internal/authz"
 	"github.com/jeanhaley32/agent-relay/internal/deniedlog"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/inbound"
@@ -434,7 +435,11 @@ func (f *Frontend) watchHeartbeat(client *bot.Client) {
 	}
 }
 
-func (f *Frontend) Name() string               { return "discord" }
+func (f *Frontend) Name() string { return "discord" }
+
+// Assurance is Claimed, for the same reason as Telegram: the snowflake is
+// Discord's assertion about an account, not a proof of presence.
+func (f *Frontend) Assurance() authz.Assurance { return authz.Claimed }
 func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 
 // Close stops the frontend: closes the gateway with a clean close frame

@@ -32,6 +32,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/authz"
 	"github.com/jeanhaley32/agent-relay/internal/inbound"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 )
@@ -81,7 +82,11 @@ func New(listenAddr, convID, fromName, owner string, logger *log.Logger) (*Front
 
 // --- relay.Endpoint / relay.Claimer ---
 
-func (f *Frontend) Name() string                      { return "web" }
+func (f *Frontend) Name() string { return "web" }
+
+// Assurance is Proved: every request is resolved with `tailscale whois` and
+// must come back as the configured owner, so arrival is itself the proof.
+func (f *Frontend) Assurance() authz.Assurance        { return authz.Proved }
 func (f *Frontend) Recv() <-chan relay.Message        { return f.out }
 func (f *Frontend) OwnsConversationID(id string) bool { return id == f.convID }
 

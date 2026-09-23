@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeanhaley32/agent-relay/internal/authz"
 	"github.com/jeanhaley32/agent-relay/internal/deniedlog"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/inbound"
@@ -231,7 +232,12 @@ func (f *Frontend) SafeErr(err error) string {
 	return strings.ReplaceAll(s, f.token, "<token>")
 }
 
-func (f *Frontend) Name() string               { return "telegram" }
+func (f *Frontend) Name() string { return "telegram" }
+
+// Assurance is Claimed: the sender id is Telegram asserting who its account
+// holder is. A stolen account carries the same id, so admins on this
+// transport must periodically prove liveness.
+func (f *Frontend) Assurance() authz.Assurance { return authz.Claimed }
 func (f *Frontend) Recv() <-chan relay.Message { return f.recv }
 
 // Close stops polling. The Recv channel is closed by the poll loop on exit.
