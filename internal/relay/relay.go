@@ -429,7 +429,19 @@ func (b *Broker) challengeSession(ctx context.Context, conv, userID string) {
 
 	go func() {
 		defer clearInFlight()
-		ticker := time.NewTicker(3 * time.Second)
+		// Poll faster than the deadline. A fixed 3s interval misses any TTL
+		// shorter than that entirely: the first check lands after the token
+		// has already expired, so an approval the user actually gave is never
+		// observed. Scale to the TTL and keep a floor so a long TTL does not
+		// mean a lazy poll.
+		interval := ttl / 4
+		if interval > 3*time.Second {
+			interval = 3 * time.Second
+		}
+		if interval < 50*time.Millisecond {
+			interval = 50 * time.Millisecond
+		}
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		// The deadline is real wall-clock time (time.Now, not b.now()): the
 		// poll ticker is already real-time, so mixing in the overridable
