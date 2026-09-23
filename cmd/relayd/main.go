@@ -206,19 +206,7 @@ func main() {
 	// Telegram and (if enabled) Discord access managers — each frontend's
 	// admin ids live in its own manager, so a Discord admin's id is only
 	// ever found in discordAcc, and would otherwise never satisfy IsAdmin.
-	cmds.IsAdmin = func(senderID string) bool {
-		if matrixAdmins[senderID] {
-			return true // Matrix admin ids are non-numeric (@user:server)
-		}
-		if webAdmins[senderID] {
-			return true // web frontend ConvID (non-numeric), tailnet-whois verified
-		}
-		id, err := strconv.ParseInt(senderID, 10, 64)
-		if err != nil {
-			return false
-		}
-		return acc.IsAdmin(id) || (discordAcc != nil && discordAcc.IsAdmin(id))
-	}
+	cmds.IsAdmin = newIsAdmin(matrixAdmins, webAdmins, acc, func() *access.Manager { return discordAcc })
 	cmds.Register(command.Command{
 		Name:  "handshake",
 		Help:  "admin: list/approve/deny access requests",
