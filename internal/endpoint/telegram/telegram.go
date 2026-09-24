@@ -37,7 +37,7 @@ const defaultBaseURL = "https://api.telegram.org"
 // just repeats the same guaranteed failure.
 const maxMessageLen = 4096
 
-type permanentSendError = senderr.Permanent
+type permanentSendError = relay.PermanentSendError
 
 // Authorizer decides whether a sender may use the relay and records requests
 // from those who may not (so an admin can approve them later). An access.Manager

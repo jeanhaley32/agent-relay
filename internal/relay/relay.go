@@ -18,7 +18,6 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/approval"
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
-	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/eventlog"
 	"github.com/jeanhaley32/agent-relay/internal/session"
 )
@@ -104,6 +103,20 @@ func (b *Broker) needsLivenessProof(senderID string) bool {
 func (b *Broker) mayAdmin(senderID string) bool {
 	return b.Gate != nil && b.Gate.MayAdmin(senderID)
 }
+
+// PermanentSendError marks a send failure that will never succeed on retry —
+// a disallowed destination, a message that cannot be split small enough, a
+// recipient that has blocked the bot. A frontend returns it from Send so the
+// broker stops retrying and reports the real outcome instead of queueing
+// forever.
+//
+// It lives here rather than beside the frontends because it is part of this
+// package's contract: AckBackendReply promises to tell the caller whether a
+// send is worth retrying, and this type is how that promise is expressed.
+type PermanentSendError struct{ Err error }
+
+func (e PermanentSendError) Error() string { return e.Err.Error() }
+func (e PermanentSendError) Unwrap() error { return e.Err }
 
 // Estimator approximates the token cost of a piece of text. The default is a
 // rough chars/4 heuristic; swap in a real tokenizer later.
@@ -557,7 +570,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			if !b.mayReceive(m.Meta["chat_id"]) {
 				b.logEvent(m, eventlog.Dropped, "outbound chat not allowlisted", "")
 				if b.AckBackendReply != nil {
-					b.AckBackendReply(m, senderr.Permanent{Err: fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"])})
+					b.AckBackendReply(m, PermanentSendError{Err: fmt.Errorf("chat_id %q is not an allowed destination", m.Meta["chat_id"])})
 				}
 				continue // dropped (the gate func is responsible for logging); cap not charged
 			}

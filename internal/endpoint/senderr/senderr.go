@@ -1,14 +1,8 @@
-// Package senderr is shared across frontends (Telegram, Discord, ...) so
-// their retry classification can't silently drift apart from each other.
+// Package senderr holds the message splitting that frontends share (Telegram,
+// Discord, ...), so chunking behaviour can't silently drift apart between them.
 package senderr
 
 import "unicode/utf8"
-
-// Permanent marks a Send failure as non-retryable.
-type Permanent struct{ Err error }
-
-func (e Permanent) Error() string { return e.Err.Error() }
-func (e Permanent) Unwrap() error { return e.Err }
 
 // Split breaks text into chunks of at most limit runes each.
 func Split(text string, limit int) []string {

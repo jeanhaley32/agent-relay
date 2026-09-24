@@ -19,7 +19,6 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
-	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
@@ -27,12 +26,12 @@ import (
 
 // TestAckErrTextClassification exercises the permanent-vs-transient
 // classification used by the real AckBackendReply closure: only a
-// senderr.Permanent failure should be surfaced back to the reply tool call,
+// relay.PermanentSendError failure should be surfaced back to the reply tool call,
 // so a transient failure that Frontend.Send has already queued for
 // background retry doesn't invite the model to resend and duplicate
 // delivery once the retry lands.
 func TestAckErrTextClassification(t *testing.T) {
-	permErr := senderr.Permanent{Err: errors.New("chat_id is not an allowed destination")}
+	permErr := relay.PermanentSendError{Err: errors.New("chat_id is not an allowed destination")}
 	transientErr := errors.New("telegram sendMessage status 500: try again")
 
 	cases := []struct {

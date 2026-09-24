@@ -1,22 +1,10 @@
 package senderr
 
 import (
-	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
 )
-
-func TestPermanentErrorAndUnwrap(t *testing.T) {
-	inner := errors.New("boom")
-	p := Permanent{Err: inner}
-	if p.Error() != "boom" {
-		t.Errorf("Error() = %q, want %q", p.Error(), "boom")
-	}
-	if !errors.Is(p, inner) {
-		t.Errorf("errors.Is(p, inner) = false, want true (Unwrap should expose inner error)")
-	}
-}
 
 func TestSplitMultiByteRunes(t *testing.T) {
 	// Multi-byte runes (3 bytes each in UTF-8) exercise runeLimitByteOffset's

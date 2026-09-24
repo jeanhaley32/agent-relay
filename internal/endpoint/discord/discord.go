@@ -35,11 +35,11 @@ import (
 )
 
 // maxMessageLen is Discord's hard per-message character cap (not 4096 like
-// Telegram). Marked senderr.Permanent since retrying an oversized message
+// Telegram). Marked relay.PermanentSendError since retrying an oversized message
 // just repeats the same guaranteed failure.
 const maxMessageLen = 2000
 
-type permanentSendError = senderr.Permanent
+type permanentSendError = relay.PermanentSendError
 
 // Authorizer decides whether a sender may use the relay and records requests
 // from those who may not (so an admin can approve them later). It mirrors

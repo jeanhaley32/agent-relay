@@ -44,7 +44,6 @@ import (
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/discord"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/matrix"
-	"github.com/jeanhaley32/agent-relay/internal/endpoint/senderr"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/telegram"
 	"github.com/jeanhaley32/agent-relay/internal/endpoint/web"
 	"github.com/jeanhaley32/agent-relay/internal/eventlog"
@@ -719,13 +718,13 @@ func main() {
 }
 
 // ackErrText classifies a Send outcome for AckBackendReply: only a permanent
-// failure (senderr.Permanent) is surfaced as an error string - Frontend.Send
+// failure (relay.PermanentSendError) is surfaced as an error string - Frontend.Send
 // also returns an error for transient failures that it has already queued
 // for background retry, and reporting those to the model would invite a
 // resend that duplicates delivery once the retry lands. Returns "" for a nil
 // or transient error.
 func ackErrText(sendErr error) string {
-	var perm senderr.Permanent
+	var perm relay.PermanentSendError
 	if sendErr != nil && errors.As(sendErr, &perm) {
 		return sendErr.Error()
 	}

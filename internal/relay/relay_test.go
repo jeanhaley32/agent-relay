@@ -1319,3 +1319,18 @@ func TestChallengeSessionWithoutApprovalDoesNotPanic(t *testing.T) {
 	// Must return rather than panic; nothing to assert beyond surviving.
 	b.challengeSession(context.Background(), "conv", "user-1")
 }
+
+// PermanentSendError moved here from internal/endpoint/senderr, which the core
+// used to import for this one type — the only backwards edge in the package
+// graph. The contract it carries is unchanged: Error() reports the inner
+// message, and errors.Is can see through it so callers can match on the cause.
+func TestPermanentSendErrorUnwraps(t *testing.T) {
+	inner := errors.New("boom")
+	p := PermanentSendError{Err: inner}
+	if p.Error() != "boom" {
+		t.Errorf("Error() = %q, want %q", p.Error(), "boom")
+	}
+	if !errors.Is(p, inner) {
+		t.Error("errors.Is(p, inner) = false — Unwrap must expose the cause, or the broker cannot tell why a send failed")
+	}
+}
