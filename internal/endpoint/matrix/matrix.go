@@ -137,9 +137,19 @@ func (f *Frontend) OwnsConversationID(id string) bool {
 // roomByConv is written only by deliver, after the admin filter, so a hit is
 // evidence. Rooms count as well as mxids because a relayd-originated message
 // may address either.
+//
+// A configured admin's own mxid always qualifies, and that is not a weakening:
+// it is an identity the operator set in config, not one inferred from traffic.
+// Without it the gate starves itself, because roomByConv is in-memory and a
+// restart empties it — relayd would be unable to send to Matrix at all until
+// an admin happened to speak first, silently dropping scheduled deliveries.
+// Discord avoids the same trap by falling back to its live allowlist for DMs.
 func (f *Frontend) KnownConversation(id string) bool {
 	if id == "" {
 		return false
+	}
+	if f.admins[id] {
+		return true
 	}
 	if _, ok := f.roomByConv.Load(id); ok {
 		return true

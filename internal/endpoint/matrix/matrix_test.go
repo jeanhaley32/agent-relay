@@ -227,7 +227,7 @@ func TestKnownConversationRequiresHavingSeenTheRoom(t *testing.T) {
 	// old prefix check would have waved through.
 	for _, id := range []string{
 		"!invited-but-silent:example.org", // auto-joined, nobody spoke
-		"@stranger:example.org",
+		"@stranger:example.org",           // not a configured admin
 		"!anything:example.org",
 		"",
 	} {
@@ -252,5 +252,25 @@ func TestKnownConversationRequiresHavingSeenTheRoom(t *testing.T) {
 	}
 	if f.KnownConversation("!invited-but-silent:example.org") {
 		t.Error("a room nobody spoke in is still not a legitimate outbound target")
+	}
+}
+
+// roomByConv is in-memory, so a relayd restart empties it. Requiring a seen
+// inbound message for every target meant the gate starved itself: after a
+// restart nothing could be sent to Matrix until an admin happened to speak
+// first, which silently drops scheduled deliveries. A configured admin's mxid
+// is an identity the operator set, not one inferred from traffic, so it stays
+// reachable across restarts. Arbitrary rooms still do not.
+func TestConfiguredAdminIsReachableBeforeAnyInboundMessage(t *testing.T) {
+	f := New("http://unused", "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	if !f.KnownConversation("@admin:example.org") {
+		t.Error("a configured admin must be reachable with an empty roomByConv, or a restart mutes Matrix entirely")
+	}
+	if f.KnownConversation("!invited-but-silent:example.org") {
+		t.Error("a room nobody spoke in must still be refused — that is the hole this gate closes")
+	}
+	if f.KnownConversation("@stranger:example.org") {
+		t.Error("a non-admin mxid must not be reachable just because it is mxid-shaped")
 	}
 }
