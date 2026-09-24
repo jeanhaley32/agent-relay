@@ -572,10 +572,10 @@ func main() {
 		if discordFront != nil && discordFront.KnownConversation(id) {
 			return true
 		}
-		// A Matrix room id (starts with '!') is a legitimate outbound
-		// target: the model only ever gets a Matrix conversation from an
-		// authorized admin's inbound message, so replying into it is safe.
-		if matrixFront != nil && matrixFront.OwnsConversationID(id) {
+		// Seen-inbound, not id-shaped: the frontend auto-joins rooms it is
+		// invited to, so an id-shape check would accept rooms no admin ever
+		// spoke in.
+		if matrixFront != nil && matrixFront.KnownConversation(id) {
 			return true
 		}
 		// The web pane's ConvID is a legitimate outbound target for the same

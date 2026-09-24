@@ -129,6 +129,32 @@ func (f *Frontend) OwnsConversationID(id string) bool {
 	return strings.HasPrefix(id, "!") || strings.HasPrefix(id, "@")
 }
 
+// KnownConversation reports whether an admin has actually spoken in this
+// conversation. This is what the outbound gate must ask; OwnsConversationID is
+// a routing heuristic on the shape of an id and accepts any room the bot was
+// invited into, so using it as the gate left that path open.
+//
+// roomByConv is written only by deliver, after the admin filter, so a hit is
+// evidence. Rooms count as well as mxids because a relayd-originated message
+// may address either.
+func (f *Frontend) KnownConversation(id string) bool {
+	if id == "" {
+		return false
+	}
+	if _, ok := f.roomByConv.Load(id); ok {
+		return true
+	}
+	known := false
+	f.roomByConv.Range(func(_, room any) bool {
+		if room.(string) == id {
+			known = true
+			return false
+		}
+		return true
+	})
+	return known
+}
+
 func (f *Frontend) Close() error {
 	f.once.Do(func() { close(f.closed) })
 	return nil

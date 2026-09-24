@@ -213,3 +213,44 @@ func TestSendResolvesRoomFromEveryAcceptedSource(t *testing.T) {
 		t.Fatalf("duplicate transaction id %q — the homeserver would drop one", got[0].txnID)
 	}
 }
+
+// The outbound gate used to accept any '!' or '@' prefixed string as a
+// legitimate Matrix target, because it asked OwnsConversationID — a routing
+// heuristic on the shape of an id. Since the frontend auto-joins rooms it is
+// invited to, a room the bot had merely been pulled into satisfied that check
+// with no admin having spoken there. KnownConversation is the fact the gate
+// actually needs. See #77.
+func TestKnownConversationRequiresHavingSeenTheRoom(t *testing.T) {
+	f := New("http://unused", "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	// Nothing seen yet: every shape of id is unknown, including the ones the
+	// old prefix check would have waved through.
+	for _, id := range []string{
+		"!invited-but-silent:example.org", // auto-joined, nobody spoke
+		"@stranger:example.org",
+		"!anything:example.org",
+		"",
+	} {
+		if f.KnownConversation(id) {
+			t.Errorf("KnownConversation(%q) = true before any inbound message — the gate is open", id)
+		}
+		if id != "" && !f.OwnsConversationID(id) {
+			t.Errorf("precondition: OwnsConversationID(%q) should be true, which is exactly why it was the wrong check", id)
+		}
+	}
+
+	// An admin speaks in a room. deliver files the conversation under the
+	// sender's mxid and remembers the physical room.
+	f.deliver(inbound{roomID: "!real:example.org", sender: "@admin:example.org", body: "hello"})
+	<-f.Recv()
+
+	if !f.KnownConversation("@admin:example.org") {
+		t.Error("the mxid an admin spoke from must be a known conversation")
+	}
+	if !f.KnownConversation("!real:example.org") {
+		t.Error("the room an admin spoke in must be known — a relayd-originated reply may address the room directly")
+	}
+	if f.KnownConversation("!invited-but-silent:example.org") {
+		t.Error("a room nobody spoke in is still not a legitimate outbound target")
+	}
+}
