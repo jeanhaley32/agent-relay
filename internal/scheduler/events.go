@@ -238,9 +238,11 @@ func (t *Tracker) Fire(scheduleID, chatID, text string) (PendingEvent, error) {
 	t.mu.Unlock()
 
 	// Inject the trigger exactly once, here. The Claude endpoint's Send is
-	// lossless-buffered (it queues durably and the shim flushes on reconnect),
-	// so a "not yet delivered" event is NOT lost and must not be re-injected on
-	// every reconcile tick. Connected() is used only as a best-effort signal to
+	// lossless across a shim reconnect — the frame waits in an in-memory queue
+	// and flushes when the shim returns — so a "not yet delivered" event must
+	// not be re-injected on every reconcile tick. That queue is NOT durable
+	// across a relayd restart; what makes a fired event survive that is this
+	// tracker persisting it and re-nudging, not the buffer. Connected() is used only as a best-effort signal to
 	// stamp DeliveredAt for metrics — never as a gate that re-sends the prompt.
 	delivered := t.inject(chatID, t.initialPrompt(&snapshot))
 	if delivered {

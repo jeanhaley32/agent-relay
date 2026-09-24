@@ -11,9 +11,11 @@ package claude
 
 import (
 	"context"
+	"log"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeanhaley32/agent-relay/internal/eventlog"
@@ -73,19 +75,37 @@ type Endpoint struct {
 
 	closeOnce sync.Once
 
-	// Resolve, if set, is consulted for every ChatID carried on a reply or
+	// resolve, if set, is consulted for every ChatID carried on a reply or
 	// schedule frame from the shim — turning a contacts-directory name
 	// (e.g. "discord.alice", "person:alice") into the live chat_id it
-	// should actually be delivered to. ok=false (including nil Resolve)
+	// should actually be delivered to. ok=false (including a nil resolve)
 	// leaves the ChatID unchanged, so this is backward compatible with
-	// literal chat_ids the model already knows. Set once before Run(); not
-	// safe to mutate concurrently with inbound frames.
-	Resolve func(name string) (chatID string, ok bool)
+	// literal chat_ids the model already knows.
+	//
+	// Supplied through WithResolve rather than assigned afterwards: New
+	// starts the accept loop before it returns, and the shim redials every
+	// second, so a caller setting a public field on the next line was racing
+	// a goroutine already reading it.
+	resolve func(name string) (chatID string, ok bool)
+
+	// injectEvicted counts inject frames dropped because the buffer was full
+	// while the shim was disconnected. Dropping the oldest is deliberate, but
+	// it used to happen in silence — a >256 backlog lost user messages with
+	// no line in the journal and no counter anywhere.
+	injectEvicted atomic.Int64
+}
+
+// Option configures an Endpoint at construction.
+type Option func(*Endpoint)
+
+// WithResolve supplies the contacts-directory lookup. See Endpoint.resolve.
+func WithResolve(fn func(name string) (chatID string, ok bool)) Option {
+	return func(e *Endpoint) { e.resolve = fn }
 }
 
 // New starts listening on socketPath for the shim and returns the endpoint. The
 // caller launches Claude Code with cmd/relay-shim pointed at the same socket.
-func New(socketPath string) (*Endpoint, error) {
+func New(socketPath string, opts ...Option) (*Endpoint, error) {
 	_ = os.Remove(socketPath) // clear any stale socket
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -108,10 +128,18 @@ func New(socketPath string) (*Endpoint, error) {
 		out:        make(chan ipc.Frame, inboundBuffer),
 		done:       make(chan struct{}),
 	}
+	for _, o := range opts {
+		o(e)
+	}
 	go e.acceptLoop()
 	go e.writeLoop() // deliver queued inject frames across reconnects
 	return e, nil
 }
+
+// InjectEvicted reports how many inject frames have been dropped for a full
+// buffer since start. Non-zero means user messages were lost while the shim
+// was disconnected.
+func (e *Endpoint) InjectEvicted() int64 { return e.injectEvicted.Load() }
 
 func (e *Endpoint) Name() string               { return "claude" }
 func (e *Endpoint) Recv() <-chan relay.Message { return e.recv }
@@ -245,8 +273,8 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 		switch f.Kind {
 		case ipc.KindReply:
 			chatID := f.ChatID
-			if e.Resolve != nil {
-				if resolved, ok := e.Resolve(chatID); ok {
+			if e.resolve != nil {
+				if resolved, ok := e.resolve(chatID); ok {
 					chatID = resolved
 				}
 			}
@@ -282,8 +310,8 @@ func (e *Endpoint) readReplies(c *ipc.Conn) {
 			}
 		case ipc.KindSchedReq:
 			chatID := f.ChatID
-			if e.Resolve != nil {
-				if resolved, ok := e.Resolve(chatID); ok {
+			if e.resolve != nil {
+				if resolved, ok := e.resolve(chatID); ok {
 					chatID = resolved
 				}
 			}
@@ -324,6 +352,9 @@ func (e *Endpoint) Send(_ context.Context, m relay.Message) error {
 	default: // buffer full: drop the oldest to make room, then enqueue
 		select {
 		case <-e.out:
+			n := e.injectEvicted.Add(1)
+			log.Printf("claude: inject buffer full (%d frames) — dropped the oldest to enqueue for %s; %d evicted since start",
+				inboundBuffer, chatID, n)
 		default:
 		}
 		select {

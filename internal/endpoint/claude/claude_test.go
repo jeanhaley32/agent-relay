@@ -333,3 +333,65 @@ func TestSecondShimConnectionIsServiced(t *testing.T) {
 		t.Fatal("frame from the second shim was never read: that connection is not being serviced")
 	}
 }
+
+// The inject buffer deliberately drops the oldest frame when full, but it used
+// to do so in silence: a backlog past the buffer size lost user messages with
+// no counter and no log line. See #83.
+func TestInjectEvictionIsCounted(t *testing.T) {
+	dir := t.TempDir()
+	e, err := New(filepath.Join(dir, "s.sock"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+
+	if got := e.InjectEvicted(); got != 0 {
+		t.Fatalf("InjectEvicted() = %d before any send, want 0", got)
+	}
+
+	// No shim is connected, so nothing drains e.out. Overfill it.
+	for i := 0; i < inboundBuffer+5; i++ {
+		if err := e.Send(context.Background(), relay.Message{
+			ConversationID: "c", Text: "msg",
+		}); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+
+	got := e.InjectEvicted()
+	if got == 0 {
+		t.Fatal("overfilled the buffer and InjectEvicted() is still 0 — messages were dropped with no signal, which is the bug")
+	}
+	// writeLoop is running and takes one frame off the channel before it
+	// blocks waiting for a shim, so the buffer holds one fewer than capacity
+	// and one of the overflow sends fits without evicting.
+	if want := 5 - 1; got < int64(want) {
+		t.Errorf("InjectEvicted() = %d, want at least %d after overfilling by 5", got, want)
+	}
+}
+
+// Resolve used to be a public field assigned after New returned, while New had
+// already started the accept loop and the shim redials every second. Supplying
+// it at construction removes the window entirely. See #82.
+func TestResolveIsSuppliedAtConstruction(t *testing.T) {
+	dir := t.TempDir()
+	called := make(chan string, 1)
+	e, err := New(filepath.Join(dir, "s.sock"), WithResolve(func(name string) (string, bool) {
+		select {
+		case called <- name:
+		default:
+		}
+		return "resolved-" + name, true
+	}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+
+	if e.resolve == nil {
+		t.Fatal("WithResolve did not take effect, so the accept loop would read a nil resolver")
+	}
+	if got, ok := e.resolve("alice"); !ok || got != "resolved-alice" {
+		t.Fatalf("resolve(alice) = %q,%v", got, ok)
+	}
+}

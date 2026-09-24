@@ -216,12 +216,11 @@ func main() {
 	dir := contacts.New(cfg.StatePath("contacts.json"), logger)
 
 	// Claude backend: listen on the socket for the shim.
-	back, err := claudebk.New(cfg.Claude.Socket)
+	back, err := claudebk.New(cfg.Claude.Socket, claudebk.WithResolve(dir.Resolve))
 	if err != nil {
 		logger.Fatalf("claude backend: %v", err)
 	}
 	defer back.Close()
-	back.Resolve = dir.Resolve
 
 	// One denied-sender log, shared across every frontend, so unauthorized
 	// attempts on any platform land in a single audit file. Built before the
@@ -506,7 +505,7 @@ func main() {
 	// to the message I sent at 16:31?" answerable in seconds instead of an hour
 	// of forensics. Failing to open it is not fatal - observability must never
 	// keep the relay from running.
-	events, err := eventlog.Open("relay-events.jsonl")
+	events, err := eventlog.Open(cfg.StatePath("relay-events.jsonl"))
 	if err != nil {
 		logger.Printf("event log disabled (%v)", err)
 	} else {

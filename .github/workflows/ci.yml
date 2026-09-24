@@ -45,10 +45,36 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: govulncheck (informational)
-        # Reports known vulns (incl. stdlib advisories tied to the runner's Go
-        # version) but never blocks — `|| true` keeps the check green; read the
-        # log for findings.
+      - name: govulncheck
+        # Blocks on a vulnerability that is BOTH in a dependency we control and
+        # actually reachable from our code. Two things are deliberately not
+        # blocking: stdlib advisories, which track the runner's Go version and
+        # are not ours to fix, and module-level advisories where the vulnerable
+        # symbol is never called.
+        #
+        # This step previously ran with a trailing `|| true`, which made it
+        # incapable of failing at all — findings were printed into a green log.
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./... || true
+          "$(go env GOPATH)/bin/govulncheck" -format json ./... > vulns.json || true
+
+          called() {
+            jq -r 'select(.finding) | .finding
+                   | select([.trace[] | select(.function != null)] | length > 0)
+                   | "\(.osv)\t\(.trace[0].module)"' vulns.json | sort -u
+          }
+
+          echo "--- reachable (a vulnerable symbol is actually called) ---"
+          called || true
+          echo "--- present but not called ---"
+          jq -r 'select(.finding) | .finding
+                 | select([.trace[] | select(.function != null)] | length == 0)
+                 | "\(.osv)\t\(.trace[0].module)"' vulns.json | sort -u || true
+
+          blocking="$(called | awk -F'\t' '$2 != "stdlib" {print $1}' | sort -u)"
+          if [ -n "$blocking" ]; then
+            echo "::error::reachable vulnerabilities in dependencies we control:"
+            echo "$blocking"
+            exit 1
+          fi
+          echo "OK: nothing reachable outside stdlib"
