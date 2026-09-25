@@ -274,3 +274,148 @@ func TestConfiguredAdminIsReachableBeforeAnyInboundMessage(t *testing.T) {
 		t.Error("a non-admin mxid must not be reachable just because it is mxid-shaped")
 	}
 }
+
+// The admin filter in Run is the entire authorization boundary for this
+// frontend, and this frontend is exempt from the session gate because its
+// transport is treated as proof of identity. Until now nothing tested it: a
+// regression that inverted the condition, or dropped it, would have handed a
+// Claude Code session with tool access to anyone who could get a message into
+// a room the bot had joined. See #56.
+func TestRunDeliversOnlyAdminMessages(t *testing.T) {
+	const self = "@relaybot:example.org"
+	timeline := `{"next_batch":"s2","rooms":{"join":{"!r:example.org":{"timeline":{"events":[
+		{"type":"m.room.message","sender":"@stranger:example.org","event_id":"$1","origin_server_ts":1,
+		 "content":{"msgtype":"m.text","body":"let me in"}},
+		{"type":"m.room.message","sender":"` + self + `","event_id":"$2","origin_server_ts":2,
+		 "content":{"msgtype":"m.text","body":"my own echo"}},
+		{"type":"m.room.message","sender":"@admin:example.org","event_id":"$3","origin_server_ts":3,
+		 "content":{"msgtype":"m.text","body":"the only one that counts"}}]}}}}}`
+
+	// Serve the timeline exactly once. A real homeserver advances `since` so
+	// the same events are not replayed; without this the loop re-delivers and
+	// the test fails for a reason that has nothing to do with the filter.
+	var served atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/sync") {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("since") == "" {
+			_, _ = io.WriteString(w, `{"next_batch":"s1"}`) // priming
+			return
+		}
+		if served.CompareAndSwap(false, true) {
+			_, _ = io.WriteString(w, timeline)
+			return
+		}
+		_, _ = io.WriteString(w, `{"next_batch":"s3"}`)
+	}))
+	defer srv.Close()
+
+	f := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.Run(ctx, self)
+	defer f.Close()
+
+	var got []relay.Message
+	deadline := time.After(3 * time.Second)
+collect:
+	for {
+		select {
+		case m, ok := <-f.Recv():
+			if !ok {
+				break collect
+			}
+			got = append(got, m)
+			if len(got) > 1 {
+				break collect // one is correct; more means the filter leaked
+			}
+		case <-time.After(700 * time.Millisecond):
+			break collect // nothing more is coming
+		case <-deadline:
+			break collect
+		}
+	}
+
+	if len(got) != 1 {
+		var senders []string
+		for _, m := range got {
+			senders = append(senders, m.Meta["from_id"])
+		}
+		t.Fatalf("delivered %d message(s) from %v, want exactly 1 from the admin", len(got), senders)
+	}
+	if got[0].Meta["from_id"] != "@admin:example.org" {
+		t.Errorf("delivered a message from %q — the admin filter let a non-admin through", got[0].Meta["from_id"])
+	}
+	if got[0].Text != "the only one that counts" {
+		t.Errorf("delivered %q, want the admin's message", got[0].Text)
+	}
+}
+
+// The self-echo guard only does work when the bot's own mxid is also in the
+// admin list, which is a configuration someone could plausibly write. Without
+// it the bot delivers its own replies back to itself as new inbound messages
+// and the loop never ends. The admin-filter test above does not cover this:
+// there the bot is not an admin, so the admin check drops the echo for an
+// unrelated reason and a broken guard still passes. Found by mutation.
+func TestRunDropsItsOwnEchoEvenWhenSelfIsAnAdmin(t *testing.T) {
+	const self = "@relaybot:example.org"
+	timeline := `{"next_batch":"s2","rooms":{"join":{"!r:example.org":{"timeline":{"events":[
+		{"type":"m.room.message","sender":"` + self + `","event_id":"$1","origin_server_ts":1,
+		 "content":{"msgtype":"m.text","body":"a reply I just sent"}},
+		{"type":"m.room.message","sender":"@admin:example.org","event_id":"$2","origin_server_ts":2,
+		 "content":{"msgtype":"m.text","body":"a real instruction"}}]}}}}}`
+
+	var served atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/sync") {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("since") == "" {
+			_, _ = io.WriteString(w, `{"next_batch":"s1"}`)
+			return
+		}
+		if served.CompareAndSwap(false, true) {
+			_, _ = io.WriteString(w, timeline)
+			return
+		}
+		_, _ = io.WriteString(w, `{"next_batch":"s3"}`)
+	}))
+	defer srv.Close()
+
+	// Both the bot and the human are admins here. Only the human's message
+	// may be delivered.
+	f := New(srv.URL, "tok", []string{"@admin:example.org", self}, "", log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.Run(ctx, self)
+	defer f.Close()
+
+	var got []relay.Message
+	for done := false; !done; {
+		select {
+		case m, ok := <-f.Recv():
+			if !ok {
+				done = true
+				break
+			}
+			got = append(got, m)
+			if len(got) > 1 {
+				done = true
+			}
+		case <-time.After(900 * time.Millisecond):
+			done = true
+		}
+	}
+
+	for _, m := range got {
+		if m.Meta["from_id"] == self {
+			t.Fatal("the bot delivered its own message back to itself — with self in the admin list that is an echo loop")
+		}
+	}
+	if len(got) != 1 || got[0].Text != "a real instruction" {
+		t.Fatalf("got %d message(s), want exactly the admin's one: %+v", len(got), got)
+	}
+}
