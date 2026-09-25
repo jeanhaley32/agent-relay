@@ -19,6 +19,14 @@ func TestStartsWithTelegramDisabledAndNoToken(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and runs the relayd binary")
 	}
+	// relayd refuses to start without the tailscale CLI, by design — it binds
+	// its admin re-auth flow to this host's tailnet address. That makes this
+	// test unrunnable anywhere Tailscale is not installed, including CI
+	// runners. It passed locally and failed on every push for two days before
+	// anyone looked, which is the more useful lesson than the skip itself.
+	if _, err := exec.LookPath("tailscale"); err != nil {
+		t.Skip("relayd requires the tailscale CLI; not present here")
+	}
 
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "relayd")
