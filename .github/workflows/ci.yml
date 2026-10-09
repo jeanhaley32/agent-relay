@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test (race)
+        run: go test -race ./...
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        # Blocks on a vulnerability that is BOTH in a dependency we control and
+        # actually reachable from our code. Two things are deliberately not
+        # blocking: stdlib advisories, which track the runner's Go version and
+        # are not ours to fix, and module-level advisories where the vulnerable
+        # symbol is never called.
+        #
+        # This step previously ran with a trailing `|| true`, which made it
+        # incapable of failing at all — findings were printed into a green log.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" -format json ./... > vulns.json || true
+
+          called() {
+            jq -r 'select(.finding) | .finding
+                   | select([.trace[] | select(.function != null)] | length > 0)
+                   | "\(.osv)\t\(.trace[0].module)"' vulns.json | sort -u
+          }
+
+          echo "--- reachable (a vulnerable symbol is actually called) ---"
+          called || true
+          echo "--- present but not called ---"
+          jq -r 'select(.finding) | .finding
+                 | select([.trace[] | select(.function != null)] | length == 0)
+                 | "\(.osv)\t\(.trace[0].module)"' vulns.json | sort -u || true
+
+          blocking="$(called | awk -F'\t' '$2 != "stdlib" {print $1}' | sort -u)"
+          if [ -n "$blocking" ]; then
+            echo "::error::reachable vulnerabilities in dependencies we control:"
+            echo "$blocking"
+            exit 1
+          fi
+          echo "OK: nothing reachable outside stdlib"

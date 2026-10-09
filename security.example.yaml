@@ -1,0 +1,30 @@
+# Security profile — how much the Claude Code session behind the bot can do.
+# Copy to security.yaml (gitignored) and adjust. run.sh applies it at launch.
+
+# mode: restricted | full
+#
+#   restricted  (default, safe): allow-listed tools run freely; deny-listed tools
+#               are hard-blocked; anything else prompts — and the prompt is relayed
+#               to admins to /allow or /deny from Telegram. The bot can always reply.
+#
+#   full        all tools, no prompts (launches with --dangerously-skip-permissions).
+#               Only for a trusted single operator running their own instance.
+mode: restricted
+
+# restricted mode only — auto-approved tools (no prompt). Read-only by default.
+allow:
+  - Read
+  - Grep
+  - Glob
+
+# restricted mode only — hard-blocked tools (never even asked). The dangerous set.
+deny:
+  - Bash
+  - Write
+  - Edit
+  - NotebookEdit
+  - WebFetch
+  - WebSearch
+  - Task   # subagents — omit from deny if you want to allow Opus-subagent escalation
+
+# Any tool not in allow or deny prompts the admin (permission relay).

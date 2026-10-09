@@ -1,0 +1,405 @@
+// Package config loads the relay daemon's configuration from a JSON file.
+// JSON (not YAML) keeps the project dependency-free. Secrets (the bot token)
+// are never stored in the file — only the name of the env var that holds them.
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/disgoorg/snowflake/v2"
+
+	"github.com/jeanhaley32/agent-relay/internal/budget"
+)
+
+// Config is the top-level daemon configuration.
+type Config struct {
+	// StateDir is where relayd keeps the state it manages itself — the
+	// admin-device bindings and the contacts directory. Neither belongs to
+	// any one frontend, so neither should be derived from a frontend's
+	// config. Empty means the working directory, which is what the paths
+	// resolved to when they hung off telegram.allowlist_file.
+	StateDir string `json:"state_dir"`
+
+	Telegram   TelegramConfig   `json:"telegram"`
+	Discord    DiscordConfig    `json:"discord"`
+	Matrix     MatrixConfig     `json:"matrix"`
+	Web        WebConfig        `json:"web"`
+	Claude     ClaudeConfig     `json:"claude"`
+	Budget     BudgetConfig     `json:"budget"`
+	Scheduler  SchedulerConfig  `json:"scheduler"`
+	Stylometry StylometryConfig `json:"stylometry"`
+}
+
+// StatePath returns the path for a relayd-managed state file, rooted at
+// StateDir.
+func (c Config) StatePath(name string) string {
+	if c.StateDir == "" {
+		return name
+	}
+	return filepath.Join(c.StateDir, name)
+}
+
+// StylometryConfig configures the optional Qdrant-backed anomaly detector
+// (plugins/stylometry). Plain data only, so this package never imports the
+// detector itself — cmd/relayd wires the two together.
+type StylometryConfig struct {
+	Enabled    bool    `json:"enabled"`
+	QdrantURL  string  `json:"qdrant_url"`
+	Collection string  `json:"collection"`
+	Threshold  float64 `json:"threshold"`
+	WarnChatID string  `json:"warn_chat_id"`
+	LogPath    string  `json:"log_path"`
+}
+
+type SchedulerConfig struct {
+	// File is where reminders are persisted (empty ⇒ "schedules.json"). Relative
+	// paths are resolved against relayd's working directory.
+	File string `json:"file"`
+	// TZ is the timezone cron specs are interpreted in (empty ⇒ host local),
+	// e.g. "America/New_York".
+	TZ string `json:"tz"`
+}
+
+// TelegramConfig configures the Telegram frontend.
+type TelegramConfig struct {
+	// EnabledRaw is a pointer so an omitted key keeps the historical
+	// behaviour — Telegram was mandatory, so every existing config has a
+	// populated block and expects it to run. nil means "enabled if the block
+	// is configured"; an explicit false turns it off. Use Enabled().
+	EnabledRaw *bool `json:"enabled"`
+
+	TokenEnv      string  `json:"token_env"`      // env var holding the bot token
+	Admins        []int64 `json:"admins"`         // ids that may run /handshake (also allowed)
+	Allowlist     []int64 `json:"allowlist"`      // permitted sender user ids
+	AllowlistFile string  `json:"allowlist_file"` // optional: persist approved ids here
+	// PollTimeoutRaw is a pointer for the same reason as
+	// RequireMentionInGuildRaw below: a plain int cannot distinguish "key
+	// omitted" from "operator explicitly chose 0". Zero meant "use the
+	// default", so an operator asking for short polling silently got 30s
+	// long-polling instead. Use PollTimeout() to read the resolved value.
+	PollTimeoutRaw *int `json:"poll_timeout"` // long-poll seconds
+
+	// DeniedLogPath, if set, captures every message attempt from a
+	// non-allowlisted sender (full text, not just id/name) to this JSONL
+	// file. Empty disables it.
+	DeniedLogPath string `json:"denied_log_path"`
+}
+
+// DiscordConfig configures the Discord frontend. Discord is fully optional —
+// a config with only a "telegram" block (as today) keeps working unchanged.
+// See internal/endpoint/discord/DESIGN.md.
+type DiscordConfig struct {
+	// Enabled gates whether relayd starts the Discord frontend at all. An
+	// explicit flag rather than "block present with non-empty admins" —
+	// per DESIGN.md — because an all-zero-value
+	// DiscordConfig{} is otherwise indistinguishable from "block omitted"
+	// once JSON-unmarshaled. Fail-closed default (false): no config block
+	// (or an empty one) means the frontend goroutine never exists, not
+	// "started with an empty allowlist that denies everyone" — see
+	// DESIGN.md's fail-closed-defaults checklist item.
+	Enabled bool `json:"enabled"`
+
+	TokenEnv string `json:"token_env"` // env var holding the bot token
+
+	// Admins/Allowlist hold Discord snowflake ids. They're strings in JSON
+	// (not numbers) because a snowflake is a 64-bit value and JSON numbers
+	// are conventionally parsed as float64 by generic tooling — an operator
+	// hand-editing this file could silently lose precision. Discord's own
+	// API returns snowflakes as strings for the same reason. See DESIGN.md.
+	Admins        []string `json:"admins"`         // ids that may run admin commands (also allowed)
+	Allowlist     []string `json:"allowlist"`      // permitted sender user ids
+	AllowlistFile string   `json:"allowlist_file"` // optional: persist approved ids here
+
+	// AllowGuildMessages/AllowedGuildIDs/RequireMentionInGuild are
+	// Discord-specific (no Telegram concept of a guild). Default is the
+	// narrowest posture: DM-only, no guild intents requested at all — see
+	// internal/endpoint/discord DESIGN.md.
+	AllowGuildMessages bool     `json:"allow_guild_messages"`
+	AllowedGuildIDs    []string `json:"allowed_guild_ids"`
+
+	// RequireMentionInGuildRaw is a pointer so applyDefaults can tell "field
+	// omitted from JSON" (nil) apart from "operator explicitly set false"
+	// (non-nil, false) — a plain bool's zero value is indistinguishable from
+	// an explicit false, which previously meant wiring
+	// WithRequireMentionInGuild(cfg.Discord.RequireMentionInGuild) silently
+	// flipped the guild policy fail-open (ambient/unmentioned guild chatter
+	// relayable) even though DESIGN.md and config.example.json document
+	// the default as true. Use RequireMentionInGuild() to read the resolved
+	// value.
+	RequireMentionInGuildRaw *bool `json:"require_mention_in_guild"`
+}
+
+// Enabled resolves whether relayd should start the Telegram frontend. An
+// omitted key means "yes if this block names anyone", which preserves the
+// behaviour from when Telegram was mandatory; an explicit false turns it off
+// even with a populated block.
+func (t TelegramConfig) Enabled() bool {
+	if t.EnabledRaw != nil {
+		return *t.EnabledRaw
+	}
+	return len(t.Admins) > 0 || len(t.Allowlist) > 0
+}
+
+// PollTimeout resolves the effective long-poll timeout: the configured value
+// if the operator set one (including an explicit 0), else the default.
+func (t TelegramConfig) PollTimeout() int {
+	if t.PollTimeoutRaw == nil {
+		return DefaultPollTimeout
+	}
+	return *t.PollTimeoutRaw
+}
+
+// RequireMentionInGuild resolves the effective value: the configured value
+// if the operator set one, else the documented default (true). Call after
+// Load (which runs applyDefaults), or directly — both are safe since this
+// resolves the default itself rather than depending on applyDefaults having
+// mutated anything.
+func (d DiscordConfig) RequireMentionInGuild() bool {
+	if d.RequireMentionInGuildRaw == nil {
+		return true
+	}
+	return *d.RequireMentionInGuildRaw
+}
+
+// MatrixConfig configures the optional Matrix frontend — Jean's private,
+// tailnet-only admin channel via a self-hosted homeserver. Like Discord it is
+// fully optional and fail-closed: Enabled=false (the zero value) means the
+// frontend goroutine never starts. Because the homeserver is reachable only
+// over Tailscale, reachability itself is the authentication, so this path is
+// deliberately exempt from the session/approval gate — see
+// internal/endpoint/matrix. The Admins here are Matrix user ids
+// (e.g. "@admin:example.org"); only their messages are relayed, and they are treated
+// as relay admins (so the group-room from_id!=chat_id lockdown doesn't fire).
+type MatrixConfig struct {
+	Enabled       bool   `json:"enabled"`
+	HomeserverURL string `json:"homeserver_url"` // e.g. https://host.example.ts.net:8448
+	TokenEnv      string `json:"token_env"`      // env var holding the bot access token
+	// AllowNonTailnetHomeserver disables the startup check that the
+	// homeserver is only reachable over the tailnet. The Matrix path is
+	// exempt from the session and approval gates on exactly that basis, so
+	// turning this on removes the last control. Deliberate escape hatch;
+	// relayd logs loudly when it is set.
+	AllowNonTailnetHomeserver bool `json:"allow_non_tailnet_homeserver"`
+
+	Admins []string `json:"admins"` // Matrix user ids whose messages are relayed
+	// MediaSpool is a directory where inbound media (images/audio/video/files)
+	// are downloaded so the backend can open them. Empty ⇒ media is surfaced as
+	// a text note but not downloaded. Relative paths resolve against relayd's
+	// working directory.
+	MediaSpool string `json:"media_spool"`
+	// ReceiptRoom is a room id to send scheduler ack receipts to instead of
+	// fanning them out to every admin on every frontend. Receipts are audit
+	// chatter, not escalations, and fanning them meant the admin room filled
+	// with machine output and stopped being usable for conversation. Empty ⇒
+	// receipts keep going to the admin fan-out.
+	ReceiptRoom string `json:"receipt_room"`
+}
+
+// WebConfig configures the optional self-hosted web frontend (a browser chat
+// pane, e.g. in vessel-writer). Like Matrix it is fully optional and
+// fail-closed: Enabled=false (the zero value) means the server never starts.
+// The page is reachable only over the tailnet, and every request is verified by
+// `tailscale whois` against TailnetOwner, so reachability + whois is the
+// authentication — this path is deliberately exempt from the session/approval
+// gate (its ConvID is NOT added to SessionGatedUsers) exactly like Matrix. The
+// single ConvID is treated as chat_id AND from_id (a 1:1 channel) and is
+// registered as a relay admin.
+type WebConfig struct {
+	Enabled      bool   `json:"enabled"`
+	ListenAddr   string `json:"listen_addr"`   // localhost bind, e.g. 127.0.0.1:8792 (nginx proxies it)
+	ConvID       string `json:"conv_id"`       // the channel's chat_id == from_id, e.g. "web-jean"
+	FromName     string `json:"from_name"`     // display name for the sender, e.g. "Jean"
+	TailnetOwner string `json:"tailnet_owner"` // required whois LoginName, e.g. you@example.com
+}
+
+// AdminIDs parses Discord.Admins as snowflake ids, returning a clear error on
+// a malformed entry rather than silently dropping it.
+func (d DiscordConfig) AdminIDs() ([]snowflake.ID, error) {
+	return parseSnowflakes("discord.admins", d.Admins)
+}
+
+// AllowlistIDs parses Discord.Allowlist as snowflake ids.
+func (d DiscordConfig) AllowlistIDs() ([]snowflake.ID, error) {
+	return parseSnowflakes("discord.allowlist", d.Allowlist)
+}
+
+// AllowedGuildSnowflakes parses Discord.AllowedGuildIDs as snowflake ids.
+func (d DiscordConfig) AllowedGuildSnowflakes() ([]snowflake.ID, error) {
+	return parseSnowflakes("discord.allowed_guild_ids", d.AllowedGuildIDs)
+}
+
+func parseSnowflakes(field string, raw []string) ([]snowflake.ID, error) {
+	ids := make([]snowflake.ID, 0, len(raw))
+	for _, s := range raw {
+		id, err := snowflake.Parse(s)
+		if err != nil {
+			return nil, fmt.Errorf("%s: invalid snowflake %q: %w", field, s, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// ClaudeConfig configures the Claude backend.
+type ClaudeConfig struct {
+	Socket string `json:"socket"` // unix socket the shim connects to
+}
+
+// BudgetConfig configures the rate limit / circuit breaker.
+type BudgetConfig struct {
+	Tier string `json:"tier"` // free|pro|max5|max20
+
+	// ConversationCaps optionally bounds cumulative estimated tokens for a
+	// specific conversation (keyed by chat_id, matching relay.Message's
+	// ConversationID/Meta["chat_id"]) - independent of and tighter than the
+	// global Tier budget. For a specific untrusted or resource-testing
+	// contact (e.g. an allowlisted but non-admin user) rather than the
+	// whole relay. Once a conversation's cumulative usage reaches its cap,
+	// further inbound messages from it are dropped before ever reaching
+	// the backend, so no more inference tokens are spent on it at all -
+	// see Broker.conversationCapExceeded's doc comment in relay.go.
+	ConversationCaps map[string]int64 `json:"conversation_caps,omitempty"`
+
+	// DefaultConversationCap, if > 0, applies to any conversation NOT
+	// explicitly listed in ConversationCaps and not an admin - a blanket
+	// per-individual cap for arbitrary allowlisted, non-admin contacts,
+	// rather than requiring every one to be added by hand.
+	DefaultConversationCap int64 `json:"default_conversation_cap,omitempty"`
+}
+
+// Defaults applied when fields are omitted.
+const (
+	DefaultTokenEnv        = "TELEGRAM_BOT_TOKEN"
+	DefaultPollTimeout     = 30
+	DefaultTier            = "pro"
+	DefaultDiscordTokenEnv = "DISCORD_BOT_TOKEN"
+)
+
+// defaultSocket prefers the per-user runtime dir ($XDG_RUNTIME_DIR, mode 0700)
+// so the IPC socket isn't in world-accessible /tmp; falls back to /tmp when it's
+// unset (the socket itself is chmod 0600 either way).
+func defaultSocket() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "agent-relay.sock")
+	}
+	return "/tmp/agent-relay.sock"
+}
+
+// Load reads and validates a config file, applying defaults.
+func Load(path string) (*Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var c Config
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	c.applyDefaults()
+	if err := c.validate(); err != nil {
+		return nil, fmt.Errorf("invalid config %s: %w", path, err)
+	}
+	return &c, nil
+}
+
+// validate checks the config after defaults are applied and returns a clear
+// error rather than letting a mistake surface as confusing downstream behavior.
+func (c *Config) validate() error {
+	// Telegram's own error comes first when the block looks like an attempt
+	// to configure it, so "you forgot the admins" beats the vaguer "nothing
+	// is enabled" for the operator who was clearly setting up Telegram.
+	// TokenEnv is deliberately not a signal here: applyDefaults fills it in,
+	// so it is never empty and cannot distinguish intent. Naming people, or
+	// saying enabled explicitly, is what shows the operator meant Telegram.
+	telegramConfigured := c.Telegram.EnabledRaw != nil ||
+		len(c.Telegram.Admins) > 0 || len(c.Telegram.Allowlist) > 0
+	telegramNotDisabled := c.Telegram.EnabledRaw == nil || *c.Telegram.EnabledRaw
+	if telegramConfigured && telegramNotDisabled && len(c.Telegram.Admins) == 0 && len(c.Telegram.Allowlist) == 0 {
+		return fmt.Errorf("telegram: enabled but no admins or allowlist — the bot would serve nobody; add your Telegram user id to \"admins\", or set telegram.enabled: false")
+	}
+	// At least one way in, or relayd would start and serve nobody.
+	if !c.Telegram.Enabled() && !c.Discord.Enabled && !c.Matrix.Enabled && !c.Web.Enabled {
+		return fmt.Errorf("no frontend is enabled: set one of telegram, discord, matrix or web")
+	}
+	for _, id := range c.Telegram.Admins {
+		if id <= 0 {
+			return fmt.Errorf("telegram.admins: invalid id %d (must be > 0)", id)
+		}
+	}
+	for _, id := range c.Telegram.Allowlist {
+		if id <= 0 {
+			return fmt.Errorf("telegram.allowlist: invalid id %d (must be > 0)", id)
+		}
+	}
+	if _, ok := budget.DefaultTiers[c.Budget.Tier]; !ok {
+		return fmt.Errorf("budget.tier %q is unknown (want one of: free, pro, max5, max20)", c.Budget.Tier)
+	}
+	if c.Telegram.PollTimeoutRaw != nil && *c.Telegram.PollTimeoutRaw < 0 {
+		return fmt.Errorf("telegram.poll_timeout must be >= 0")
+	}
+	if c.Claude.Socket == "" {
+		return fmt.Errorf("claude.socket must not be empty")
+	}
+	if c.Discord.Enabled {
+		if len(c.Discord.Admins) == 0 && len(c.Discord.Allowlist) == 0 {
+			return fmt.Errorf("discord: enabled but no admins or allowlist — the bot would serve nobody; add your Discord user id to \"admins\"")
+		}
+		if _, err := c.Discord.AdminIDs(); err != nil {
+			return err
+		}
+		if _, err := c.Discord.AllowlistIDs(); err != nil {
+			return err
+		}
+		if _, err := c.Discord.AllowedGuildSnowflakes(); err != nil {
+			return err
+		}
+		// allow_guild_messages=true with an empty allowed_guild_ids is
+		// deliberately NOT rejected here: it's a valid (if inert) config —
+		// fail-closed means every guild is denied until at least one is
+		// listed, not that the combination itself is invalid. See
+		// DESIGN.md.
+	}
+	return nil
+}
+
+func (c *Config) applyDefaults() {
+	if c.Telegram.TokenEnv == "" {
+		c.Telegram.TokenEnv = DefaultTokenEnv
+	}
+	// PollTimeout resolves its own default; nothing to do here.
+	if c.Claude.Socket == "" {
+		c.Claude.Socket = defaultSocket()
+	}
+	if c.Budget.Tier == "" {
+		c.Budget.Tier = DefaultTier
+	}
+	if c.Scheduler.File == "" {
+		c.Scheduler.File = "schedules.json"
+	}
+	if c.Discord.Enabled && c.Discord.TokenEnv == "" {
+		c.Discord.TokenEnv = DefaultDiscordTokenEnv
+	}
+}
+
+// Token resolves the Telegram bot token from the configured env var.
+func (c *Config) Token() (string, error) {
+	v := os.Getenv(c.Telegram.TokenEnv)
+	if v == "" {
+		return "", fmt.Errorf("bot token env %s is not set", c.Telegram.TokenEnv)
+	}
+	return v, nil
+}
+
+// DiscordToken resolves the Discord bot token from the configured env var —
+// same convention as Token(), extended for the second frontend rather than
+// inventing a new one (DESIGN.md).
+func (c *Config) DiscordToken() (string, error) {
+	v := os.Getenv(c.Discord.TokenEnv)
+	if v == "" {
+		return "", fmt.Errorf("discord bot token env %s is not set", c.Discord.TokenEnv)
+	}
+	return v, nil
+}

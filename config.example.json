@@ -1,0 +1,48 @@
+{
+  "state_dir": "",
+  "telegram": {
+    "enabled": true,
+    "token_env": "TELEGRAM_BOT_TOKEN",
+    "admins": [
+      123456789
+    ],
+    "allowlist": [],
+    "allowlist_file": "allowlist.json",
+    "poll_timeout": 30
+  },
+  "discord": {
+    "enabled": false,
+    "token_env": "DISCORD_BOT_TOKEN",
+    "admins": [
+      "123456789012345678"
+    ],
+    "allowlist": [],
+    "allowlist_file": "discord_allowlist.json",
+    "allow_guild_messages": false,
+    "allowed_guild_ids": [],
+    "require_mention_in_guild": true
+  },
+  "matrix": {
+    "enabled": false,
+    "homeserver_url": "https://matrix.example.org:8448",
+    "token_env": "MATRIX_ACCESS_TOKEN",
+    "admins": [
+      "@admin:example.org"
+    ],
+    "media_spool": "matrix-media"
+  },
+  "web": {
+    "enabled": false,
+    "listen_addr": "127.0.0.1:8792",
+    "conv_id": "web-user",
+    "from_name": "You",
+    "tailnet_owner": "you@example.com"
+  },
+  "claude": {
+    "socket": "/tmp/agent-relay.sock"
+  },
+  "budget": {
+    "tier": "max5",
+    "conversation_caps": {}
+  }
+}

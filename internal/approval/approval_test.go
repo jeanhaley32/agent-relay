@@ -1,0 +1,258 @@
+package approval
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+	"time"
+)
+
+func TestApprovalFlow(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	reqSrv := httptest.NewServer(m.RequestHandler())
+	defer reqSrv.Close()
+	appSrv := httptest.NewServer(m.ApproveHandler())
+	defer appSrv.Close()
+
+	// Create a request.
+	resp, err := http.PostForm(reqSrv.URL+"/request", url.Values{"desc": {"restart relayd"}})
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	var created struct{ Token, Link string }
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
+	if created.Token == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	// Status should be pending.
+	statusResp, err := http.Get(reqSrv.URL + "/status/" + created.Token)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	var st struct{ Status string }
+	_ = json.NewDecoder(statusResp.Body).Decode(&st)
+	statusResp.Body.Close()
+	if st.Status != "pending" {
+		t.Fatalf("status = %q, want pending", st.Status)
+	}
+
+	// Approve via the tailnet-side handler.
+	approveResp, err := http.PostForm(appSrv.URL+"/approve/"+created.Token, url.Values{"decision": {"approve"}})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	approveResp.Body.Close()
+
+	// Status should now be approved.
+	statusResp2, err := http.Get(reqSrv.URL + "/status/" + created.Token)
+	if err != nil {
+		t.Fatalf("status2: %v", err)
+	}
+	var st2 struct{ Status string }
+	_ = json.NewDecoder(statusResp2.Body).Decode(&st2)
+	statusResp2.Body.Close()
+	if st2.Status != "approved" {
+		t.Fatalf("status = %q, want approved", st2.Status)
+	}
+
+	// A second decision on the same token must not flip it.
+	approveResp2, err := http.PostForm(appSrv.URL+"/approve/"+created.Token, url.Values{"decision": {"deny"}})
+	if err != nil {
+		t.Fatalf("second approve: %v", err)
+	}
+	approveResp2.Body.Close()
+	statusResp3, _ := http.Get(reqSrv.URL + "/status/" + created.Token)
+	var st3 struct{ Status string }
+	_ = json.NewDecoder(statusResp3.Body).Decode(&st3)
+	statusResp3.Body.Close()
+	if st3.Status != "approved" {
+		t.Fatalf("status changed after second decision: %q", st3.Status)
+	}
+}
+
+func TestRequestHandlerActionHashBinding(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	reqSrv := httptest.NewServer(m.RequestHandler())
+	defer reqSrv.Close()
+
+	// Create a request through the public HTTP surface with an action_hash
+	// form value, mirroring how a real caller binds a token to an action.
+	resp, err := http.PostForm(reqSrv.URL+"/request", url.Values{
+		"desc":        {"delete message 42"},
+		"action_hash": {"del:42"},
+	})
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	var created struct{ Token, Link string }
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
+	if created.Token == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	m.mu.Lock()
+	m.pending[created.Token].status = StatusApproved
+	m.mu.Unlock()
+
+	// A mismatched action_hash must be rejected even though the token is
+	// approved, proving the HTTP-created token carried the binding through.
+	if st, ok := m.Consume(created.Token, "del:99"); !ok || st == StatusApproved {
+		t.Fatalf("mismatched consume: status=%q ok=%v, want non-approved/true", st, ok)
+	}
+	// The bound action_hash must still work.
+	if st, ok := m.Consume(created.Token, "del:42"); !ok || st != StatusApproved {
+		t.Fatalf("bound consume: status=%q ok=%v, want approved/true", st, ok)
+	}
+}
+
+func TestStatusIsNonConsumingPeek(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("delete message 42", "del:42", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	// Status is documented as a read-only peek - calling it repeatedly on an
+	// approved token must not consume the decision.
+	for i := 0; i < 3; i++ {
+		st, ok := m.Status(token)
+		if !ok || st != StatusApproved {
+			t.Fatalf("Status call %d: status=%q ok=%v, want approved/true", i, st, ok)
+		}
+	}
+
+	// Consume must still succeed after repeated Status peeks.
+	st, ok := m.Consume(token, "del:42")
+	if !ok || st != StatusApproved {
+		t.Fatalf("consume after peeks: status=%q ok=%v, want approved/true", st, ok)
+	}
+}
+
+func TestConsumeOneShot(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("delete message 42", "del:42", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	st, ok := m.Consume(token, "del:42")
+	if !ok || st != StatusApproved {
+		t.Fatalf("first consume: status=%q ok=%v, want approved/true", st, ok)
+	}
+
+	// A second consume of the same approval must not succeed - one
+	// approval authorizes exactly one action.
+	st2, ok2 := m.Consume(token, "del:42")
+	if !ok2 || st2 == StatusApproved {
+		t.Fatalf("second consume: status=%q ok=%v, want non-approved/true (replay must be rejected)", st2, ok2)
+	}
+}
+
+func TestConsumeActionMismatch(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("delete message 42", "del:42", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	// Approval was bound to del:42 - presenting a different action hash
+	// (e.g. an attacker substituting a different target) must be rejected.
+	st, ok := m.Consume(token, "del:99")
+	if !ok || st == StatusApproved {
+		t.Fatalf("mismatched consume: status=%q ok=%v, want non-approved/true", st, ok)
+	}
+
+	// The original action hash must still work - the mismatched attempt
+	// above must not have consumed or corrupted the token.
+	st2, ok2 := m.Consume(token, "del:42")
+	if !ok2 || st2 != StatusApproved {
+		t.Fatalf("correct consume after mismatch: status=%q ok=%v, want approved/true", st2, ok2)
+	}
+}
+
+func TestConsumeUnboundToken(t *testing.T) {
+	// Tokens created via the plain Create (empty actionHash) accept any
+	// actionHash at Consume time - existing unbound callers keep working.
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("legacy caller", "", time.Minute)
+
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	st, ok := m.Consume(token, "anything")
+	if !ok || st != StatusApproved {
+		t.Fatalf("unbound consume: status=%q ok=%v, want approved/true", st, ok)
+	}
+}
+
+func TestApprovalExpiry(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	token, _ := m.create("expires fast", "", 1*time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	req, ok := m.get(token)
+	if !ok {
+		t.Fatal("expected token to still be tracked (not yet gc'd)")
+	}
+	if req.status != StatusExpired {
+		t.Fatalf("status = %q, want expired", req.status)
+	}
+}
+
+func TestUnknownToken(t *testing.T) {
+	m := NewManager("http://tailnet.example")
+	appSrv := httptest.NewServer(m.ApproveHandler())
+	defer appSrv.Close()
+	resp, err := http.Get(appSrv.URL + "/approve/doesnotexist")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// An approval that is never consumed must stop being good at its deadline.
+// Previously only StatusPending was converted to Expired, so a request
+// approved at t=9m of a 10m TTL stayed consumable until gc deleted it at
+// expires+10m — a 2x authorization window that contradicted Status's own doc
+// comment.
+func TestApprovedButUnconsumedExpiresAtDeadline(t *testing.T) {
+	m := NewManager("http://example.invalid")
+	token, _ := m.CreateBound("do the risky thing", "hash-1", 40*time.Millisecond)
+
+	// Same shortcut the other tests use rather than driving the HTTP handler.
+	m.mu.Lock()
+	m.pending[token].status = StatusApproved
+	m.mu.Unlock()
+
+	if st, _ := m.Status(token); st != StatusApproved {
+		t.Fatalf("before the deadline: status %q, want approved", st)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	if st, _ := m.Status(token); st != StatusExpired {
+		t.Fatalf("past the deadline: Status returned %q, want expired", st)
+	}
+	st, ok := m.Consume(token, "hash-1")
+	if !ok {
+		t.Fatal("Consume should still find the request")
+	}
+	if st == StatusApproved {
+		t.Fatal("Consume authorized an approval that was past its deadline")
+	}
+}

@@ -1,0 +1,425 @@
+package scheduler
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// rewriteFireAt backdates a one-shot's FireAt directly on disk to simulate the
+// process being down past its fire time.
+func rewriteFireAt(t *testing.T, path, id string, at time.Time) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var items []*Schedule
+	if err := json.Unmarshal(b, &items); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, sc := range items {
+		if sc.ID == id {
+			sc.FireAt = at
+		}
+	}
+	out, _ := json.MarshalIndent(items, "", "  ")
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// collector records deliveries.
+type collector struct {
+	mu   sync.Mutex
+	got  []string
+	fire chan struct{}
+}
+
+func newCollector() *collector { return &collector{fire: make(chan struct{}, 8)} }
+func (c *collector) deliver(scheduleID, chatID, text string) error {
+	c.mu.Lock()
+	c.got = append(c.got, chatID+"|"+text)
+	c.mu.Unlock()
+	c.fire <- struct{}{}
+	return nil
+}
+func (c *collector) count() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.got) }
+
+func newTestSched(t *testing.T, c *collector) *Scheduler {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sched.json")
+	s, err := New(path, time.UTC, c.deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	t.Cleanup(s.Close)
+	return s
+}
+
+// TestOneShotFires: a short-delay one-shot fires once and is then forgotten.
+func TestOneShotFires(t *testing.T) {
+	c := newCollector()
+	s := newTestSched(t, c)
+	if _, err := s.Create("do pushups", "", 40*time.Millisecond, "42"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	select {
+	case <-c.fire:
+	case <-time.After(2 * time.Second):
+		t.Fatal("one-shot never fired")
+	}
+	if got := c.got[0]; got != "42|do pushups" {
+		t.Fatalf("wrong delivery: %q", got)
+	}
+	// After firing, it should be gone from the set.
+	if n := len(s.List()); n != 0 {
+		t.Fatalf("one-shot not removed after firing: %d left", n)
+	}
+}
+
+// TestCreateValidation rejects bad input and a malformed cron spec.
+func TestCreateValidation(t *testing.T) {
+	c := newCollector()
+	s := newTestSched(t, c)
+	cases := []struct {
+		name, text, cron string
+		in               time.Duration
+	}{
+		{"empty text", "", "", time.Minute},
+		{"neither cron nor delay", "hi", "", 0},
+		{"both cron and delay", "hi", "0 9 * * *", time.Minute},
+		{"bad cron", "hi", "not a cron", 0},
+	}
+	for _, tc := range cases {
+		if _, err := s.Create(tc.text, tc.cron, tc.in, "1"); err == nil {
+			t.Errorf("%s: expected error, got nil", tc.name)
+		}
+	}
+	// A valid daily cron is accepted and has a future next-fire.
+	sc, err := s.Create("stretch", "0 9 * * *", 0, "1")
+	if err != nil {
+		t.Fatalf("valid cron rejected: %v", err)
+	}
+	if next := s.Next(sc); !next.After(time.Now()) {
+		t.Fatalf("cron next-fire not in the future: %v", next)
+	}
+}
+
+// TestCancel disarms a schedule so it never fires.
+func TestCancel(t *testing.T) {
+	c := newCollector()
+	s := newTestSched(t, c)
+	sc, _ := s.Create("later", "", 200*time.Millisecond, "7")
+	if !s.Cancel(sc.ID) {
+		t.Fatal("cancel returned false for a live schedule")
+	}
+	if s.Cancel(sc.ID) {
+		t.Fatal("second cancel should return false")
+	}
+	time.Sleep(400 * time.Millisecond)
+	if n := c.count(); n != 0 {
+		t.Fatalf("cancelled schedule still fired (%d)", n)
+	}
+}
+
+// TestPersistReload: a recurring schedule survives a restart (reload from disk).
+func TestPersistReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c1 := newCollector()
+	s1, err := New(path, time.UTC, c1.deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new1: %v", err)
+	}
+	sc, _ := s1.Create("weekly review", "0 9 * * 1", 0, "9")
+	s1.Close()
+
+	c2 := newCollector()
+	s2, err := New(path, time.UTC, c2.deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new2: %v", err)
+	}
+	defer s2.Close()
+	list := s2.List()
+	if len(list) != 1 || list[0].ID != sc.ID || list[0].Cron != "0 9 * * 1" {
+		t.Fatalf("recurring schedule did not survive reload: %+v", list)
+	}
+}
+
+// TestMissedOneShotFiresOnLoad: a one-shot whose FireAt already passed while the
+// process was down fires shortly after reload instead of being lost.
+func TestMissedOneShotFiresOnLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c1 := newCollector()
+	s1, err := New(path, time.UTC, c1.deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new1: %v", err)
+	}
+	// Create a one-shot far enough out that it won't fire before we close.
+	sc, _ := s1.Create("missed me", "", time.Hour, "5")
+	s1.Close()
+
+	// Simulate downtime past the fire time by backdating FireAt on disk.
+	rewriteFireAt(t, path, sc.ID, time.Now().Add(-time.Minute))
+
+	c2 := newCollector()
+	s2, err := New(path, time.UTC, c2.deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new2: %v", err)
+	}
+	defer s2.Close()
+	select {
+	case <-c2.fire:
+	case <-time.After(2 * time.Second):
+		t.Fatal("missed one-shot did not fire on load")
+	}
+}
+
+// failingCollector's deliver always errors, simulating a durable-persist
+// failure so fire() must keep the one-shot schedule intact for retry instead
+// of deleting it.
+type failingCollector struct {
+	mu    sync.Mutex
+	calls int
+	fire  chan struct{}
+}
+
+func newFailingCollector() *failingCollector {
+	return &failingCollector{fire: make(chan struct{}, 8)}
+}
+
+func (c *failingCollector) deliver(scheduleID, chatID, text string) error {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	c.fire <- struct{}{}
+	return errors.New("simulated deliver failure")
+}
+
+func (c *failingCollector) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestFireKeepsScheduleOnDeliverError: when deliver returns an error, the
+// one-shot schedule must survive (not be deleted) rather than silently
+// losing the event. A one-shot's timer has already fired and is not
+// re-armed in-process on this error path, so it only actually retries if
+// the scheduler restarts and reloads it (load re-arms missed one-shots);
+// this test only asserts the schedule isn't lost, not that it re-fires.
+func TestFireKeepsScheduleOnDeliverError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newFailingCollector()
+	s, err := New(path, time.UTC, c.deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	sc, err := s.Create("do pushups", "", 40*time.Millisecond, "42")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	select {
+	case <-c.fire:
+	case <-time.After(2 * time.Second):
+		t.Fatal("one-shot never attempted delivery")
+	}
+
+	// Give fire() a moment to finish its post-deliver bookkeeping.
+	time.Sleep(50 * time.Millisecond)
+
+	list := s.List()
+	if len(list) != 1 || list[0].ID != sc.ID {
+		t.Fatalf("schedule was removed despite deliver error: %+v", list)
+	}
+}
+
+// externalCollector records ExternalFunc calls (file-watch-detected schedules).
+type externalCollector struct {
+	mu  sync.Mutex
+	got []struct {
+		sc   Schedule
+		kind string
+	}
+	seen chan struct{}
+}
+
+func newExternalCollector() *externalCollector {
+	return &externalCollector{seen: make(chan struct{}, 8)}
+}
+func (e *externalCollector) onExternal(sc *Schedule, kind string) {
+	e.mu.Lock()
+	e.got = append(e.got, struct {
+		sc   Schedule
+		kind string
+	}{*sc, kind})
+	e.mu.Unlock()
+	e.seen <- struct{}{}
+}
+func (e *externalCollector) last() (Schedule, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n := len(e.got)
+	return e.got[n-1].sc, e.got[n-1].kind
+}
+
+// TestFileWatchArmsExternallyAddedSchedule: a schedule hand-appended to
+// schedules.json while the process is running gets armed and tagged
+// Source=file, and the ExternalFunc hook fires with kind="added" — without
+// any restart.
+func TestFileWatchArmsExternallyAddedSchedule(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newCollector()
+	ext := newExternalCollector()
+	s, err := New(path, time.UTC, c.deliver, ext.onExternal, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	// Seed the file with one schedule the running process never created.
+	hand := []*Schedule{{
+		ID:     "hand-added-1",
+		Text:   "hand-added reminder",
+		FireAt: time.Now().Add(time.Hour), // far enough out it won't fire mid-test
+		ChatID: "99",
+	}}
+	b, _ := json.MarshalIndent(hand, "", "  ")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	select {
+	case <-ext.seen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("file watch never detected the hand-added schedule")
+	}
+
+	sc, kind := ext.last()
+	if kind != "added" {
+		t.Fatalf("kind = %q, want added", kind)
+	}
+	if sc.Source != SourceFile {
+		t.Fatalf("Source = %q, want %q", sc.Source, SourceFile)
+	}
+
+	list := s.List()
+	if len(list) != 1 || list[0].ID != "hand-added-1" {
+		t.Fatalf("hand-added schedule not armed in memory: %+v", list)
+	}
+	if got := s.OutOfBandCount(); got != 1 {
+		t.Fatalf("OutOfBandCount() = %d, want 1", got)
+	}
+}
+
+// TestFileWatchIgnoresOwnSaves: Create() (which calls save() internally)
+// must not trigger a spurious ExternalFunc call — the watcher's diff should
+// find nothing new, since the file it re-reads matches what's already armed.
+func TestFileWatchIgnoresOwnSaves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newCollector()
+	ext := newExternalCollector()
+	s, err := New(path, time.UTC, c.deliver, ext.onExternal, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := s.Create("normal reminder", "", time.Hour, "1"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	select {
+	case <-ext.seen:
+		t.Fatal("ExternalFunc fired for a tool-created schedule's own save()")
+	case <-time.After(600 * time.Millisecond):
+		// expected: no external notification for our own write
+	}
+}
+
+// TestFileWatchDoesNotDisarmOnExternalRemoval: an id present in memory but
+// missing from a hand-edited file must stay armed — a hand-edit must never
+// be able to silently kill a running schedule.
+func TestFileWatchDoesNotDisarmOnExternalRemoval(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.json")
+	c := newCollector()
+	ext := newExternalCollector()
+	s, err := New(path, time.UTC, c.deliver, ext.onExternal, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer s.Close()
+
+	sc, err := s.Create("do not lose me", "", time.Hour, "1")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Hand-edit the file down to an empty array, simulating an external wipe.
+	if err := os.WriteFile(path, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Give the debounced watcher time to react (or not).
+	time.Sleep(600 * time.Millisecond)
+
+	list := s.List()
+	if len(list) != 1 || list[0].ID != sc.ID {
+		t.Fatalf("schedule was disarmed by an external file edit: %+v", list)
+	}
+}
+
+// A one-shot whose delivery fails used to be orphaned: its timer had already
+// fired and nothing re-armed it, so the reminder was never delivered for the
+// rest of the process lifetime while List() still showed it pending. A briefly
+// unavailable backend socket is enough to trigger it.
+func TestOneShotRetriesAfterFailedDelivery(t *testing.T) {
+	var attempts int32
+	failed := make(chan struct{})
+
+	deliver := func(scheduleID, chatID, text string) error {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			close(failed)
+			return errors.New("backend socket unavailable")
+		}
+		return nil
+	}
+	s, err := New(filepath.Join(t.TempDir(), "sched.json"), time.UTC, deliver, nil, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	sc, err := s.Create("the reminder", "", 40*time.Millisecond, "42")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := sc.ID
+
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first delivery never attempted")
+	}
+	// Let fire() finish re-arming after deliver returned.
+	time.Sleep(100 * time.Millisecond)
+
+	s.mu.Lock()
+	_, stillThere := s.items[id]
+	_, armed := s.timers[id]
+	s.mu.Unlock()
+
+	if !stillThere {
+		t.Fatal("schedule was dropped after a failed delivery")
+	}
+	if !armed {
+		t.Fatal("schedule left with no timer: it would never retry in this process")
+	}
+}

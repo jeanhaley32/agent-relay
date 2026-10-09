@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "channel-spike": {
+      "command": "./bin/channel-spike",
+      "args": []
+    },
+    "relay": {
+      "command": "./bin/relay-shim",
+      "args": [
+        "--socket",
+        "/tmp/agent-relay.sock"
+      ]
+    },
+    "writer": {
+      "command": "/path/to/writer-mcp",
+      "args": [
+        "-base",
+        "http://127.0.0.1:8791"
+      ]
+    }
+  }
+}

@@ -1,0 +1,57 @@
+# Go build artifacts
+/bin/
+*.exe
+*.test
+*.out
+*.prof
+
+# Local env / secrets (tokens, bot creds) — never commit
+.env
+*.local
+/config.local.*
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+config.json
+
+# relay-managed dynamic allowlist (may contain user ids)
+allowlist.json
+
+# runtime logs
+*.log
+
+# operator security profile + generated Claude settings
+security.yaml
+.claude/settings.json
+
+# relay-managed scheduled reminders (may contain user text/ids)
+schedules.json
+schedules.json.events
+
+# runtime session-id capture for ops/reboot-relay-safe.sh (per-boot artifact, not source)
+.relay_session_id
+__pycache__/
+/relay-shim
+
+# Message audit trail: contains chat_id/from_id, never commit
+relay-events.jsonl
+
+# Msgstore fallback spool: full message content while Kafka is unreachable, never commit
+relay-messages.spool
+
+# Matrix inbound media spool (downloaded files, not source)
+matrix-media/
+
+# relay-managed Telegram update offset (runtime state, not source)
+telegram_offset
+
+# Live state containing real chat ids and device bindings. Never committed:
+# the public history was rewritten on 2026-09-22 to scrub exactly these.
+adminbind.json
+contacts.json
+
+# local MCP config carries host paths
+.mcp.json

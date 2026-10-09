@@ -1,0 +1,104 @@
+package command
+
+import "testing"
+
+func TestAdminGating(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Command{Name: "danger", Admin: true, Run: func(Context, []string) string { return "did it" }})
+	r.IsAdmin = func(sender string) bool { return sender == "admin" }
+
+	// Non-admin in a DM (chat==sender) is refused.
+	reply, handled := r.Dispatch(Context{SenderID: "bob", ChatID: "bob"}, "/danger")
+	if !handled || reply == "did it" {
+		t.Fatalf("non-admin should be refused, got %q", reply)
+	}
+
+	// Admin in a DM succeeds.
+	reply, _ = r.Dispatch(Context{SenderID: "admin", ChatID: "admin"}, "/danger")
+	if reply != "did it" {
+		t.Fatalf("admin should be allowed, got %q", reply)
+	}
+
+	// Admin but NOT in a DM (group: chat != sender) is refused.
+	reply, _ = r.Dispatch(Context{SenderID: "admin", ChatID: "group42"}, "/danger")
+	if reply == "did it" {
+		t.Fatalf("admin command must be DM-only, got %q", reply)
+	}
+}
+
+func TestHelpHidesAdminFromNonAdmins(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Command{Name: "danger", Admin: true, Run: func(Context, []string) string { return "" }})
+	r.Register(Command{Name: "safe", Run: func(Context, []string) string { return "" }})
+	r.IsAdmin = func(sender string) bool { return sender == "admin" }
+
+	nonAdmin, _ := r.Dispatch(Context{SenderID: "bob", ChatID: "bob"}, "/help")
+	if contains(nonAdmin, "danger") {
+		t.Fatalf("/help must hide admin commands from non-admins: %q", nonAdmin)
+	}
+	if !contains(nonAdmin, "safe") {
+		t.Fatalf("/help should show non-admin commands: %q", nonAdmin)
+	}
+	admin, _ := r.Dispatch(Context{SenderID: "admin", ChatID: "admin"}, "/help")
+	if !contains(admin, "danger") {
+		t.Fatalf("/help should show admin commands to admins: %q", admin)
+	}
+}
+
+// nil IsAdmin must FAIL CLOSED — admin commands denied when no admin system is
+// wired (a real frontend must set IsAdmin; the demo opts in explicitly).
+func TestNilAdminFailsClosed(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Command{Name: "danger", Admin: true, Run: func(Context, []string) string { return "ok" }})
+	reply, _ := r.Dispatch(Context{}, "/danger")
+	if reply == "ok" {
+		t.Fatalf("nil IsAdmin must fail closed, got %q", reply)
+	}
+}
+
+func TestEscaped(t *testing.T) {
+	cases := []struct {
+		in, out string
+		ok      bool
+	}{
+		{`\/help`, `/help`, true}, // escaped command → unescape + forward to model
+		{`\/tier max5`, `/tier max5`, true},
+		{`/help`, `/help`, false},   // real command → unchanged, not escaped
+		{`hello`, `hello`, false},   // plain text
+		{`\hello`, `\hello`, false}, // backslash not before a slash → not escaped
+	}
+	for _, c := range cases {
+		out, ok := Escaped(c.in)
+		if out != c.out || ok != c.ok {
+			t.Fatalf("Escaped(%q) = (%q, %v), want (%q, %v)", c.in, out, ok, c.out, c.ok)
+		}
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+// Escaped checked the untrimmed text while Dispatch trims first, so a leading
+// space meant neither path handled the escape: Escaped said no, Dispatch saw
+// no leading slash, and the backslash reached the model instead of the literal
+// /command the user was asking for.
+func TestEscapedMatchesDispatchOnLeadingWhitespace(t *testing.T) {
+	for _, in := range []string{`\/foo`, `  \/foo`, "\t\\/foo"} {
+		unescaped, ok := Escaped(in)
+		if !ok {
+			t.Fatalf("Escaped(%q) = false, want true", in)
+		}
+		if unescaped != "/foo" {
+			t.Fatalf("Escaped(%q) unescaped to %q, want %q", in, unescaped, "/foo")
+		}
+	}
+	if _, ok := Escaped("no slash here"); ok {
+		t.Fatal("plain text should not be reported as escaped")
+	}
+}

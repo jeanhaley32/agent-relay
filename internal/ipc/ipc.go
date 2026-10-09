@@ -1,0 +1,143 @@
+// Package ipc defines the tiny wire protocol between the relay daemon and the
+// per-session stdio shim that Claude Code spawns. It is newline-delimited JSON
+// over any io.ReadWriteCloser (in practice a unix-domain socket).
+//
+// Two frame kinds cross the link:
+//
+//	inject  daemon -> shim : push a message into the Claude session
+//	reply   shim  -> daemon: Claude called the reply tool
+//
+// This mirrors the split described in DESIGN.md: the daemon is long-lived and
+// hosts the broker; the shim is a thin bridge Claude Code owns over stdio.
+package ipc
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"io"
+	"sync"
+)
+
+// Kind is the frame type.
+type Kind string
+
+const (
+	KindInject      Kind = "inject"       // daemon -> shim: push a message into the session
+	KindReply       Kind = "reply"        // shim -> daemon: Claude called the reply tool
+	KindReplyAck    Kind = "reply_ack"    // daemon -> shim: outcome of a reply frame (delivered or not)
+	KindPermRequest Kind = "perm_request" // shim -> daemon: Claude wants a tool approved
+	KindPermVerdict Kind = "perm_verdict" // daemon -> shim: allow/deny a pending tool request
+	KindSchedReq    Kind = "sched_req"    // shim -> daemon: a schedule tool was called
+	KindSchedResp   Kind = "sched_resp"   // daemon -> shim: result of a schedule op
+	KindReauthReq   Kind = "reauth_req"   // shim -> daemon: force_reauth tool was called
+	KindReauthResp  Kind = "reauth_resp"  // daemon -> shim: result of a force_reauth op
+)
+
+// Schedule op names carried in Frame.Op for KindSchedReq.
+const (
+	OpScheduleCreate = "create"
+	OpScheduleList   = "list"
+	OpScheduleCancel = "cancel"
+
+	// Pending-event ops (carried in Frame.Op for KindSchedReq): the agent
+	// acknowledges a fired event or lists currently-open events.
+	OpEventAck  = "event_ack"
+	OpEventList = "event_list"
+)
+
+// Frame is one message on the link. Message fields (ChatID/Text/Meta) are used
+// by inject/reply; permission fields (RequestID/Tool/Detail/Allow) by the
+// perm_* kinds.
+type Frame struct {
+	Kind   Kind              `json:"kind"`
+	ChatID string            `json:"chat_id,omitempty"`
+	Text   string            `json:"text,omitempty"`
+	Meta   map[string]string `json:"meta,omitempty"`
+
+	// Permission-relay fields.
+	RequestID string `json:"request_id,omitempty"` // id of the tool-approval request
+	Tool      string `json:"tool,omitempty"`       // tool name (e.g. "Bash")
+	Detail    string `json:"detail,omitempty"`     // human-readable description
+	Allow     bool   `json:"allow,omitempty"`      // verdict (perm_verdict only)
+
+	// Scheduler fields. RequestID doubles as the correlation id matching a
+	// sched_resp to its sched_req; Text/ChatID carry the reminder.
+	Op        string `json:"op,omitempty"`         // create | list | cancel (sched_req)
+	Cron      string `json:"cron,omitempty"`       // recurring cron spec (create)
+	InSeconds int64  `json:"in_seconds,omitempty"` // one-shot delay in seconds (create)
+	SchedID   string `json:"sched_id,omitempty"`   // schedule id (cancel req / create resp)
+	Result    string `json:"result,omitempty"`     // human-readable result (sched_resp / reauth_resp)
+	Err       string `json:"err,omitempty"`        // error text, empty on success (sched_resp / reauth_resp)
+
+	// force_reauth field: the admin user id to re-auth (reauth_req). Empty ⇒
+	// target the requesting conversation (ChatID), which for a 1:1 admin chat
+	// is that admin's own user id.
+	Target string `json:"target,omitempty"`
+}
+
+// Conn is a framed JSON connection. Send is safe for concurrent use; Recv must
+// be called from a single goroutine (one reader).
+type Conn struct {
+	rwc io.ReadWriteCloser
+	sc  *bufio.Scanner
+
+	mu  sync.Mutex // guards enc
+	enc *json.Encoder
+}
+
+// newFrameScanner returns a line scanner bounded at MaxFrameBytes, which is a
+// per-frame cap. io.LimitReader would bound the whole connection instead, so a
+// long-lived socket would simply stop working once it had carried that much.
+func newFrameScanner(r io.Reader) *bufio.Scanner {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), MaxFrameBytes)
+	return sc
+}
+
+// MaxFrameBytes caps how much a single frame may allocate. Defense in depth:
+// the socket is chmod 0600 in a private runtime dir, so only the owner's
+// processes can connect — but an unbounded decoder means any one of them can
+// force the daemon to allocate without limit, and nothing else here would
+// notice. Generous enough for real payloads, which are chat-sized text plus
+// small metadata.
+const MaxFrameBytes = 8 << 20 // 8 MiB
+
+// NewConn wraps a stream (e.g. a unix socket) in the framed protocol.
+func NewConn(rwc io.ReadWriteCloser) *Conn {
+	return &Conn{
+		rwc: rwc,
+		sc:  newFrameScanner(rwc),
+		enc: json.NewEncoder(rwc), // Encode appends '\n' => framing
+	}
+}
+
+// Send writes one frame. Safe for concurrent callers.
+func (c *Conn) Send(f Frame) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.enc.Encode(f)
+}
+
+// Recv reads the next frame, blocking until one arrives or the stream ends
+// (io.EOF). Call from a single goroutine.
+func (c *Conn) Recv() (Frame, error) {
+	var f Frame
+	for {
+		if !c.sc.Scan() {
+			if err := c.sc.Err(); err != nil {
+				return f, err
+			}
+			return f, io.EOF
+		}
+		line := c.sc.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue // tolerate blank lines between frames
+		}
+		err := json.Unmarshal(line, &f)
+		return f, err
+	}
+}
+
+// Close closes the underlying stream.
+func (c *Conn) Close() error { return c.rwc.Close() }
