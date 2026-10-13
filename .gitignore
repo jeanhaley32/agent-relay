@@ -42,6 +42,9 @@ relay-events.jsonl
 # Msgstore fallback spool: full message content while Kafka is unreachable, never commit
 relay-messages.spool
 
+# Msgstore fallback spool: full message content while Kafka is unreachable, never commit
+relay-messages.spool
+
 # Matrix inbound media spool (downloaded files, not source)
 matrix-media/
 
