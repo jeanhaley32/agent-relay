@@ -97,11 +97,18 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	})
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	delivered := 0
 	for ch := range f.clients {
 		select {
 		case ch <- string(payload):
+			delivered++
 		default: // slow/backed-up client — drop this frame rather than block the broker
 		}
+	}
+	// There is no backlog: a frame no open page took is gone. Say so, or the
+	// reply tool reports "sent" for a message nobody will ever see.
+	if delivered == 0 {
+		return fmt.Errorf("web: no open page received the message (%d connected, all backed up or none)", len(f.clients))
 	}
 	return nil
 }

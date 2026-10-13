@@ -670,18 +670,38 @@ func (f *Frontend) KnownConversation(chatID string) bool {
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
-		var permErr error
+		// Precedence: a permanent failure, then a dropped chunk, then a queued
+		// one, so the broker hears the worst outcome for the whole message.
+		var permErr, dropErr, queuedErr error
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
 			if err := f.sendChunk(ctx, cm); err != nil {
 				var perm permanentSendError
-				if errors.As(err, &perm) && permErr == nil {
-					permErr = err
+				var queued relay.QueuedSendError
+				switch {
+				case errors.As(err, &perm):
+					if permErr == nil {
+						permErr = err
+					}
+				case errors.As(err, &queued):
+					if queuedErr == nil {
+						queuedErr = err
+					}
+				default:
+					if dropErr == nil {
+						dropErr = err
+					}
 				}
 			}
 		}
-		return permErr
+		if permErr != nil {
+			return permErr
+		}
+		if dropErr != nil {
+			return dropErr
+		}
+		return queuedErr
 	}
 	return f.sendChunk(ctx, m)
 }
@@ -701,8 +721,10 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 		return err
 	}
 	f.logger.Printf("discord send failed, queuing for background retry: %v", err)
-	f.enqueueRetry(m)
-	return err
+	if !f.enqueueRetry(m) {
+		return fmt.Errorf("discord send failed and the retry queue is full, message dropped: %w", err)
+	}
+	return relay.QueuedSendError{Err: err}
 }
 
 // resolveChannel figures out which physical channel to CreateMessage into
@@ -808,11 +830,13 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 // would stall the whole relay - a bounded, honest failure mode instead of
 // unbounded memory growth or a hung sender. The evicted item is counted in
 // permanentDrops so it's visible on /metrics rather than a silent drop.
-func (f *Frontend) enqueueRetry(m relay.Message) {
+// It reports whether m itself was queued; false means m was dropped.
+func (f *Frontend) enqueueRetry(m relay.Message) bool {
 	item := retryItem{msg: m, attempts: 0, nextAt: time.Now().Add(retryBackoff(0))}
 	select {
 	case f.retryQueue <- item:
 		f.queueDepth.Add(1)
+		return true
 	default:
 		f.logger.Printf("discord retry queue full (%d), dropping oldest to make room", retryQueueCapacity)
 		select {
@@ -824,6 +848,7 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 		select {
 		case f.retryQueue <- item:
 			f.queueDepth.Add(1)
+			return true
 		default:
 			// Still full after making room: this new item is lost, and that
 			// is a permanent drop like any other.
@@ -831,6 +856,7 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 			f.permanentDrops.Add(1)
 		}
 	}
+	return false
 }
 
 func retryBackoff(attempts int) time.Duration {

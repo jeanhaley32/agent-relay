@@ -139,6 +139,27 @@ type PermanentSendError struct{ Err error }
 func (e PermanentSendError) Error() string { return e.Err.Error() }
 func (e PermanentSendError) Unwrap() error { return e.Err }
 
+// QueuedSendError marks a send failure the frontend has already queued for
+// background retry. It is the only failure AckBackendReply reports as
+// delivered-in-due-course: telling the caller about it would invite a resend
+// that duplicates delivery once the retry lands. Any other non-nil error
+// means nothing will deliver the message, so the caller must hear about it.
+// A frontend without a retry queue (Matrix, web) never returns this type, so
+// its failures are honest by default. Queued is not delivered: the retry
+// worker can still give up later, and nothing reports that back to the caller.
+type QueuedSendError struct{ Err error }
+
+func (e QueuedSendError) Error() string { return e.Err.Error() }
+func (e QueuedSendError) Unwrap() error { return e.Err }
+
+// UnconfirmedSendError marks a send whose outcome is unknown: the request may
+// have reached the platform before the error (a timeout or a 5xx after the
+// write). The caller is told so, and that a blind resend may duplicate it.
+type UnconfirmedSendError struct{ Err error }
+
+func (e UnconfirmedSendError) Error() string { return e.Err.Error() }
+func (e UnconfirmedSendError) Unwrap() error { return e.Err }
+
 // Estimator approximates the token cost of a piece of text. The default is a
 // rough chars/4 heuristic; swap in a real tokenizer later.
 type Estimator func(text string) int
@@ -192,8 +213,8 @@ type Broker struct {
 	//
 	Gate Gatekeeper
 
-	// OnBackendReply, if set, fires after a reply is actually delivered -
-	// used to auto-resolve fired triggers. nil ⇒ no hook.
+	// OnBackendReply, if set, fires after a reply is actually delivered.
+	// nil ⇒ no hook.
 	OnBackendReply func(m Message)
 
 	// AckBackendReply, if set, is called after every Frontend.Send attempt
@@ -480,7 +501,25 @@ func (b *Broker) logEvent(m Message, event, detail, errText string) {
 	// This same chokepoint sees inbound, replies, deterministic sends, and
 	// gate-denials, so every message — including probes that never reach the
 	// model — is captured with its body.
-	b.MsgStore.Publish(msgRecord(m, event, detail, errText))
+	r := msgRecord(m, event, detail, errText)
+	if r.Frontend == "" && event != eventlog.Dropped {
+		r.Frontend = b.platformFor(m)
+	}
+	b.MsgStore.Publish(r)
+}
+
+// platformFor resolves the frontend a message without a "platform" tag belongs
+// to. Replies and deterministic sends carry only their ConversationID, the
+// same key Send routes on, so ask the frontend that would route them.
+func (b *Broker) platformFor(m Message) string {
+	switch fe := b.Frontend.(type) {
+	case interface{ PlatformFor(string) string }:
+		return fe.PlatformFor(m.ConversationID)
+	case nil:
+		return ""
+	default:
+		return fe.Name()
+	}
 }
 
 // msgRecord builds the full-content persistence record for a message + event.

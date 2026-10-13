@@ -19,20 +19,22 @@ import (
 	"github.com/jeanhaley32/agent-relay/internal/budget"
 	"github.com/jeanhaley32/agent-relay/internal/command"
 	claudebk "github.com/jeanhaley32/agent-relay/internal/endpoint/claude"
+	"github.com/jeanhaley32/agent-relay/internal/endpoint/matrix"
 	"github.com/jeanhaley32/agent-relay/internal/ipc"
 	"github.com/jeanhaley32/agent-relay/internal/relay"
 	"github.com/jeanhaley32/agent-relay/internal/scheduler"
 )
 
-// TestAckErrTextClassification exercises the permanent-vs-transient
-// classification used by the real AckBackendReply closure: only a
-// relay.PermanentSendError failure should be surfaced back to the reply tool call,
-// so a transient failure that Frontend.Send has already queued for
-// background retry doesn't invite the model to resend and duplicate
-// delivery once the retry lands.
+// TestAckErrTextClassification exercises the classification used by the real
+// AckBackendReply closure. Only a failure the frontend queued for background
+// retry (relay.QueuedSendError) may be reported as delivered; a resend would
+// duplicate it once the retry lands. Any other failure must reach the reply
+// tool call: Matrix has no retry queue, and its "cannot resolve room" errors
+// were reported as "sent" while the messages were lost (2026-10-12).
 func TestAckErrTextClassification(t *testing.T) {
 	permErr := relay.PermanentSendError{Err: errors.New("chat_id is not an allowed destination")}
-	transientErr := errors.New("telegram sendMessage status 500: try again")
+	queuedErr := relay.QueuedSendError{Err: errors.New("telegram sendMessage status 500: try again")}
+	unqueuedErr := errors.New(`matrix send: cannot resolve room for conversation "@admin:example.org"`)
 
 	cases := []struct {
 		name string
@@ -40,8 +42,13 @@ func TestAckErrTextClassification(t *testing.T) {
 		want string
 	}{
 		{"nil error", nil, ""},
-		{"transient error suppressed", transientErr, ""},
+		{"queued for retry suppressed", queuedErr, ""},
+		{"wrapped queued suppressed", errWrap{queuedErr}, ""},
+		{"unqueued failure surfaced", unqueuedErr, unqueuedErr.Error()},
 		{"permanent error surfaced", permErr, permErr.Error()},
+		{"wrapped permanent surfaced", errWrap{permErr}, errWrap{permErr}.Error()},
+		{"unconfirmed flagged", relay.UnconfirmedSendError{Err: errors.New("matrix PUT 502")},
+			"delivery unconfirmed, the message may or may not have arrived. Tell the user it may be missing or doubled rather than reporting it sent: matrix PUT 502"},
 	}
 
 	for _, c := range cases {
@@ -51,13 +58,6 @@ func TestAckErrTextClassification(t *testing.T) {
 				t.Errorf("ackErrText(%v) = %q, want %q", c.err, got, c.want)
 			}
 		})
-	}
-
-	// A permanent error wrapped by fmt.Errorf("%w", ...) must still be
-	// detected via errors.As, not just a direct type assertion.
-	wrapped := errWrap{permErr}
-	if got := ackErrText(wrapped); got != wrapped.Error() {
-		t.Errorf("ackErrText(wrapped permanent) = %q, want %q", got, wrapped.Error())
 	}
 }
 
@@ -595,5 +595,21 @@ func TestWebhookInjectWithoutAdminIsUnavailable(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/inject", strings.NewReader(`{"text":"hello"}`)))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("got %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// The bug behind beads-m9w, end to end through the real pieces: a Matrix send
+// that cannot resolve its room must produce a non-empty ack, which the shim
+// turns into a tool error instead of "sent".
+func TestMatrixUnresolvedRoomAcksAsFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no request should be made, got %s %s", r.Method, r.URL.Path)
+	}))
+	defer srv.Close()
+	front := matrix.New(srv.URL, "tok", nil, "", log.New(io.Discard, "", 0))
+
+	err := front.Send(context.Background(), relay.Message{ConversationID: "@nobody:example.org", Text: "hello"})
+	if got := ackErrText(err); got == "" {
+		t.Fatalf("ack for an unresolvable Matrix room was empty (reported as sent); Send err = %v", err)
 	}
 }

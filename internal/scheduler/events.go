@@ -72,13 +72,6 @@ type TrackerConfig struct {
 	TickEvery     time.Duration // reconciliation scan interval (default 30s)
 	Retention     time.Duration // how long to keep acknowledged events before pruning (default 1h)
 
-	// ReplyAckWindow bounds reply-inferred acknowledgment: a model reply only
-	// auto-resolves an event if it lands within this window after the event
-	// fired (or after its last nudge). Outside the window a reply is treated as
-	// ordinary unrelated chatter, NOT evidence the trigger was handled, so the
-	// explicit ack_event tool is still required. Default 2m.
-	ReplyAckWindow time.Duration
-
 	// Now is an injectable clock (tests drive time deterministically). Defaults
 	// to time.Now. Injected via config rather than mutated post-construction so
 	// the reconciliation goroutine never races a field write.
@@ -98,18 +91,16 @@ func (c TrackerConfig) withDefaults() TrackerConfig {
 	if c.Retention <= 0 {
 		c.Retention = time.Hour
 	}
-	if c.ReplyAckWindow <= 0 {
-		c.ReplyAckWindow = 2 * time.Minute
-	}
 	if c.Now == nil {
 		c.Now = time.Now
 	}
 	return c
 }
 
-// Tracker follows fired events until acknowledged. Its methods are safe for
-// concurrent use: the reconciliation goroutine, MCP tool handlers, the
-// schedule-fire callback, and reply-inferred acks all mutate through the mutex.
+// Tracker follows fired events until acknowledged. Only Ack closes an event; a
+// reply on the event's chat is not evidence the trigger's work was done. Its
+// methods are safe for concurrent use: the reconciliation goroutine, MCP tool
+// handlers and the schedule-fire callback all mutate through the mutex.
 type Tracker struct {
 	path     string
 	inject   InjectFunc
@@ -283,49 +274,6 @@ func (t *Tracker) Ack(id, note string) error {
 
 	t.receipt("✓ handled: " + note)
 	return nil
-}
-
-// NoteReply auto-resolves a still-open event for chatID ONLY when a reply lands
-// promptly after it fired (or after its last nudge) — within cfg.ReplyAckWindow.
-// That narrow window is real evidence the agent immediately engaged with the
-// trigger; a reply outside it is ordinary unrelated chatter on a busy chat and
-// must NOT silently ack the event (that would defeat the feature's whole point),
-// leaving the explicit ack_event tool as the only path. This supplements, never
-// replaces, ack_event. at is the time the reply was observed, and must be a
-// reply that was actually delivered to the user (the caller only invokes this
-// after the outbound gate passes).
-func (t *Tracker) NoteReply(chatID string, at time.Time) {
-	t.mu.Lock()
-	changed := false
-	var resolved []string
-	for _, ev := range t.events {
-		if ev.Status != StatusPending || ev.ChatID != chatID {
-			continue
-		}
-		// Reference is the most recent prompt the agent saw for this event.
-		ref := ev.FiredAt
-		if ev.LastNudgeAt.After(ref) {
-			ref = ev.LastNudgeAt
-		}
-		if at.After(ref) && at.Sub(ref) <= t.cfg.ReplyAckWindow {
-			ev.Status = StatusAcknowledged
-			ev.AckNote = "inferred from prompt reply"
-			ev.AckedAt = at
-			changed = true
-			resolved = append(resolved, ev.ID)
-			t.logger.Printf("event %s auto-resolved (reply within %s of fire/nudge on chat %s)", ev.ID, t.cfg.ReplyAckWindow, chatID)
-		}
-	}
-	if changed {
-		_ = t.persist()
-	}
-	t.mu.Unlock()
-
-	// Inferred acks get their own receipt (event ID, not a note) so they don't
-	// silently break the "every ack leaves a trail" invariant Ack() upholds.
-	for _, id := range resolved {
-		t.receipt("✓ auto-resolved (reply): " + id)
-	}
 }
 
 // ListPending returns copies of all currently-open events, oldest fire first.

@@ -584,18 +584,6 @@ func main() {
 	// that it exists.
 	go serveGrafanaWebhook(back, admins, acc, meter, front, discordFront, tracker, sched, logger, b, *cfgPath)
 
-	// Reply-inferred acknowledgment: a model reply landing on a chat after a
-	// trigger fired there is strong evidence the trigger was handled, so
-	// auto-resolve any still-open events for that chat. Supplements ack_event.
-	b.OnBackendReply = func(m relay.Message) {
-		chatID := m.Meta["chat_id"]
-		if chatID == "" {
-			chatID = m.ConversationID
-		}
-		if chatID != "" {
-			tracker.NoteReply(chatID, time.Now())
-		}
-	}
 	// Surface the real Send outcome back to the reply tool call that
 	// originated it (by RequestID, carried in Meta["reply_id"]), instead of
 	// the tool call always returning "sent" regardless of what actually
@@ -762,18 +750,22 @@ func main() {
 	logger.Printf("stopped")
 }
 
-// ackErrText classifies a Send outcome for AckBackendReply: only a permanent
-// failure (relay.PermanentSendError) is surfaced as an error string - Frontend.Send
-// also returns an error for transient failures that it has already queued
-// for background retry, and reporting those to the model would invite a
-// resend that duplicates delivery once the retry lands. Returns "" for a nil
-// or transient error.
+// ackErrText classifies a Send outcome for AckBackendReply. Only a failure the
+// frontend has already queued for background retry (relay.QueuedSendError) is
+// reported as success: surfacing it would invite a resend that duplicates
+// delivery once the retry lands. Every other error is surfaced, because nothing
+// else will deliver that message. The default is honest: a frontend with no
+// retry queue (Matrix) used to have every failure reported as "sent".
 func ackErrText(sendErr error) string {
-	var perm relay.PermanentSendError
-	if sendErr != nil && errors.As(sendErr, &perm) {
-		return sendErr.Error()
+	var queued relay.QueuedSendError
+	if sendErr == nil || errors.As(sendErr, &queued) {
+		return ""
 	}
-	return ""
+	var unconfirmed relay.UnconfirmedSendError
+	if errors.As(sendErr, &unconfirmed) {
+		return "delivery unconfirmed, the message may or may not have arrived. Tell the user it may be missing or doubled rather than reporting it sent: " + sendErr.Error()
+	}
+	return sendErr.Error()
 }
 
 // mustStartDiscord builds the Discord frontend from cfg.Discord, connects
@@ -890,6 +882,9 @@ func mustStartMatrix(cfg *config.Config, logger *log.Logger) *matrix.Frontend {
 		mediaSpool = "matrix-media"
 	}
 	front := matrix.New(cfg.Matrix.HomeserverURL, token, cfg.Matrix.Admins, mediaSpool, logger)
+	if err := front.LoadRooms("matrix-rooms.json"); err != nil {
+		logger.Printf("matrix: %v (replies wait for the next inbound per room)", err)
+	}
 
 	backoff := 2 * time.Second
 	connectDeadline := time.Now().Add(2 * time.Minute)

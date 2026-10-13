@@ -90,22 +90,39 @@ func (mf *MultiFrontend) Recv() <-chan Message { return mf.recv }
 // notice) doesn't get silently misrouted to the wrong platform and dropped —
 // see Claimer's doc comment.
 func (mf *MultiFrontend) Send(ctx context.Context, m Message) error {
+	fe, _ := mf.route(m.ConversationID)
+	return fe.Send(ctx, m)
+}
+
+// PlatformFor names the sub-frontend that owns convID, so the message store
+// can tag replies that only carry a chat_id. It returns "" when the id is
+// neither learned nor claimed: Send would fall back to frontends[0], and a
+// guessed tag reads as authoritative where an empty one is honest.
+func (mf *MultiFrontend) PlatformFor(convID string) string {
+	if mf == nil || len(mf.frontends) == 0 {
+		return ""
+	}
+	if fe, matched := mf.route(convID); matched {
+		return fe.Name()
+	}
+	return ""
+}
+
+// route picks the sub-frontend for convID; matched is false when it fell back
+// to frontends[0] without the id being learned or claimed.
+func (mf *MultiFrontend) route(convID string) (fe Endpoint, matched bool) {
 	mf.mu.RLock()
-	fe, ok := mf.owner[m.ConversationID]
+	fe, ok := mf.owner[convID]
 	mf.mu.RUnlock()
-	if !ok {
-		for _, cand := range mf.frontends {
-			if claimer, isClaimer := cand.(Claimer); isClaimer && claimer.OwnsConversationID(m.ConversationID) {
-				fe = cand
-				ok = true
-				break
-			}
+	if ok {
+		return fe, true
+	}
+	for _, cand := range mf.frontends {
+		if claimer, isClaimer := cand.(Claimer); isClaimer && claimer.OwnsConversationID(convID) {
+			return cand, true
 		}
 	}
-	if !ok {
-		fe = mf.frontends[0]
-	}
-	return fe.Send(ctx, m)
+	return mf.frontends[0], false
 }
 
 // Close closes every sub-frontend, collecting the first error but always

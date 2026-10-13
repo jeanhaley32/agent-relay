@@ -3,10 +3,13 @@ package matrix
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -351,6 +354,11 @@ collect:
 	if got[0].Text != "the only one that counts" {
 		t.Errorf("delivered %q, want the admin's message", got[0].Text)
 	}
+	// The message store files a row under Meta["platform"]; without it every
+	// Matrix message was stored with no frontend.
+	if got[0].Meta["platform"] != "matrix" {
+		t.Errorf("platform = %q, want matrix", got[0].Meta["platform"])
+	}
 }
 
 // The self-echo guard only does work when the bot's own mxid is also in the
@@ -417,5 +425,155 @@ func TestRunDropsItsOwnEchoEvenWhenSelfIsAnAdmin(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Text != "a real instruction" {
 		t.Fatalf("got %d message(s), want exactly the admin's one: %+v", len(got), got)
+	}
+}
+
+// The room for a DM-style conversation is learned only from inbound, so a
+// restart used to drop every reply until the admin wrote again. A learned
+// room must survive into a fresh Frontend.
+func TestLearnedRoomSurvivesRestart(t *testing.T) {
+	h := &fakeHomeserver{whoamiID: "@relaybot:example.org"}
+	srv := httptest.NewServer(h.handler())
+	defer srv.Close()
+	rooms := filepath.Join(t.TempDir(), "matrix-rooms.json")
+
+	before := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+	if err := before.LoadRooms(rooms); err != nil {
+		t.Fatalf("LoadRooms on a missing file: %v", err)
+	}
+	before.deliver(inbound{roomID: "!dm:example.org", sender: "@admin:example.org", body: "hello"})
+
+	after := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+	if err := after.LoadRooms(rooms); err != nil {
+		t.Fatalf("LoadRooms: %v", err)
+	}
+	if err := after.Send(context.Background(), relay.Message{ConversationID: "@admin:example.org", Text: "after restart"}); err != nil {
+		t.Fatalf("send after restart: %v", err)
+	}
+	if got := h.sentMessages(); len(got) != 1 || got[0].room != "!dm:example.org" {
+		t.Fatalf("reply after restart went to %+v, want !dm:example.org", got)
+	}
+}
+
+// The rooms file is input like any other: an identity that is no longer an
+// admin, or a value that is not a room id, must not come back as "known".
+func TestLoadRoomsRestoresOnlyCurrentAdmins(t *testing.T) {
+	rooms := filepath.Join(t.TempDir(), "matrix-rooms.json")
+	content := `{"@admin:example.org": "!dm:example.org", "@revoked:example.org": "!old:example.org", "@admin2:example.org": "not-a-room"}`
+	if err := os.WriteFile(rooms, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := New("http://unused", "tok", []string{"@admin:example.org", "@admin2:example.org"}, "", log.New(io.Discard, "", 0))
+	if err := f.LoadRooms(rooms); err != nil {
+		t.Fatalf("LoadRooms: %v", err)
+	}
+	if !f.KnownConversation("!dm:example.org") {
+		t.Fatal("current admin's room was not restored")
+	}
+	for _, id := range []string{"@revoked:example.org", "!old:example.org", "not-a-room"} {
+		if f.KnownConversation(id) {
+			t.Fatalf("%q passed the outbound gate from the file alone", id)
+		}
+	}
+}
+
+// A 5xx or timeout may arrive after the homeserver stored the event. Send
+// retries once with the SAME transaction id, which the send endpoint treats as
+// idempotent, so the retry cannot duplicate the message.
+func TestSendRetriesAmbiguousFailureWithSameTxn(t *testing.T) {
+	var mu sync.Mutex
+	var txns []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		txns = append(txns, r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
+		n := len(txns)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = io.WriteString(w, `{"event_id":"$evt"}`)
+	}))
+	defer srv.Close()
+	f := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	err := f.Send(context.Background(), relay.Message{ConversationID: "!r:example.org", Text: "hi"})
+	if err != nil {
+		t.Fatalf("Send after one 502: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(txns) != 2 || txns[0] != txns[1] {
+		t.Fatalf("want two PUTs with one transaction id, got %v", txns)
+	}
+}
+
+// Two ambiguous failures: the outcome is unknown, and the error says so.
+func TestSendReportsUnconfirmedWhenStillAmbiguous(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	f := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	err := f.Send(context.Background(), relay.Message{ConversationID: "!r:example.org", Text: "hi"})
+	var unconfirmed relay.UnconfirmedSendError
+	if !errors.As(err, &unconfirmed) {
+		t.Fatalf("want relay.UnconfirmedSendError, got %T: %v", err, err)
+	}
+}
+
+// A 4xx is a definite refusal: no retry, and not reported as unconfirmed.
+func TestSendRefusalIsDefinite(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"errcode":"M_FORBIDDEN"}`)
+	}))
+	defer srv.Close()
+	f := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	err := f.Send(context.Background(), relay.Message{ConversationID: "!r:example.org", Text: "hi"})
+	var unconfirmed relay.UnconfirmedSendError
+	if err == nil || errors.As(err, &unconfirmed) {
+		t.Fatalf("want a definite error, got %T: %v", err, err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("a 4xx must not be retried, got %d calls", n)
+	}
+}
+
+// A homeserver that cannot be reached never saw the request, so the failure is
+// definite: a refused connection must not be reported as "may have arrived".
+func TestSendUnreachableHomeserverIsDefinite(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	addr := srv.URL
+	srv.Close() // nothing listens there now
+	f := New(addr, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	err := f.Send(context.Background(), relay.Message{ConversationID: "!r:example.org", Text: "hi"})
+	var unconfirmed relay.UnconfirmedSendError
+	if err == nil || errors.As(err, &unconfirmed) {
+		t.Fatalf("want a definite error for a refused connection, got %T: %v", err, err)
+	}
+}
+
+// A timeout after the request went out is genuinely ambiguous.
+func TestSendTimeoutIsUnconfirmed(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+	f := New(srv.URL, "tok", []string{"@admin:example.org"}, "", log.New(io.Discard, "", 0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := f.Send(ctx, relay.Message{ConversationID: "!r:example.org", Text: "hi"})
+	var unconfirmed relay.UnconfirmedSendError
+	if !errors.As(err, &unconfirmed) {
+		t.Fatalf("want relay.UnconfirmedSendError after a timeout, got %T: %v", err, err)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,11 +59,10 @@ func newTestTracker(t *testing.T, h *trackerHarness) (*Tracker, *time.Time) {
 	// mutating a Tracker field after construction, so the reconciliation
 	// goroutine never races a field write.
 	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{
-		NudgeAfter:     5 * time.Minute,
-		EscalateAfter:  12 * time.Minute,
-		TickEvery:      time.Hour, // effectively disable the auto loop for tests
-		ReplyAckWindow: 2 * time.Minute,
-		Now:            func() time.Time { return *clock },
+		NudgeAfter:    5 * time.Minute,
+		EscalateAfter: 12 * time.Minute,
+		TickEvery:     time.Hour, // effectively disable the auto loop for tests
+		Now:           func() time.Time { return *clock },
 	}, nil)
 	if err != nil {
 		t.Fatalf("new tracker: %v", err)
@@ -193,45 +191,37 @@ func TestAckEmptyNoteRejected(t *testing.T) {
 	}
 }
 
-func TestReplyInferredAck(t *testing.T) {
+// TestUnrelatedReplyLeavesTriggerPending replays 2026-10-10: three 09:00
+// triggers were closed at 09:00:35 by one unrelated reply on the same chat.
+// Only ack_event may close a trigger, so a reply must leave it pending and the
+// nudge and fallback must still run. The interface check keeps this test
+// compiling whether or not the tracker exposes a reply observer at all.
+func TestUnrelatedReplyLeavesTriggerPending(t *testing.T) {
 	h := &trackerHarness{connected: true}
 	tr, clock := newTestTracker(t, h)
-	tr.Fire("s", "42", "text")
-	// A reply on the same chat AFTER the fire resolves it.
-	*clock = clock.Add(time.Minute)
-	tr.NoteReply("42", *clock)
+	ev, _ := tr.Fire("s", "42", "email review")
+
+	*clock = clock.Add(35 * time.Second)
+	if r, ok := any(tr).(interface{ NoteReply(string, time.Time) }); ok {
+		r.NoteReply("42", *clock)
+	}
+	if len(tr.ListPending()) != 1 {
+		t.Fatal("an unrelated reply on the trigger's chat closed the trigger")
+	}
+
+	*clock = clock.Add(6 * time.Minute)
+	tr.Reconcile(*clock)
+	*clock = clock.Add(7 * time.Minute)
+	tr.Reconcile(*clock)
+	if inj, fb, _ := h.counts(); inj != 2 || fb != 1 {
+		t.Fatalf("escalation should still run for the unacked trigger: inj=%d fb=%d", inj, fb)
+	}
+
+	if err := tr.Ack(ev.ID, "reviewed inbox"); err != nil {
+		t.Fatalf("explicit ack: %v", err)
+	}
 	if len(tr.ListPending()) != 0 {
-		t.Fatal("reply after fire should auto-resolve the event")
-	}
-	h.mu.Lock()
-	receipts := append([]string(nil), h.receipts...)
-	h.mu.Unlock()
-	if len(receipts) != 1 || !strings.HasPrefix(receipts[0], "✓ auto-resolved (reply): ") {
-		t.Fatalf("expected one auto-resolved receipt, got %v", receipts)
-	}
-}
-
-func TestReplyBeforeFireDoesNotAck(t *testing.T) {
-	h := &trackerHarness{connected: true}
-	tr, clock := newTestTracker(t, h)
-	// A reply observed BEFORE the fire (earlier timestamp) must not resolve it.
-	replyAt := *clock
-	*clock = clock.Add(time.Minute)
-	tr.Fire("s", "42", "text")
-	tr.NoteReply("42", replyAt)
-	if len(tr.ListPending()) != 1 {
-		t.Fatal("a reply predating the fire must not resolve the event")
-	}
-}
-
-func TestReplyDifferentChatDoesNotAck(t *testing.T) {
-	h := &trackerHarness{connected: true}
-	tr, clock := newTestTracker(t, h)
-	tr.Fire("s", "42", "text")
-	*clock = clock.Add(time.Minute)
-	tr.NoteReply("99", *clock) // different chat
-	if len(tr.ListPending()) != 1 {
-		t.Fatal("a reply on another chat must not resolve the event")
+		t.Fatal("explicit ack should close the trigger")
 	}
 }
 
@@ -306,34 +296,6 @@ func TestNoRetrySpamWhileDisconnected(t *testing.T) {
 	tr.Reconcile(*clock)
 	if inj, _, _ := h.counts(); inj != 2 {
 		t.Fatalf("expected exactly one nudge re-inject, got %d total injects", inj)
-	}
-}
-
-// TestReplyOutsideWindowDoesNotAck: a reply landing well after the fire (past
-// ReplyAckWindow) is ordinary chatter, not evidence — it must NOT auto-resolve.
-func TestReplyOutsideWindowDoesNotAck(t *testing.T) {
-	h := &trackerHarness{connected: true}
-	tr, clock := newTestTracker(t, h)
-	tr.Fire("s", "42", "text")
-	*clock = clock.Add(3 * time.Minute) // beyond the 2m window
-	tr.NoteReply("42", *clock)
-	if len(tr.ListPending()) != 1 {
-		t.Fatal("a reply outside the ack window must not resolve the event")
-	}
-}
-
-// TestReplyWindowResetByNudge: after a nudge, the window is measured from the
-// nudge, so a prompt reply following the nudge still auto-resolves.
-func TestReplyWindowResetByNudge(t *testing.T) {
-	h := &trackerHarness{connected: true}
-	tr, clock := newTestTracker(t, h)
-	tr.Fire("s", "42", "text")
-	*clock = clock.Add(6 * time.Minute) // trigger the nudge
-	tr.Reconcile(*clock)
-	*clock = clock.Add(time.Minute) // 1m after the nudge, within window
-	tr.NoteReply("42", *clock)
-	if len(tr.ListPending()) != 0 {
-		t.Fatal("a reply promptly after a nudge should auto-resolve the event")
 	}
 }
 
@@ -467,12 +429,11 @@ func TestRetentionPruning(t *testing.T) {
 	now := time.Now()
 	clock := &now
 	tr, err := NewTracker(path, h.inject, h.fallback, h.receipt, TrackerConfig{
-		NudgeAfter:     5 * time.Minute,
-		EscalateAfter:  12 * time.Minute,
-		Retention:      10 * time.Minute,
-		TickEvery:      time.Hour,
-		ReplyAckWindow: 2 * time.Minute,
-		Now:            func() time.Time { return *clock },
+		NudgeAfter:    5 * time.Minute,
+		EscalateAfter: 12 * time.Minute,
+		Retention:     10 * time.Minute,
+		TickEvery:     time.Hour,
+		Now:           func() time.Time { return *clock },
 	}, nil)
 	if err != nil {
 		t.Fatalf("new tracker: %v", err)

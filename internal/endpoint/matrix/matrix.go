@@ -26,9 +26,11 @@ package matrix
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -73,6 +75,11 @@ type Frontend struct {
 	// see deliver) back to the physical room id so Send can route a reply
 	// into the right room. Mirrors discord's convChannels map.
 	roomByConv sync.Map // convID(string) -> roomID(string)
+
+	// roomsFile persists roomByConv so a restart can still reply into a room
+	// before its admin writes again. Empty means memory only.
+	roomsFile string
+	roomsMu   sync.Mutex
 
 	// txn is a monotonic transaction-id counter for idempotent sends.
 	txn atomic.Int64
@@ -134,14 +141,14 @@ func (f *Frontend) OwnsConversationID(id string) bool {
 // a routing heuristic on the shape of an id and accepts any room the bot was
 // invited into, so using it as the gate left that path open.
 //
-// roomByConv is written only by deliver, after the admin filter, so a hit is
-// evidence. Rooms count as well as mxids because a relayd-originated message
+// roomByConv is written only by deliver, after the admin filter, and by
+// LoadRooms, which restores only current admins, so a hit is evidence. Rooms count as well as mxids because a relayd-originated message
 // may address either.
 //
 // A configured admin's own mxid always qualifies, and that is not a weakening:
 // it is an identity the operator set in config, not one inferred from traffic.
-// Without it the gate starves itself, because roomByConv is in-memory and a
-// restart empties it — relayd would be unable to send to Matrix at all until
+// Without it the gate starves itself, because a restart without a rooms file
+// empties roomByConv — relayd would be unable to send to Matrix at all until
 // an admin happened to speak first, silently dropping scheduled deliveries.
 // Discord avoids the same trap by falling back to its live allowlist for DMs.
 func (f *Frontend) KnownConversation(id string) bool {
@@ -292,6 +299,74 @@ type inbound struct {
 	mimetype string
 }
 
+// LoadRooms restores the conversation-to-room map from path and keeps it there
+// as rooms are learned. Without it, a restart drops every reply until the
+// admin writes again: the room is otherwise only learned from inbound.
+func (f *Frontend) LoadRooms(path string) error {
+	f.roomsFile = path
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	rooms := map[string]string{}
+	if err := json.Unmarshal(data, &rooms); err != nil {
+		return fmt.Errorf("matrix rooms %s: %w", path, err)
+	}
+	// Only current admins and well-formed room ids come back: KnownConversation
+	// treats this map as proof an admin spoke, so a revoked admin must not
+	// survive a restart through the file.
+	for conv, room := range rooms {
+		if !f.admins[conv] || !strings.HasPrefix(room, "!") {
+			continue
+		}
+		f.roomByConv.Store(conv, room)
+		f.logger.Printf("matrix: restored room %s for %s", room, conv)
+	}
+	return nil
+}
+
+func (f *Frontend) saveRooms() {
+	if f.roomsFile == "" {
+		return
+	}
+	f.roomsMu.Lock()
+	defer f.roomsMu.Unlock()
+	rooms := map[string]string{}
+	f.roomByConv.Range(func(k, v any) bool {
+		rooms[k.(string)] = v.(string)
+		return true
+	})
+	data, _ := json.MarshalIndent(rooms, "", "  ")
+	tmp := f.roomsFile + ".tmp"
+	_ = os.Remove(tmp) // a leftover tmp (or a link planted there) must not keep its mode or target
+	if err := writeSynced(tmp, data); err != nil {
+		f.logger.Printf("matrix: saving rooms: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, f.roomsFile); err != nil {
+		f.logger.Printf("matrix: saving rooms: %v", err)
+	}
+}
+
+func writeSynced(path string, data []byte) error {
+	fh, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := fh.Write(data); err != nil {
+		fh.Close()
+		return err
+	}
+	if err := fh.Sync(); err != nil {
+		fh.Close()
+		return err
+	}
+	return fh.Close()
+}
+
 // mediaMsgTypes are the m.room.message msgtypes that carry a downloadable file.
 var mediaMsgTypes = map[string]string{
 	"m.image": "image",
@@ -308,7 +383,9 @@ func (f *Frontend) deliver(m inbound) {
 	// room id as chat_id would trip it. The physical room is remembered
 	// separately so Send can route the reply back into it.
 	convID := m.sender
-	f.roomByConv.Store(convID, m.roomID)
+	if prev, loaded := f.roomByConv.Swap(convID, m.roomID); !loaded || prev.(string) != m.roomID {
+		f.saveRooms()
+	}
 
 	text := m.body
 	meta := map[string]string{
@@ -320,6 +397,7 @@ func (f *Frontend) deliver(m inbound) {
 		"from_name": m.sender,
 		"room_id":   m.roomID,
 		"source":    "matrix",
+		"platform":  "matrix",
 		"event_id":  m.eventID,
 	}
 
@@ -475,11 +553,49 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		url.PathEscape(room), url.PathEscape(txnID))
 	body := map[string]any{"msgtype": "m.text", "body": m.Text}
-	if err := f.put(ctx, path, body, nil); err != nil {
-		f.sendFailures.Add(1)
-		return fmt.Errorf("matrix send to %s: %w", room, err)
+	// A timeout or 5xx may come after the homeserver stored the event. The
+	// send endpoint is idempotent per transaction id, so one retry with the
+	// same id settles it without risking a duplicate. If that is ambiguous
+	// too, say the outcome is unknown rather than that it failed.
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err = f.put(ctx, path, body, nil); err == nil {
+			return nil
+		}
+		if !ambiguous(err) || ctx.Err() != nil {
+			break
+		}
 	}
-	return nil
+	f.sendFailures.Add(1)
+	err = fmt.Errorf("matrix send to %s: %w", room, err)
+	if ambiguous(err) {
+		return relay.UnconfirmedSendError{Err: err}
+	}
+	return err
+}
+
+// statusError is a non-2xx answer from the homeserver.
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e statusError) Error() string { return e.msg }
+
+// ambiguous reports whether a request error leaves the outcome unknown: a
+// timeout or a connection lost after the request went out (the server may have
+// acted before the reply was lost), or a 5xx. A 4xx is a definite refusal, and
+// so is a failure to connect at all: the request never reached the server.
+func ambiguous(err error) bool {
+	var se statusError
+	if errors.As(err, &se) {
+		return se.code >= 500
+	}
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return false
+	}
+	return true
 }
 
 // --- Matrix Client-Server API plumbing ---
@@ -617,7 +733,7 @@ func (f *Frontend) do(ctx context.Context, method, u string, body, out any) erro
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Matrix errors are JSON {errcode, error}; surface them without
 		// leaking the bearer token (which never appears in the body).
-		return fmt.Errorf("matrix %s %d: %s", method, resp.StatusCode, strings.TrimSpace(string(data)))
+		return statusError{code: resp.StatusCode, msg: fmt.Sprintf("matrix %s %d: %s", method, resp.StatusCode, strings.TrimSpace(string(data)))}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {

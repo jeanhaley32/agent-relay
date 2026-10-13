@@ -151,3 +151,23 @@ func TestSendFansOutAndDropsForSlowClients(t *testing.T) {
 		t.Fatal("live client received nothing")
 	}
 }
+
+// With no open page there is no one to deliver to and no backlog, so Send
+// must fail; returning nil made the reply tool report "sent" for a message
+// nobody would ever see.
+func TestSendWithNoOpenPageFails(t *testing.T) {
+	f := &Frontend{
+		convID: "web-test", logger: log.New(io.Discard, "", 0),
+		out:     make(chan relay.Message, 1),
+		clients: map[chan string]struct{}{},
+	}
+	if err := f.Send(context.Background(), relay.AssistantMsg("web-test", "anyone?")); err == nil {
+		t.Fatal("Send with no open page returned nil")
+	}
+
+	wedged := make(chan string) // never read
+	f.clients[wedged] = struct{}{}
+	if err := f.Send(context.Background(), relay.AssistantMsg("web-test", "anyone?")); err == nil {
+		t.Fatal("Send where every page is backed up returned nil")
+	}
+}

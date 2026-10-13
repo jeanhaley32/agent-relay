@@ -320,6 +320,62 @@ func TestSend429Retryable(t *testing.T) {
 	}
 }
 
+// TestSendChunkQueuedReturnsQueuedSendError: a transient failure is queued for
+// background retry, and the error says so, so the broker reports the reply as
+// delivered-in-due-course instead of inviting a duplicate resend.
+func TestSendChunkQueuedReturnsQueuedSendError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"message":"You are being rate limited.","retry_after":0.01,"global":false}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	err = f.sendChunk(context.Background(), relay.Message{Text: "hi", Meta: map[string]string{"channel_id": "123"}})
+	var queued relay.QueuedSendError
+	if !errors.As(err, &queued) {
+		t.Fatalf("a queued send must return relay.QueuedSendError, got %T: %v", err, err)
+	}
+	if got := f.QueueDepth(); got != 1 {
+		t.Fatalf("QueueDepth = %d, want 1", got)
+	}
+}
+
+// TestSplitSendQueuedReturnsQueuedSendError: a split message whose chunks
+// were queued must say so, the same as a single message, rather than return
+// nil and look delivered to the broker.
+func TestSplitSendQueuedReturnsQueuedSendError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/channels/123/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"message":"You are being rate limited.","retry_after":0.01,"global":false}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f, err := New(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithLogger(testLogger(t)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer f.Close()
+
+	long := strings.Repeat("word ", maxMessageLen/5+50)
+	err = f.Send(context.Background(), relay.Message{Text: long, Meta: map[string]string{"channel_id": "123"}})
+	var queued relay.QueuedSendError
+	if !errors.As(err, &queued) {
+		t.Fatalf("a queued split send must return relay.QueuedSendError, got %T: %v", err, err)
+	}
+}
+
 // TestSendTooLongUsesRuneCount pins the byte-vs-codepoint fix: Discord's
 // 2000 limit is 2000 CHARACTERS (code points), not bytes. A message with
 // 1200 multibyte runes is well over 2000 bytes but must NOT be rejected.

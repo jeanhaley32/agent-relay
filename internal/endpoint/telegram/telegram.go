@@ -232,6 +232,18 @@ func (f *Frontend) SafeErr(err error) string {
 	return strings.ReplaceAll(s, f.token, "<token>")
 }
 
+// scrubURL removes the token from the request URL inside a transport error,
+// keeping the error chain intact (timeouts still unwrap to their cause). Send
+// errors leave this package for the event log and message store, so they must
+// not carry the token the way a raw *url.Error does.
+func (f *Frontend) scrubURL(err error) error {
+	var ue *url.Error
+	if f.token != "" && errors.As(err, &ue) {
+		ue.URL = strings.ReplaceAll(ue.URL, f.token, "<token>")
+	}
+	return err
+}
+
 func (f *Frontend) Name() string { return "telegram" }
 
 // Assurance is Claimed: the sender id is Telegram asserting who its account
@@ -355,11 +367,11 @@ func (f *Frontend) getUpdates(ctx context.Context, offset int64) ([]tgUpdate, er
 	endpoint := fmt.Sprintf("%s/bot%s/getUpdates?%s", f.base, f.token, q.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, f.scrubURL(err)
 	}
 	resp, err := f.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, f.scrubURL(err)
 	}
 	defer resp.Body.Close()
 	var out tgUpdatesResp
@@ -387,11 +399,11 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 	endpoint := fmt.Sprintf("%s/bot%s/getMe", f.base, f.token)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return BotInfo{}, err
+		return BotInfo{}, f.scrubURL(err)
 	}
 	resp, err := f.http.Do(req)
 	if err != nil {
-		return BotInfo{}, err
+		return BotInfo{}, f.scrubURL(err)
 	}
 	defer resp.Body.Close()
 	var out struct {
@@ -416,13 +428,15 @@ func (f *Frontend) Me(ctx context.Context) (BotInfo, error) {
 func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 	chunks := senderr.Split(m.Text, maxMessageLen)
 	if len(chunks) > 1 {
-		var permErr, firstErr error
+		var permErr, firstErr, dropErr error
 		queuing := false
 		for _, chunk := range chunks {
 			cm := m
 			cm.Text = chunk
 			if queuing {
-				f.enqueueRetry(cm)
+				if !f.enqueueRetry(cm) && dropErr == nil {
+					dropErr = errors.New("telegram retry queue full, part of a split message was dropped")
+				}
 				continue
 			}
 			if err := f.sendChunk(ctx, cm); err != nil {
@@ -447,6 +461,9 @@ func (f *Frontend) Send(ctx context.Context, m relay.Message) error {
 		if permErr != nil {
 			return permErr
 		}
+		if dropErr != nil {
+			return dropErr
+		}
 		return firstErr
 	}
 	return f.sendChunk(ctx, m)
@@ -469,8 +486,10 @@ func (f *Frontend) sendChunk(ctx context.Context, m relay.Message) error {
 		return err
 	}
 	f.logger.Printf("telegram send failed, queuing for background retry: %s", f.SafeErr(err))
-	f.enqueueRetry(m)
-	return err
+	if !f.enqueueRetry(m) {
+		return fmt.Errorf("telegram send failed and the retry queue is full, message dropped: %s", f.SafeErr(err))
+	}
+	return relay.QueuedSendError{Err: err}
 }
 
 func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
@@ -485,12 +504,12 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", f.base, f.token)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
 	if err != nil {
-		return err
+		return f.scrubURL(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := f.http.Do(req)
 	if err != nil {
-		return err
+		return f.scrubURL(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
@@ -516,11 +535,13 @@ func (f *Frontend) sendOnce(ctx context.Context, m relay.Message) error {
 // startRetryWorker (which caps its pending slice too), since draining the
 // channel each loop would otherwise let the real in-flight count grow well
 // past retryQueueCapacity.
-func (f *Frontend) enqueueRetry(m relay.Message) {
+// It reports whether m itself was queued; false means m was dropped.
+func (f *Frontend) enqueueRetry(m relay.Message) bool {
 	item := retryItem{msg: m, attempts: 0, nextAt: time.Now().Add(retryBackoff(0))}
 	select {
 	case f.retryQueue <- item:
 		f.queueDepth.Add(1)
+		return true
 	default:
 		f.logger.Printf("telegram retry queue full (%d), dropping oldest queued item to make room", retryQueueCapacity)
 		select {
@@ -532,11 +553,13 @@ func (f *Frontend) enqueueRetry(m relay.Message) {
 		select {
 		case f.retryQueue <- item:
 			f.queueDepth.Add(1)
+			return true
 		default:
 			f.logger.Printf("telegram retry queue full again, dropping new item")
 			f.permanentDrops.Add(1)
 		}
 	}
+	return false
 }
 
 // retryBackoff is exponential with a cap, so a sustained outage doesn't

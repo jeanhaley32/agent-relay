@@ -3,11 +3,13 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -305,6 +307,12 @@ func TestSendRetryQueue(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the first attempt to fail")
 	}
+	// Queued, so the broker must report it as delivered-in-due-course rather
+	// than invite a resend that would duplicate it.
+	var queued relay.QueuedSendError
+	if !errors.As(err, &queued) {
+		t.Fatalf("a queued send must return relay.QueuedSendError, got %T: %v", err, err)
+	}
 	if got := f.SendFailures(); got != 1 {
 		t.Fatalf("SendFailures = %d, want 1", got)
 	}
@@ -466,13 +474,9 @@ func TestSafeErrRedactsToken(t *testing.T) {
 		WithPollTimeout(0))
 	defer f.Close()
 
-	_, err := f.Me(context.Background())
-	if err == nil {
-		t.Fatal("expected a transport error")
-	}
-	if !strings.Contains(err.Error(), secret) {
-		t.Fatalf("test premise broken: raw error should embed the token, got %q", err.Error())
-	}
+	// Me scrubs its own transport errors now, so build the raw one SafeErr
+	// exists for: a *url.Error carrying the token-bearing URL.
+	err := error(&url.Error{Op: "Get", URL: "http://127.0.0.1:1/bot" + secret + "/getMe", Err: errors.New("connection refused")})
 	if got := f.SafeErr(err); strings.Contains(got, secret) {
 		t.Fatalf("SafeErr leaked the token: %q", got)
 	}
@@ -528,5 +532,42 @@ func TestOffsetStoreIsOptionalAndFailsSoft(t *testing.T) {
 	f2 := &Frontend{offsetPath: path, logger: log.New(io.Discard, "", 0)}
 	if got := f2.loadOffset(); got != 0 {
 		t.Fatalf("garbage file: got %d, want 0", got)
+	}
+}
+
+// A transport failure prints its request URL, and Telegram's URL carries the
+// bot token. Send errors are written to the event log and message store, so
+// the token must be gone before the error leaves the frontend.
+func TestSendTransportErrorHidesToken(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	base := srv.URL
+	srv.Close() // refuse every connection
+
+	f := New(testToken, WithBaseURL(base), WithPollTimeout(0))
+	defer f.Close()
+	err := f.sendOnce(context.Background(), relay.Message{ConversationID: "222", Meta: map[string]string{"chat_id": "222"}, Text: "hi"})
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Fatalf("send error leaks the bot token: %v", err)
+	}
+}
+
+// A token that does not parse into a URL (a stray newline from a secrets file)
+// fails in NewRequest, and url.Parse's error prints the whole URL too.
+func TestRequestBuildErrorHidesToken(t *testing.T) {
+	bad := testToken + "\n"
+	f := New(bad, WithBaseURL("http://127.0.0.1:1"), WithPollTimeout(0))
+	defer f.Close()
+	err := f.sendOnce(context.Background(), relay.Message{ConversationID: "222", Meta: map[string]string{"chat_id": "222"}, Text: "hi"})
+	if err == nil {
+		t.Fatal("expected a request-build error")
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Fatalf("request-build error leaks the bot token: %v", err)
+	}
+	if _, err := f.Me(context.Background()); err == nil || strings.Contains(err.Error(), testToken) {
+		t.Fatalf("Me error leaks the bot token or did not fail: %v", err)
 	}
 }

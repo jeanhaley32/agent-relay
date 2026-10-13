@@ -52,6 +52,7 @@ telegram_offset
 # the public history was rewritten on 2026-09-22 to scrub exactly these.
 adminbind.json
 contacts.json
+matrix-rooms.json
 
 # local MCP config carries host paths
 .mcp.json
